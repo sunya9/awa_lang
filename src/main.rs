@@ -124,7 +124,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
 #[derive(Debug)]
 enum Expr {
     Num(f64),
-    Var(String), // 変数参照
+    Var(String),    // 変数参照
+    Neg(Box<Expr>), // 単項マイナス（例: -3, -(x + 1)）
     BinOp(Box<Expr>, Token, Box<Expr>),
 }
 
@@ -143,8 +144,9 @@ type Env = HashMap<String, f64>;
 // ===== 構文解析（Parser）=====
 // 再帰下降パーサ。優先順位を文法の階層で表現する。
 //   expr   = term (('+' | '-') term)*
-//   term   = factor (('*' | '/') factor)*
-//   factor = Num | '(' expr ')'
+//   term   = unary (('*' | '/') unary)*
+//   unary  = '-' unary | factor
+//   factor = Num | Ident | '(' expr ')'
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -220,18 +222,30 @@ impl Parser {
     }
 
     fn parse_term(&mut self) -> Result<Expr, AwaError> {
-        let mut left = self.parse_factor()?;
+        let mut left = self.parse_unary()?;
         while let Some(op) = self.peek() {
             match op {
                 Token::Star | Token::Slash => {
                     let op = self.next().unwrap();
-                    let right = self.parse_factor()?;
+                    let right = self.parse_unary()?;
                     left = Expr::BinOp(Box::new(left), op, Box::new(right));
                 }
                 _ => break,
             }
         }
         Ok(left)
+    }
+
+    // 単項マイナス。右再帰なので `--3`（= 3）のような連続適用も自然に扱える。
+    // factor より高い優先順位: `-3 * 2` は `(-3) * 2`、`-2 + 1` は `(-2) + 1`。
+    fn parse_unary(&mut self) -> Result<Expr, AwaError> {
+        if let Some(Token::Minus) = self.peek() {
+            self.next(); // '-' を消費
+            let operand = self.parse_unary()?;
+            Ok(Expr::Neg(Box::new(operand)))
+        } else {
+            self.parse_factor()
+        }
     }
 
     fn parse_factor(&mut self) -> Result<Expr, AwaError> {
@@ -271,6 +285,7 @@ fn eval_expr(expr: &Expr, env: &Env) -> Result<f64, AwaError> {
             .get(name)
             .copied()
             .ok_or(AwaError::UndefinedVariable(name.clone())),
+        Expr::Neg(operand) => Ok(-eval_expr(operand, env)?),
         Expr::BinOp(left, op, right) => {
             let l = eval_expr(left, env)?;
             let r = eval_expr(right, env)?;
@@ -325,6 +340,7 @@ fn main() {
         "let x = 5\nlet y = x * 2 + 1\nx + y\ny / x",
         "let a = 10\na / (a - 10)", // 0 除算
         "let p = 3\nq + 1",         // 未定義変数 q → UndefinedVariable
+        "-3\n-2 * 5\n-(1 + 2)\nlet n = 4\n-n + 10", // 単項マイナス
     ];
     for (i, src) in programs.iter().enumerate() {
         println!("=== program {} ===", i + 1);
