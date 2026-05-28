@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 // ===== エラー型 =====
@@ -7,11 +8,12 @@ use std::fmt;
 // ヴァリアントを増やすと、match で対応漏れがコンパイルエラーになる。
 #[derive(Debug)]
 enum AwaError {
-    UnexpectedChar(char),    // 字句解析: 知らない文字
-    InvalidNumber(String),   // 字句解析: 数値として parse できない
-    UnexpectedToken(String), // 構文解析: 想定外のトークン
-    UnexpectedEof,           // 構文解析: 入力が途中で終わった
-    DivisionByZero,          // 評価: 0 除算
+    UnexpectedChar(char),      // 字句解析: 知らない文字
+    InvalidNumber(String),     // 字句解析: 数値として parse できない
+    UnexpectedToken(String),   // 構文解析: 想定外のトークン
+    UnexpectedEof,             // 構文解析: 入力が途中で終わった
+    DivisionByZero,            // 評価: 0 除算
+    UndefinedVariable(String), // 評価: 未定義変数の参照
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -24,6 +26,7 @@ impl fmt::Display for AwaError {
             AwaError::UnexpectedToken(t) => write!(f, "予期しないトークン: {}", t),
             AwaError::UnexpectedEof => write!(f, "入力が途中で終わっています"),
             AwaError::DivisionByZero => write!(f, "0 で割ることはできません"),
+            AwaError::UndefinedVariable(name) => write!(f, "未定義の変数です: {}", name),
         }
     }
 }
@@ -32,12 +35,16 @@ impl fmt::Display for AwaError {
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     Num(f64),
+    Ident(String), // 識別子（変数名）
+    Let,           // キーワード let
+    Equal,         // =
     Plus,
     Minus,
     Star,
     Slash,
     LParen,
     RParen,
+    Newline, // 文の区切り
 }
 
 // ===== 字句解析（Lexer）=====
@@ -50,7 +57,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
     while i < chars.len() {
         let c = chars[i];
         match c {
-            ' ' | '\t' => i += 1,
+            ' ' | '\t' | '\r' => i += 1,
+            '\n' => {
+                tokens.push(Token::Newline);
+                i += 1;
+            }
+            '=' => {
+                tokens.push(Token::Equal);
+                i += 1;
+            }
             '+' => {
                 tokens.push(Token::Plus);
                 i += 1;
@@ -85,6 +100,20 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                 let n: f64 = s.parse().map_err(|_| AwaError::InvalidNumber(s.clone()))?;
                 tokens.push(Token::Num(n));
             }
+            // 識別子: 英字または _ で始まり、英数字または _ が続く。
+            // 予約語 "let" だけは専用トークンに振り分ける（残りは変数名）。
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                let token = match word.as_str() {
+                    "let" => Token::Let,
+                    _ => Token::Ident(word),
+                };
+                tokens.push(token);
+            }
             _ => return Err(AwaError::UnexpectedChar(c)),
         }
     }
@@ -95,8 +124,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
 #[derive(Debug)]
 enum Expr {
     Num(f64),
+    Var(String), // 変数参照
     BinOp(Box<Expr>, Token, Box<Expr>),
 }
+
+// 文（statement）。プログラムは文の並び。
+//   let x = expr   → 変数束縛（値は返さず env を更新する）
+//   expr           → 式文（評価して結果を表示する）
+#[derive(Debug)]
+enum Stmt {
+    Let(String, Expr),
+    Expr(Expr),
+}
+
+// 環境: 変数名 → 値。評価中ずっと持ち回り、変数の解決に使う表。
+type Env = HashMap<String, f64>;
 
 // ===== 構文解析（Parser）=====
 // 再帰下降パーサ。優先順位を文法の階層で表現する。
@@ -121,6 +163,45 @@ impl Parser {
         let t = self.tokens.get(self.pos).cloned();
         self.pos += 1;
         t
+    }
+
+    // 連続する改行を読み飛ばす。空行や文末の改行を吸収する。
+    fn skip_newlines(&mut self) {
+        while let Some(Token::Newline) = self.peek() {
+            self.next();
+        }
+    }
+
+    // プログラム = 文の並び。改行で区切られた文を末尾まで読む。
+    fn parse_program(&mut self) -> Result<Vec<Stmt>, AwaError> {
+        let mut stmts = Vec::new();
+        self.skip_newlines();
+        while self.peek().is_some() {
+            stmts.push(self.parse_stmt()?);
+            self.skip_newlines();
+        }
+        Ok(stmts)
+    }
+
+    // 文 = `let ident = expr`（束縛）または `expr`（式文）。
+    fn parse_stmt(&mut self) -> Result<Stmt, AwaError> {
+        if let Some(Token::Let) = self.peek() {
+            self.next(); // 'let' を消費
+            let name = match self.next() {
+                Some(Token::Ident(name)) => name,
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                None => return Err(AwaError::UnexpectedEof),
+            };
+            match self.next() {
+                Some(Token::Equal) => {}
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                None => return Err(AwaError::UnexpectedEof),
+            }
+            let value = self.parse_expr()?;
+            Ok(Stmt::Let(name, value))
+        } else {
+            Ok(Stmt::Expr(self.parse_expr()?))
+        }
     }
 
     fn parse_expr(&mut self) -> Result<Expr, AwaError> {
@@ -156,6 +237,7 @@ impl Parser {
     fn parse_factor(&mut self) -> Result<Expr, AwaError> {
         match self.next() {
             Some(Token::Num(n)) => Ok(Expr::Num(n)),
+            Some(Token::Ident(name)) => Ok(Expr::Var(name)),
             Some(Token::LParen) => {
                 let e = self.parse_expr()?;
                 match self.next() {
@@ -171,27 +253,27 @@ impl Parser {
 }
 
 // ===== 評価（Evaluator）=====
-// TODO(あなた): eval を Result<f64, AwaError> を返すように実装してください。
-//
-// ヒント:
-//   1. Expr::Num(n) のときは Ok(*n) を返す。
-//   2. Expr::BinOp(left, op, right) のときは、まず子を評価する。
-//      子も失敗しうるので `?` でエラーを伝播する:
-//          let l = eval(left)?;
-//          let r = eval(right)?;
-//   3. op に応じて四則演算し、結果を Ok(...) で包む。
-//   4. ★設計判断★ 0 除算をどう扱うか。
-//      f64 では 1.0 / 0.0 は panic せず inf（無限大）になってしまう。
-//      言語として r == 0.0 のとき Err(AwaError::DivisionByZero) を返すべきか?
-//      （Gleam なら型/実行時にどう守るか、を考える良い練習）
-//   5. op が Plus/Minus/Star/Slash 以外に来ることは構文上ありえないので
-//      `_ => unreachable!()` でよい。
-fn eval(expr: &Expr) -> Result<f64, AwaError> {
+// env を受け取り、変数参照を解決できるようになった。
+fn eval_expr(expr: &Expr, env: &Env) -> Result<f64, AwaError> {
     match expr {
         Expr::Num(n) => Ok(*n),
+        // TODO(あなた): 変数参照 Expr::Var(name) を実装してください。
+        //
+        // やること: env から name を引いて、その値を Ok で返す。
+        //   - env は HashMap<String, f64>。env.get(name) は Option<&f64> を返す。
+        //   - 見つかったら f64 をコピーして Ok(...)（&f64 → f64 は .copied() が便利）。
+        //   - ★設計判断★ 見つからなかったらどうする?
+        //       未定義変数はエラーにすべき（Gleam なら型検査で弾くが、今は実行時）。
+        //       AwaError::UndefinedVariable(name.clone()) を Err で返す。
+        //       ヒント: Option を Result に変えるイディオム `.ok_or(...)` が使える。
+        //       例: env.get(name).copied().ok_or(...) で 1 行に書ける。
+        Expr::Var(name) => env
+            .get(name)
+            .copied()
+            .ok_or(AwaError::UndefinedVariable(name.clone())),
         Expr::BinOp(left, op, right) => {
-            let l = eval(left)?;
-            let r = eval(right)?;
+            let l = eval_expr(left, env)?;
+            let r = eval_expr(right, env)?;
             match op {
                 Token::Plus => Ok(l + r),
                 Token::Minus => Ok(l - r),
@@ -209,30 +291,46 @@ fn eval(expr: &Expr) -> Result<f64, AwaError> {
     }
 }
 
+// プログラム（文の並び）を順に評価する。1 つの env を共有するので、
+// let で束縛した変数を後続の文から参照できる。
+fn eval_program(stmts: &[Stmt]) -> Result<(), AwaError> {
+    let mut env: Env = HashMap::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let(name, expr) => {
+                let value = eval_expr(expr, &env)?;
+                env.insert(name.clone(), value);
+                println!("let {} = {}", name, value);
+            }
+            Stmt::Expr(expr) => {
+                println!("{}", eval_expr(expr, &env)?);
+            }
+        }
+    }
+    Ok(())
+}
+
 // ===== パイプライン =====
 // tokenize → parse → eval を ? で連結。どこで失敗しても Err が main まで伝わる。
 // この「失敗しうる処理を縦に積む」形が Result の真価。
-fn run(input: &str) -> Result<f64, AwaError> {
-    let tokens = tokenize(input)?;
+fn run(source: &str) -> Result<(), AwaError> {
+    let tokens = tokenize(source)?;
     let mut parser = Parser::new(tokens);
-    let ast = parser.parse_expr()?;
-    eval(&ast)
+    let program = parser.parse_program()?;
+    eval_program(&program)
 }
 
 fn main() {
-    let inputs = [
-        "1 + 2 * 3",
-        "(1 + 2) * 3",
-        "10 / 2 - 3",
-        "2 * (3 + 4) - 1",
-        "1 / 0", // 0 除算 → eval でエラーにする想定
-        "1 + ",  // 途中で終わる → UnexpectedEof
-        "1 @ 2", // 不正な文字 → UnexpectedChar
+    let programs = [
+        "let x = 5\nlet y = x * 2 + 1\nx + y\ny / x",
+        "let a = 10\na / (a - 10)", // 0 除算
+        "let p = 3\nq + 1",         // 未定義変数 q → UndefinedVariable
     ];
-    for input in inputs {
-        match run(input) {
-            Ok(value) => println!("{} = {}", input, value),
-            Err(e) => println!("{:<14} => エラー: {}", input, e),
+    for (i, src) in programs.iter().enumerate() {
+        println!("=== program {} ===", i + 1);
+        if let Err(e) = run(src) {
+            println!("error: {}", e);
         }
     }
 }
+
