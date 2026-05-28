@@ -1,6 +1,6 @@
-let x = 5
-let y = x * 2 + 1
-x + y
-if x < y { x } else { y }
-let abs = if x - 10 < 0 { -(x - 10) } else { x - 10 }
-abs
+let x = 5;
+let y = x * 2 + 1;
+x + y;
+if x < y { x } else { y };
+let abs = if x - 10 < 0 { -(x - 10) } else { x - 10 };
+abs;

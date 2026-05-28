@@ -89,7 +89,7 @@ enum Token {
     RParen,
     LBrace,  // {
     RBrace,  // }
-    Newline, // 文の区切り
+    Semicolon, // ; 文の終端
 }
 
 // ===== 字句解析（Lexer）=====
@@ -102,9 +102,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
     while i < chars.len() {
         let c = chars[i];
         match c {
-            ' ' | '\t' | '\r' => i += 1,
-            '\n' => {
-                tokens.push(Token::Newline);
+            // 改行も含めすべての空白は読み飛ばす。文の区切りは ; で明示するので
+            // 式を自由に複数行へ折り返せる（例: `1 +` 改行 `2;`）。
+            ' ' | '\t' | '\r' | '\n' => i += 1,
+            ';' => {
+                tokens.push(Token::Semicolon);
                 i += 1;
             }
             // 2 文字演算子は次の文字を覗いて判定する。
@@ -348,20 +350,13 @@ impl Parser {
         }
     }
 
-    // 連続する改行を読み飛ばす。空行や文末の改行を吸収する。
-    fn skip_newlines(&mut self) {
-        while let Some(Token::Newline) = self.peek() {
-            self.next();
-        }
-    }
-
-    // プログラム = 文の並び。改行で区切られた文を末尾まで読む。
+    // プログラム = 文の並び。各文は ; で終端する。
     fn parse_program(&mut self) -> Result<Vec<Stmt>, AwaError> {
         let mut stmts = Vec::new();
-        self.skip_newlines();
         while self.peek().is_some() {
             stmts.push(self.parse_stmt()?);
-            self.skip_newlines();
+            // 各文の後に ; を必須とする（終端方式）。
+            self.expect(Token::Semicolon)?;
         }
         Ok(stmts)
     }
@@ -811,170 +806,131 @@ fn main() {
 }
 
 // ===== テスト =====
-// `cargo test` で実行される。#[cfg(test)] が付いたモジュールは
-// テストビルドのときだけコンパイルされ、本番バイナリには含まれない。
 #[cfg(test)]
 mod tests {
-    // 親モジュール（このファイルのトップレベル）の項目を全部使えるようにする。
     use super::*;
 
-    // テスト用ヘルパ: ソースを実行し「最後の文の値」を返す。
-    // 多くのテストは最終行の結果だけ確認したいので、それを 1 行で書けるようにする。
     fn eval(src: &str) -> Result<Value, AwaError> {
         let mut env = Env::new();
         run(src, &mut env).map(|values| values.last().expect("少なくとも 1 文を期待").clone())
     }
 
-    // 数値リテラルを作るショートカット。
     fn num(n: f64) -> Value {
         Value::Num(n)
     }
 
     #[test]
     fn 演算子優先順位() {
-        assert_eq!(eval("1 + 2 * 3"), Ok(num(7.0)));
-        assert_eq!(eval("(1 + 2) * 3"), Ok(num(9.0)));
-        assert_eq!(eval("2 * (3 + 4) - 1"), Ok(num(13.0)));
+        assert_eq!(eval("1 + 2 * 3;"), Ok(num(7.0)));
+        assert_eq!(eval("(1 + 2) * 3;"), Ok(num(9.0)));
+        assert_eq!(eval("2 * (3 + 4) - 1;"), Ok(num(13.0)));
     }
 
     #[test]
     fn 変数束縛は後続の文から参照できる() {
-        assert_eq!(eval("let x = 5\nlet y = x * 2 + 1\nx + y"), Ok(num(16.0)));
+        assert_eq!(eval("let x = 5; let y = x * 2 + 1; x + y;"), Ok(num(16.0)));
     }
 
     #[test]
     fn 単項マイナスは乗算より強く結合する() {
-        // -2 * 5 は (-2) * 5 = -10
-        assert_eq!(eval("-2 * 5"), Ok(num(-10.0)));
-        // --3 は -(-3) = 3
-        assert_eq!(eval("--3"), Ok(num(3.0)));
+        assert_eq!(eval("-2 * 5;"), Ok(num(-10.0)));
+        assert_eq!(eval("--3;"), Ok(num(3.0)));
     }
 
     #[test]
     fn if_は選ばれた腕だけを評価する() {
-        // 条件が真なら else 側の 1/0 は評価されない（短絡評価）
-        assert_eq!(
-            eval("let x = 0\nif x == 0 { 100 } else { 1 / x }"),
-            Ok(num(100.0))
-        );
+        assert_eq!(eval("let x = 0; if x == 0 { 100 } else { 1 / x };"), Ok(num(100.0)));
     }
 
     #[test]
     fn 比較は加減算より弱く結合する() {
-        // 1 + 2 == 3 は (1 + 2) == 3 → true
-        assert_eq!(eval("1 + 2 == 3"), Ok(Value::Bool(true)));
+        assert_eq!(eval("1 + 2 == 3;"), Ok(Value::Bool(true)));
     }
 
     #[test]
     fn ゼロ除算はエラー() {
-        assert_eq!(eval("1 / 0"), Err(AwaError::DivisionByZero));
+        assert_eq!(eval("1 / 0;"), Err(AwaError::DivisionByZero));
     }
 
     #[test]
     fn 未定義変数はエラー() {
-        assert_eq!(
-            eval("q + 1"),
-            Err(AwaError::UndefinedVariable("q".to_string()))
-        );
+        assert_eq!(eval("q + 1;"), Err(AwaError::UndefinedVariable("q".to_string())));
     }
 
     #[test]
     fn 型エラー_boolに算術() {
         assert_eq!(
-            eval("true + 1"),
-            Err(AwaError::TypeError {
-                expected: "Num",
-                found: "Bool"
-            })
+            eval("true + 1;"),
+            Err(AwaError::TypeError { expected: "Num", found: "Bool" })
         );
     }
-
-    // TODO(あなた): ここに数個テストを足してください。
-    //
-    // 「今は正しく動くが、将来うっかり壊しそうな振る舞い」を狙うと有効です。
-    // 候補（どれでも・自由に）:
-    //   1. if の条件が数値だと型エラーになること
-    //        eval("if 1 { 2 } else { 3 }") は
-    //        Err(AwaError::TypeError { expected: "Bool", found: "Num" }) のはず
-    //   2. Num と Bool の等価比較 (==) は型エラーになること
-    //        eval("1 == true") は何を返すべき? （values_equal の実装を確認）
-    //   3. REPL 的な「複数行で env を持ち越す」挙動
-    //        ヒント: eval ヘルパは最後の値だけ返す。途中の値も見たいなら
-    //        run(src, &mut env) を直接呼んで Vec<Value> 全体を assert する。
-    //   4. 括弧の対応が壊れた入力 "(1 + 2" がパースエラーになること
-    //        どの AwaError ヴァリアントになるか予想してから書くと学びが深い。
 
     #[test]
     fn 型エラー_ifの条件が数値() {
         assert_eq!(
-            eval("if 1 { 2 } else { 3 }"),
-            Err(AwaError::TypeError {
-                expected: "Bool",
-                found: "Num"
-            })
+            eval("if 1 { 2 } else { 3 };"),
+            Err(AwaError::TypeError { expected: "Bool", found: "Num" })
         );
     }
 
     #[test]
     fn 型エラー_numとboolの比較() {
         assert_eq!(
-            eval("1 == true"),
-            Err(AwaError::TypeError {
-                expected: "Num",
-                found: "Bool"
-            })
+            eval("1 == true;"),
+            Err(AwaError::TypeError { expected: "Num", found: "Bool" })
         );
     }
 
     #[test]
     fn repl_env持ち越し() {
         let mut env = Env::new();
-        assert_eq!(run("let x = 10", &mut env), Ok(vec![Value::Num(10.0)]));
-        assert_eq!(run("x + 5", &mut env), Ok(vec![Value::Num(15.0)]));
+        assert_eq!(run("let x = 10;", &mut env), Ok(vec![Value::Num(10.0)]));
+        assert_eq!(run("x + 5;", &mut env), Ok(vec![Value::Num(15.0)]));
     }
 
     #[test]
     fn 括弧の対応が壊れた入力() {
-        assert_eq!(eval("(1 + 2"), Err(AwaError::UnexpectedEof));
+        assert_eq!(eval("(1 + 2;"), Err(AwaError::UnexpectedToken("Semicolon".to_string())));
+    }
+
+    #[test]
+    fn セミコロン無しはエラー() {
+        assert_eq!(eval("1 + 2"), Err(AwaError::UnexpectedEof));
     }
 
     #[test]
     fn 基本的な関数呼び出し() {
-        assert_eq!(eval("let add = fn(a, b) { a + b }\nadd(1, 2)"), Ok(num(3.0)));
+        assert_eq!(eval("let add = fn(a, b) { a + b }; add(1, 2);"), Ok(num(3.0)));
     }
 
     #[test]
     fn クロージャは定義時の変数を捕捉する() {
-        // make_adder(5) が返す関数は、呼び出し時に n=5 を覚えている（レキシカルスコープ）。
         assert_eq!(
-            eval("let make_adder = fn(n) { fn(x) { x + n } }\nlet add5 = make_adder(5)\nadd5(10)"),
+            eval("let make_adder = fn(n) { fn(x) { x + n } }; let add5 = make_adder(5); add5(10);"),
             Ok(num(15.0))
         );
     }
 
     #[test]
     fn 高階関数_関数を引数に渡せる() {
-        // apply_twice(f, x) = f(f(x))。f に関数値を渡す。
         assert_eq!(
-            eval("let inc = fn(x) { x + 1 }\nlet twice = fn(f, x) { f(f(x)) }\ntwice(inc, 0)"),
+            eval("let inc = fn(x) { x + 1 }; let twice = fn(f, x) { f(f(x)) }; twice(inc, 0);"),
             Ok(num(2.0))
         );
     }
 
     #[test]
     fn 再帰関数() {
-        // 階乗。呼び出しのたびに新しい call_env ができるので再帰が成立する。
         assert_eq!(
-            eval("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }\nfact(5)"),
+            eval("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5);"),
             Ok(num(120.0))
         );
     }
 
     #[test]
     fn レキシカルスコープ_呼び出し場所の変数は見えない() {
-        // f は定義時に x を捕捉していない。呼び出し側に x があっても参照できない。
         assert_eq!(
-            eval("let f = fn() { x }\nlet x = 99\nf()"),
+            eval("let f = fn() { x }; let x = 99; f();"),
             Err(AwaError::UndefinedVariable("x".to_string()))
         );
     }
@@ -982,13 +938,19 @@ mod tests {
     #[test]
     fn 引数の個数が合わないとエラー() {
         assert_eq!(
-            eval("let add = fn(a, b) { a + b }\nadd(1)"),
+            eval("let add = fn(a, b) { a + b }; add(1);"),
             Err(AwaError::ArityMismatch { expected: 2, found: 1 })
         );
     }
 
     #[test]
     fn 関数でない値の呼び出しはエラー() {
-        assert_eq!(eval("let x = 5\nx(1)"), Err(AwaError::NotCallable("Num")));
+        assert_eq!(eval("let x = 5; x(1);"), Err(AwaError::NotCallable("Num")));
+    }
+
+    #[test]
+    fn 複数行に折り返した式() {
+        // 改行は空白扱い。式が複数行にまたがれる。
+        assert_eq!(eval("1 +\n2 +\n3;"), Ok(num(6.0)));
     }
 }
