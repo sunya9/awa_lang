@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{Write, stdout};
 
 // ===== エラー型 =====
 // 言語全体で使うエラーを 1 つの enum にまとめる。
@@ -523,19 +524,18 @@ fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
     }
 }
 
-// プログラム（文の並び）を順に評価する。1 つの env を共有するので、
-// let で束縛した変数を後続の文から参照できる。
-fn eval_program(stmts: &[Stmt]) -> Result<(), AwaError> {
-    let mut env: Env = HashMap::new();
+// プログラム（文の並び）を順に評価する。env は呼び出し側が所有して渡す。
+// こうすると REPL は同じ env を行をまたいで使い回せ、let の束縛が持ち越せる。
+fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<(), AwaError> {
     for stmt in stmts {
         match stmt {
             Stmt::Let(name, expr) => {
-                let value = eval_expr(expr, &env)?;
+                let value = eval_expr(expr, env)?;
                 env.insert(name.clone(), value);
                 println!("let {} = {}", name, value);
             }
             Stmt::Expr(expr) => {
-                println!("{}", eval_expr(expr, &env)?);
+                println!("{}", eval_expr(expr, env)?);
             }
         }
     }
@@ -543,34 +543,87 @@ fn eval_program(stmts: &[Stmt]) -> Result<(), AwaError> {
 }
 
 // ===== パイプライン =====
-// tokenize → parse → eval を ? で連結。どこで失敗しても Err が main まで伝わる。
-// この「失敗しうる処理を縦に積む」形が Result の真価。
-fn run(source: &str) -> Result<(), AwaError> {
+// tokenize → parse → eval を ? で連結。どこで失敗しても Err が呼び出し側へ伝わる。
+// env を借用で受け取るので、ファイル実行（使い捨て env）も REPL（持ち越す env）も
+// この 1 つの関数で賄える。
+fn run(source: &str, env: &mut Env) -> Result<(), AwaError> {
     let tokens = tokenize(source)?;
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
-    eval_program(&program)
+    eval_program(&program, env)
+}
+
+// ===== ファイル実行 =====
+// .awa ファイルを読んで一括実行する。エラーが出たら表示して終了する
+// （REPL と違い、続行はしない）。
+fn run_file(path: &str) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ファイルを読めません ({}): {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    // ファイル実行では env は使い捨て（プログラムの実行中だけ生きる）。
+    let mut env: Env = HashMap::new();
+    if let Err(e) = run(&source, &mut env) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+// ===== REPL（対話実行）=====
+// 1 行読んでは評価する。env はループの外で持つので、let で束縛した変数を
+// 次の行から参照できる（セッション状態）。
+//
+// TODO(あなた): REPL のループ本体を実装してください。
+//
+// 使える道具:
+//   - stdin から 1 行読む:
+//         let mut line = String::new();
+//         let n = stdin.read_line(&mut line)?;   // n == 0 なら EOF（Ctrl-D）
+//   - 評価: run(&line, &mut env) が Result<(), AwaError> を返す。
+//
+// 実装の指針（ここが設計判断）:
+//   1. ループで「プロンプト表示 → 1 行読む → 評価」を繰り返す。
+//   2. read_line が 0（EOF, Ctrl-D）を返したらループを抜ける。
+//   3. ★重要★ run がエラーを返しても REPL は落とさず、エラーを表示して
+//      次の入力へ進む（ファイル実行とは逆の方針）。
+//   4. 空行（改行だけ）は評価をスキップしてよい（お好みで）。
+//
+// 参考: プロンプトは print! の後に stdout().flush() しないと表示されない
+// （println! と違い print! は改行が無く、行バッファのまま出ないことがある）。
+fn repl() -> std::io::Result<()> {
+    println!("awa REPL — Ctrl-D で終了");
+    let mut env: Env = HashMap::new();
+    let stdin = std::io::stdin();
+    loop {
+        print!("awa> ");
+        stdout().flush()?;
+        let mut line = String::new();
+        let n = stdin.read_line(&mut line);
+        if n? == 0 {
+            break; // EOF
+        }
+        let result = run(&line, &mut env);
+        match result {
+            Ok(()) => {}
+            Err(e) => eprintln!("エラー: {}", e),
+        }
+    }
+    Ok(())
 }
 
 fn main() {
-    let programs = [
-        "let x = 5\nlet y = x * 2 + 1\nx + y\ny / x",
-        "let a = 10\na / (a - 10)",                 // 0 除算
-        "let p = 3\nq + 1",                         // 未定義変数 q → UndefinedVariable
-        "-3\n-2 * 5\n-(1 + 2)\nlet n = 4\n-n + 10", // 単項マイナス
-        // if と比較（Rust 風の波括弧）
-        "let a = 3\nlet b = 5\nif a < b { a } else { b }\nif a == b { 1 } else { 0 }",
-        // 比較の優先順位: 1 + 2 == 3 は (1 + 2) == 3 → true
-        "1 + 2 == 3\n2 * 3 < 5\ntrue == true\ntrue != false",
-        // 短絡評価: 偽の腕の 1 / x（x=0）は評価されないはず
-        "let x = 0\nif x == 0 { 100 } else { 1 / x }",
-        "if 1 { 2 } else { 3 }", // 型エラー: 条件が Bool でない
-        "true + 1",              // 型エラー: Bool に算術
-    ];
-    for (i, src) in programs.iter().enumerate() {
-        println!("=== program {} ===", i + 1);
-        if let Err(e) = run(src) {
-            println!("error: {}", e);
+    // 引数: awa <file> ならファイル実行、引数なしなら REPL。
+    // args().nth(1) は最初の引数（args[0] は実行ファイル名なので飛ばす）。
+    match std::env::args().nth(1) {
+        Some(path) => run_file(&path),
+        None => {
+            if let Err(e) = repl() {
+                eprintln!("REPL エラー: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }

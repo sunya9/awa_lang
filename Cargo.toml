@@ -3,4 +3,10 @@ name = "awa_lang"
 version = "0.1.0"
 edition = "2024"
 
+# 正式名は awa_lang だが、コマンド名は短く awa にする。
+# これで `awa foo.awa` / `awa`（REPL）と叩ける。
+[[bin]]
+name = "awa"
+path = "src/main.rs"
+
 [dependencies]
