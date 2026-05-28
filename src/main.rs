@@ -7,7 +7,9 @@ use std::io::{Write, stdout};
 // これ自体が ADT（代数的データ型）の練習であり、Phase 3 で本格化する
 // パターンマッチ／網羅性チェックの土台になる。
 // ヴァリアントを増やすと、match で対応漏れがコンパイルエラーになる。
-#[derive(Debug)]
+// PartialEq を derive しておくと、テストで assert_eq!(..., Err(AwaError::DivisionByZero))
+// のようにエラーの種類まで含めて比較できる。
+#[derive(Debug, PartialEq)]
 enum AwaError {
     UnexpectedChar(char),      // 字句解析: 知らない文字
     InvalidNumber(String),     // 字句解析: 数値として parse できない
@@ -524,29 +526,33 @@ fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
     }
 }
 
-// プログラム（文の並び）を順に評価する。env は呼び出し側が所有して渡す。
-// こうすると REPL は同じ env を行をまたいで使い回せ、let の束縛が持ち越せる。
-fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<(), AwaError> {
+// プログラム（文の並び）を順に評価し、各文の値を順に返す。
+// env は呼び出し側が所有して渡す（REPL は行をまたいで使い回す）。
+//
+// 「計算」だけを行い「表示」はしない純粋関数にしてある。こうすると
+// テストは戻り値の Vec<Value> を assert するだけで済む（I/O と分離）。
+// Let も束縛した値を結果に含める（REPL でその場で確認しやすい）。
+fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
+    let mut results = Vec::new();
     for stmt in stmts {
-        match stmt {
+        let value = match stmt {
             Stmt::Let(name, expr) => {
                 let value = eval_expr(expr, env)?;
                 env.insert(name.clone(), value);
-                println!("let {} = {}", name, value);
+                value
             }
-            Stmt::Expr(expr) => {
-                println!("{}", eval_expr(expr, env)?);
-            }
-        }
+            Stmt::Expr(expr) => eval_expr(expr, env)?,
+        };
+        results.push(value);
     }
-    Ok(())
+    Ok(results)
 }
 
 // ===== パイプライン =====
 // tokenize → parse → eval を ? で連結。どこで失敗しても Err が呼び出し側へ伝わる。
 // env を借用で受け取るので、ファイル実行（使い捨て env）も REPL（持ち越す env）も
 // この 1 つの関数で賄える。
-fn run(source: &str, env: &mut Env) -> Result<(), AwaError> {
+fn run(source: &str, env: &mut Env) -> Result<Vec<Value>, AwaError> {
     let tokens = tokenize(source)?;
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
@@ -566,9 +572,16 @@ fn run_file(path: &str) {
     };
     // ファイル実行では env は使い捨て（プログラムの実行中だけ生きる）。
     let mut env: Env = HashMap::new();
-    if let Err(e) = run(&source, &mut env) {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
+    match run(&source, &mut env) {
+        Ok(values) => {
+            for v in values {
+                println!("{}", v);
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -582,7 +595,7 @@ fn run_file(path: &str) {
 //   - stdin から 1 行読む:
 //         let mut line = String::new();
 //         let n = stdin.read_line(&mut line)?;   // n == 0 なら EOF（Ctrl-D）
-//   - 評価: run(&line, &mut env) が Result<(), AwaError> を返す。
+//   - 評価: run(&line, &mut env) が Result<Vec<Value>, AwaError> を返す。
 //
 // 実装の指針（ここが設計判断）:
 //   1. ループで「プロンプト表示 → 1 行読む → 評価」を繰り返す。
@@ -607,7 +620,11 @@ fn repl() -> std::io::Result<()> {
         }
         let result = run(&line, &mut env);
         match result {
-            Ok(()) => {}
+            Ok(values) => {
+                for v in values {
+                    println!("{}", v);
+                }
+            }
             Err(e) => eprintln!("エラー: {}", e),
         }
     }
@@ -625,5 +642,134 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+// ===== テスト =====
+// `cargo test` で実行される。#[cfg(test)] が付いたモジュールは
+// テストビルドのときだけコンパイルされ、本番バイナリには含まれない。
+#[cfg(test)]
+mod tests {
+    // 親モジュール（このファイルのトップレベル）の項目を全部使えるようにする。
+    use super::*;
+
+    // テスト用ヘルパ: ソースを実行し「最後の文の値」を返す。
+    // 多くのテストは最終行の結果だけ確認したいので、それを 1 行で書けるようにする。
+    fn eval(src: &str) -> Result<Value, AwaError> {
+        let mut env = Env::new();
+        run(src, &mut env).map(|values| *values.last().expect("少なくとも 1 文を期待"))
+    }
+
+    // 数値リテラルを作るショートカット。
+    fn num(n: f64) -> Value {
+        Value::Num(n)
+    }
+
+    #[test]
+    fn 演算子優先順位() {
+        assert_eq!(eval("1 + 2 * 3"), Ok(num(7.0)));
+        assert_eq!(eval("(1 + 2) * 3"), Ok(num(9.0)));
+        assert_eq!(eval("2 * (3 + 4) - 1"), Ok(num(13.0)));
+    }
+
+    #[test]
+    fn 変数束縛は後続の文から参照できる() {
+        assert_eq!(eval("let x = 5\nlet y = x * 2 + 1\nx + y"), Ok(num(16.0)));
+    }
+
+    #[test]
+    fn 単項マイナスは乗算より強く結合する() {
+        // -2 * 5 は (-2) * 5 = -10
+        assert_eq!(eval("-2 * 5"), Ok(num(-10.0)));
+        // --3 は -(-3) = 3
+        assert_eq!(eval("--3"), Ok(num(3.0)));
+    }
+
+    #[test]
+    fn if_は選ばれた腕だけを評価する() {
+        // 条件が真なら else 側の 1/0 は評価されない（短絡評価）
+        assert_eq!(
+            eval("let x = 0\nif x == 0 { 100 } else { 1 / x }"),
+            Ok(num(100.0))
+        );
+    }
+
+    #[test]
+    fn 比較は加減算より弱く結合する() {
+        // 1 + 2 == 3 は (1 + 2) == 3 → true
+        assert_eq!(eval("1 + 2 == 3"), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn ゼロ除算はエラー() {
+        assert_eq!(eval("1 / 0"), Err(AwaError::DivisionByZero));
+    }
+
+    #[test]
+    fn 未定義変数はエラー() {
+        assert_eq!(
+            eval("q + 1"),
+            Err(AwaError::UndefinedVariable("q".to_string()))
+        );
+    }
+
+    #[test]
+    fn 型エラー_boolに算術() {
+        assert_eq!(
+            eval("true + 1"),
+            Err(AwaError::TypeError {
+                expected: "Num",
+                found: "Bool"
+            })
+        );
+    }
+
+    // TODO(あなた): ここに数個テストを足してください。
+    //
+    // 「今は正しく動くが、将来うっかり壊しそうな振る舞い」を狙うと有効です。
+    // 候補（どれでも・自由に）:
+    //   1. if の条件が数値だと型エラーになること
+    //        eval("if 1 { 2 } else { 3 }") は
+    //        Err(AwaError::TypeError { expected: "Bool", found: "Num" }) のはず
+    //   2. Num と Bool の等価比較 (==) は型エラーになること
+    //        eval("1 == true") は何を返すべき? （values_equal の実装を確認）
+    //   3. REPL 的な「複数行で env を持ち越す」挙動
+    //        ヒント: eval ヘルパは最後の値だけ返す。途中の値も見たいなら
+    //        run(src, &mut env) を直接呼んで Vec<Value> 全体を assert する。
+    //   4. 括弧の対応が壊れた入力 "(1 + 2" がパースエラーになること
+    //        どの AwaError ヴァリアントになるか予想してから書くと学びが深い。
+
+    #[test]
+    fn 型エラー_ifの条件が数値() {
+        assert_eq!(
+            eval("if 1 { 2 } else { 3 }"),
+            Err(AwaError::TypeError {
+                expected: "Bool",
+                found: "Num"
+            })
+        );
+    }
+
+    #[test]
+    fn 型エラー_numとboolの比較() {
+        assert_eq!(
+            eval("1 == true"),
+            Err(AwaError::TypeError {
+                expected: "Num",
+                found: "Bool"
+            })
+        );
+    }
+
+    #[test]
+    fn repl_env持ち越し() {
+        let mut env = Env::new();
+        assert_eq!(run("let x = 10", &mut env), Ok(vec![Value::Num(10.0)]));
+        assert_eq!(run("x + 5", &mut env), Ok(vec![Value::Num(15.0)]));
+    }
+
+    #[test]
+    fn 括弧の対応が壊れた入力() {
+        assert_eq!(eval("(1 + 2"), Err(AwaError::UnexpectedEof));
     }
 }
