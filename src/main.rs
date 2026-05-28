@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Write, stdout};
+use std::rc::Rc;
 
 // ===== エラー型 =====
 // 言語全体で使うエラーを 1 つの enum にまとめる。
@@ -22,6 +23,12 @@ enum AwaError {
         expected: &'static str,
         found: &'static str,
     },
+    NotCallable(&'static str), // 評価: 関数でない値を呼び出した
+    ArityMismatch {
+        // 評価: 引数の個数が宣言と合わない
+        expected: usize,
+        found: usize,
+    },
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -42,6 +49,16 @@ impl fmt::Display for AwaError {
                     expected, found
                 )
             }
+            AwaError::NotCallable(found) => {
+                write!(f, "{} は関数ではないので呼び出せません", found)
+            }
+            AwaError::ArityMismatch { expected, found } => {
+                write!(
+                    f,
+                    "引数の個数が違います: {} 個必要ですが {} 個でした",
+                    expected, found
+                )
+            }
         }
     }
 }
@@ -55,6 +72,8 @@ enum Token {
     Let,           // キーワード let
     If,            // キーワード if
     Else,          // キーワード else
+    Fn,            // キーワード fn
+    Comma,         // ,
     Equal,         // =
     EqEq,          // ==
     NotEq,         // !=
@@ -158,6 +177,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                 tokens.push(Token::RBrace);
                 i += 1;
             }
+            ',' => {
+                tokens.push(Token::Comma);
+                i += 1;
+            }
             '0'..='9' | '.' => {
                 let start = i;
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
@@ -180,6 +203,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                     "let" => Token::Let,
                     "if" => Token::If,
                     "else" => Token::Else,
+                    "fn" => Token::Fn,
                     "true" => Token::Bool(true),
                     "false" => Token::Bool(false),
                     _ => Token::Ident(word),
@@ -193,15 +217,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
 }
 
 // ===== AST =====
-#[derive(Debug)]
+// Clone を derive する理由: 関数を値にすると、Closure が本体 Expr を
+// 保持する。クロージャ生成時に本体を複製できる必要があるため。
+#[derive(Debug, Clone)]
 enum Expr {
     Num(f64),
     Bool(bool),     // 真偽値リテラル
     Var(String),    // 変数参照
     Neg(Box<Expr>), // 単項マイナス（例: -3, -(x + 1)）
     BinOp(Box<Expr>, Token, Box<Expr>),
-    // if 条件 then 真の腕 else 偽の腕。三項とも式。
+    // if 条件 { 真の腕 } else { 偽の腕 }。三項とも式。
     If(Box<Expr>, Box<Expr>, Box<Expr>),
+    // 無名関数 fn(引数,...) { 本体 }。引数名のリストと本体の式。
+    Lambda(Vec<String>, Box<Expr>),
+    // 関数呼び出し callee(引数,...)。callee も式（変数とは限らない）。
+    Call(Box<Expr>, Vec<Expr>),
 }
 
 // 文（statement）。プログラムは文の並び。
@@ -214,13 +244,42 @@ enum Stmt {
 }
 
 // ===== 値（実行時の値）=====
-// これまで値は f64 だけだったが、比較や if のために Bool を導入。
-// Gleam と同じく「数値」と「真偽値」は別の型で、混同は型エラーになる。
-// Copy 可能なので env への出し入れで .copied() が使える。
-#[derive(Debug, Clone, Copy, PartialEq)]
+// 関数を第一級の値にしたので、もう Copy ではない（Func が本体と環境を抱える）。
+// 代わりに Clone を使う。Func は Rc<Closure> で包み、値の複製を安価にする
+// （本体や環境を毎回ディープコピーせず、参照カウントを増やすだけ）。
+#[derive(Debug, Clone)]
 enum Value {
     Num(f64),
     Bool(bool),
+    Func(Rc<Closure>),
+}
+
+// クロージャ = 関数 + 定義時の環境。
+//   params: 引数名のリスト
+//   body:   本体の式
+//   env:    定義された時点の環境のスナップショット（キャプチャ）
+// これにより fn(x){ x + n } が外側の n を覚えていられる。
+#[derive(Debug)]
+struct Closure {
+    params: Vec<String>,
+    body: Expr,
+    env: Env,
+    // この関数が let で束縛されたときの名前。再帰のために使う。
+    // 無名関数（束縛されずに即使われる等）は None。
+    name: Option<String>,
+}
+
+// Value 同士の等価比較。Num/Bool は中身で比較。関数は等価性を定義しない
+// （同一性比較は混乱のもとなので、常に false とする）。
+// derive せず手書きにしたのは、Closure に PartialEq が無いため。
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -228,6 +287,7 @@ impl fmt::Display for Value {
         match self {
             Value::Num(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", b),
+            Value::Func(c) => write!(f, "<fn/{}>", c.params.len()),
         }
     }
 }
@@ -237,6 +297,7 @@ fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Num(_) => "Num",
         Value::Bool(_) => "Bool",
+        Value::Func(_) => "Func",
     }
 }
 
@@ -250,9 +311,13 @@ type Env = HashMap<String, Value>;
 //   comparison = additive  (('<' | '>' | '<=' | '>=') additive)*
 //   additive   = term      (('+' | '-') term)*
 //   term       = unary     (('*' | '/') unary)*
-//   unary      = '-' unary | factor
-//   factor     = Num | Bool | Ident | '(' expr ')' | if
+//   unary      = '-' unary | call
+//   call       = factor ('(' args? ')')*
+//   args       = expr (',' expr)*
+//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda
 //   if         = 'if' expr '{' expr '}' 'else' '{' expr '}'
+//   lambda     = 'fn' '(' params? ')' '{' expr '}'
+//   params     = Ident (',' Ident)*
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -387,8 +452,35 @@ impl Parser {
             let operand = self.parse_unary()?;
             Ok(Expr::Neg(Box::new(operand)))
         } else {
-            self.parse_factor()
+            self.parse_call()
         }
+    }
+
+    // 呼び出し層。factor を読んだ後、続く ( ... ) を貪欲に呼び出しとして畳む。
+    // f(1)(2) のような連鎖（高階関数の戻り値を即呼び出す）も自然に扱える。
+    //   call = factor ('(' args? ')')*
+    //   args = expr (',' expr)*
+    fn parse_call(&mut self) -> Result<Expr, AwaError> {
+        let mut expr = self.parse_factor()?;
+        while let Some(Token::LParen) = self.peek() {
+            self.next(); // '(' を消費
+            let mut args = Vec::new();
+            // 引数が無い呼び出し f() を許す。次が ')' でなければ引数列を読む。
+            if self.peek() != Some(&Token::RParen) {
+                loop {
+                    args.push(self.parse_expr()?);
+                    match self.peek() {
+                        Some(Token::Comma) => {
+                            self.next(); // ',' を消費して次の引数へ
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            self.expect(Token::RParen)?;
+            expr = Expr::Call(Box::new(expr), args);
+        }
+        Ok(expr)
     }
 
     fn parse_factor(&mut self) -> Result<Expr, AwaError> {
@@ -396,6 +488,33 @@ impl Parser {
             Some(Token::Num(n)) => Ok(Expr::Num(n)),
             Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
             Some(Token::Ident(name)) => Ok(Expr::Var(name)),
+            // 無名関数 fn(引数, ...) { 本体 }。引数名を読み、本体を波括弧で囲む。
+            Some(Token::Fn) => {
+                self.expect(Token::LParen)?;
+                let mut params = Vec::new();
+                if self.peek() != Some(&Token::RParen) {
+                    loop {
+                        match self.next() {
+                            Some(Token::Ident(name)) => params.push(name),
+                            Some(other) => {
+                                return Err(AwaError::UnexpectedToken(format!("{:?}", other)));
+                            }
+                            None => return Err(AwaError::UnexpectedEof),
+                        }
+                        match self.peek() {
+                            Some(Token::Comma) => {
+                                self.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                let body = self.parse_expr()?;
+                self.expect(Token::RBrace)?;
+                Ok(Expr::Lambda(params, Box::new(body)))
+            }
             // 'if' は既に消費済み。Rust 風: if 条件 { 真の腕 } else { 偽の腕 }。
             // 波括弧で腕を囲むので、ML 風の then/else と違い境界が明確。
             // 今は各腕に式 1 つだけ（将来ここを複数文のブロックに拡張できる）。
@@ -456,9 +575,11 @@ fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
     match expr {
         Expr::Num(n) => Ok(Value::Num(*n)),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
+        // 値はもう Copy ではないので .cloned() で複製する。
+        // Num/Bool は安価、Func は Rc のカウント増加で済む。
         Expr::Var(name) => env
             .get(name)
-            .copied()
+            .cloned()
             .ok_or_else(|| AwaError::UndefinedVariable(name.clone())),
         // 単項マイナスは数値専用。Bool に書くと型エラー。
         Expr::Neg(operand) => Ok(Value::Num(-as_num(eval_expr(operand, env)?)?)),
@@ -467,26 +588,57 @@ fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
             let r = eval_expr(right, env)?;
             eval_binop(l, op, r)
         }
-        // TODO(あなた): if 式 Expr::If(cond, then_branch, else_branch) を実装してください。
-        //
-        // やること:
-        //   1. cond を eval_expr で評価し、as_bool(...)? で bool を取り出す。
-        //      （cond が Num だと as_bool が型エラーを返す＝Gleam 的に Bool 必須）
-        //   2. その bool が true なら then_branch を、false なら else_branch を
-        //      eval_expr で評価して返す。
-        //   ★重要★ 選ばれた腕「だけ」を評価すること（短絡評価）。
-        //      両方評価すると、通らないはずの腕の 0 除算や未定義変数で
-        //      落ちてしまう。Rust の if 式はまさにこの「片方だけ」を満たす。
-        Expr::If(cond, then_branch, else_branch) => match eval_expr(cond, env) {
-            Ok(v) => {
-                if as_bool(v)? {
-                    eval_expr(then_branch, env)
-                } else {
-                    eval_expr(else_branch, env)
-                }
+        // if は選ばれた腕だけを評価する（短絡評価）。
+        Expr::If(cond, then_branch, else_branch) => {
+            if as_bool(eval_expr(cond, env)?)? {
+                eval_expr(then_branch, env)
+            } else {
+                eval_expr(else_branch, env)
             }
-            Err(e) => Err(e),
-        },
+        }
+        // 無名関数を評価すると Closure（関数 + 現在の環境のコピー）になる。
+        // env.clone() がキャプチャの実体。ここで包んだ env を、呼び出し時に
+        // 引数を足したスコープのベースとして使う。
+        Expr::Lambda(params, body) => Ok(Value::Func(Rc::new(Closure {
+            params: params.clone(),
+            body: (**body).clone(),
+            env: env.clone(),
+            name: None, // 束縛時に let 側で名前を付け直す（再帰のため）
+        }))),
+        // 関数呼び出し。
+        Expr::Call(callee, args) => {
+            // 1. 呼ぶ対象を評価し、関数であることを確認する。
+            let callee_val = eval_expr(callee, env)?;
+            let closure = match callee_val {
+                Value::Func(c) => c,
+                other => return Err(AwaError::NotCallable(type_name(&other))),
+            };
+            // 2. 引数の個数チェック。
+            if args.len() != closure.params.len() {
+                return Err(AwaError::ArityMismatch {
+                    expected: closure.params.len(),
+                    found: args.len(),
+                });
+            }
+            // 3. 各引数を「呼び出し側の env」で評価する（ここは呼び出し側スコープ）。
+            let mut arg_values = Vec::with_capacity(args.len());
+            for arg in args {
+                arg_values.push(eval_expr(arg, env)?);
+            }
+            // 本体を評価する環境を作る。ベースはキャプチャした closure.env
+            // （レキシカルスコープ）で、呼び出し側 env ではない。
+            let mut call_env = closure.env.clone();
+            // 再帰のため、名前付き関数なら「名前→自分自身」を call_env に入れる。
+            // これでクロージャ生成時には未束縛だった自分の名前を、本体から呼べる。
+            if let Some(name) = &closure.name {
+                call_env.insert(name.clone(), Value::Func(closure.clone()));
+            }
+            // 仮引数に実引数を束縛する。
+            for (param, value) in closure.params.iter().zip(arg_values) {
+                call_env.insert(param.clone(), value);
+            }
+            eval_expr(&closure.body, &call_env)
+        }
     }
 }
 
@@ -538,7 +690,20 @@ fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
         let value = match stmt {
             Stmt::Let(name, expr) => {
                 let value = eval_expr(expr, env)?;
-                env.insert(name.clone(), value);
+                // 関数を let で束縛するときは、その名前をクロージャに刻む。
+                // これで呼び出し時に「名前→自分自身」を注入でき、再帰が成立する。
+                // Rc の中身は不変なので、名前を入れた新しい Closure を作り直す。
+                let value = match value {
+                    Value::Func(c) => Value::Func(Rc::new(Closure {
+                        params: c.params.clone(),
+                        body: c.body.clone(),
+                        env: c.env.clone(),
+                        name: Some(name.clone()),
+                    })),
+                    other => other,
+                };
+                // Value はもう Copy ではないので、env に入れる分を clone する。
+                env.insert(name.clone(), value.clone());
                 value
             }
             Stmt::Expr(expr) => eval_expr(expr, env)?,
@@ -657,7 +822,7 @@ mod tests {
     // 多くのテストは最終行の結果だけ確認したいので、それを 1 行で書けるようにする。
     fn eval(src: &str) -> Result<Value, AwaError> {
         let mut env = Env::new();
-        run(src, &mut env).map(|values| *values.last().expect("少なくとも 1 文を期待"))
+        run(src, &mut env).map(|values| values.last().expect("少なくとも 1 文を期待").clone())
     }
 
     // 数値リテラルを作るショートカット。
@@ -771,5 +936,59 @@ mod tests {
     #[test]
     fn 括弧の対応が壊れた入力() {
         assert_eq!(eval("(1 + 2"), Err(AwaError::UnexpectedEof));
+    }
+
+    #[test]
+    fn 基本的な関数呼び出し() {
+        assert_eq!(eval("let add = fn(a, b) { a + b }\nadd(1, 2)"), Ok(num(3.0)));
+    }
+
+    #[test]
+    fn クロージャは定義時の変数を捕捉する() {
+        // make_adder(5) が返す関数は、呼び出し時に n=5 を覚えている（レキシカルスコープ）。
+        assert_eq!(
+            eval("let make_adder = fn(n) { fn(x) { x + n } }\nlet add5 = make_adder(5)\nadd5(10)"),
+            Ok(num(15.0))
+        );
+    }
+
+    #[test]
+    fn 高階関数_関数を引数に渡せる() {
+        // apply_twice(f, x) = f(f(x))。f に関数値を渡す。
+        assert_eq!(
+            eval("let inc = fn(x) { x + 1 }\nlet twice = fn(f, x) { f(f(x)) }\ntwice(inc, 0)"),
+            Ok(num(2.0))
+        );
+    }
+
+    #[test]
+    fn 再帰関数() {
+        // 階乗。呼び出しのたびに新しい call_env ができるので再帰が成立する。
+        assert_eq!(
+            eval("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }\nfact(5)"),
+            Ok(num(120.0))
+        );
+    }
+
+    #[test]
+    fn レキシカルスコープ_呼び出し場所の変数は見えない() {
+        // f は定義時に x を捕捉していない。呼び出し側に x があっても参照できない。
+        assert_eq!(
+            eval("let f = fn() { x }\nlet x = 99\nf()"),
+            Err(AwaError::UndefinedVariable("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn 引数の個数が合わないとエラー() {
+        assert_eq!(
+            eval("let add = fn(a, b) { a + b }\nadd(1)"),
+            Err(AwaError::ArityMismatch { expected: 2, found: 1 })
+        );
+    }
+
+    #[test]
+    fn 関数でない値の呼び出しはエラー() {
+        assert_eq!(eval("let x = 5\nx(1)"), Err(AwaError::NotCallable("Num")));
     }
 }
