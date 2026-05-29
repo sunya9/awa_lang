@@ -984,6 +984,14 @@ mod tests {
     }
 
     #[test]
+    fn codegen_文字列と変換() {
+        let out = compile_and_run(
+            "\"hello\" <> \" \" <> \"world\"\n\"a\" == \"a\"\nint_to_string(42)\nint_to_float(3) + 1.5",
+        );
+        assert_eq!(out, "hello world\ntrue\n42\n4.5\n");
+    }
+
+    #[test]
     fn codegen_adtとパターンマッチ() {
         // Option の構築・case と、再帰 ADT(List)の畳み込みが native 実行される。
         let out = compile_and_run(

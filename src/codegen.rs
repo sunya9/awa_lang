@@ -27,10 +27,39 @@ fn llvm_ty(ty: &Type) -> Result<String> {
         Type::Int | Type::Long => Ok("i64".into()),
         Type::Float => Ok("double".into()),
         Type::Bool => Ok("i1".into()),
+        Type::Str => Ok("ptr".into()),
         Type::Fun(..) => Ok(CLOSURE_TY.into()),
         Type::Con(..) => Ok("ptr".into()),
         other => unsupported(format!("型 {}", other)),
     }
+}
+
+// 数値変換などの組込関数（codegen 側）。
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "int_to_float"
+            | "float_to_int"
+            | "int_to_long"
+            | "long_to_int"
+            | "int_to_string"
+            | "float_to_string"
+    )
+}
+
+// Rust 文字列 → LLVM の文字列定数 `[N x i8] c"...\00"` と長さ N（null 込み）。
+fn llvm_string_constant(s: &str) -> (String, usize) {
+    let mut body = String::new();
+    for &b in s.as_bytes() {
+        if b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b) {
+            body.push_str(&format!("\\{:02X}", b));
+        } else {
+            body.push(b as char);
+        }
+    }
+    body.push_str("\\00");
+    let n = s.len() + 1;
+    (format!("[{} x i8] c\"{}\"", n, body), n)
 }
 
 // 構築子の情報（タグ・arity・所属型・フィールド型式・型パラメータ）。
@@ -99,6 +128,8 @@ struct Module {
     fn_ctr: usize,                          // 匿名関数 @fnN の採番
     globals: HashMap<String, (Vec<Type>, Type)>, // トップレベル関数名 → (引数型, 戻り型)
     ctors: HashMap<String, CtorInfo>,       // 構築子名 → 情報
+    strings: String,                        // 文字列リテラルのグローバル定義
+    str_ctr: usize,
 }
 
 impl Module {
@@ -106,6 +137,15 @@ impl Module {
         let n = self.fn_ctr;
         self.fn_ctr += 1;
         format!("fn{}", n)
+    }
+    // 文字列リテラルをグローバル定数として登録し、その ptr（@.strN）を返す。
+    fn intern_string(&mut self, s: &str) -> String {
+        let label = format!("@.str{}", self.str_ctr);
+        self.str_ctr += 1;
+        let (constant, _) = llvm_string_constant(s);
+        self.strings
+            .push_str(&format!("{} = private unnamed_addr constant {}\n", label, constant));
+        label
     }
 }
 
@@ -153,7 +193,8 @@ impl Gen {
             TExprKind::Int(n) | TExprKind::Long(n) => Ok(n.to_string()),
             TExprKind::Float(n) => Ok(format!("0x{:016X}", n.to_bits())),
             TExprKind::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
-            TExprKind::Str(_) => unsupported("型 String"),
+            // 文字列リテラル → グローバル定数への ptr。
+            TExprKind::Str(s) => Ok(m.intern_string(s)),
             TExprKind::Var(name) => self.var(name, m),
             TExprKind::Neg(x) => {
                 let v = self.expr(x, m)?;
@@ -319,6 +360,10 @@ impl Gen {
     fn binop(&mut self, l: &TExpr, op: &Token, r: &TExpr, m: &mut Module) -> Result<String> {
         let lv = self.expr(l, m)?;
         let rv = self.expr(r, m)?;
+        // 文字列の連結と等価はランタイム関数（ptr 比較ではなく中身で比べる）。
+        if matches!(l.ty, Type::Str) {
+            return self.str_binop(op, &lv, &rv);
+        }
         let llty = llvm_ty(&l.ty)?;
         let float = is_float(&l.ty);
         let reg = format!("%t{}", self.fresh());
@@ -351,6 +396,58 @@ impl Gen {
         };
         self.line(&format!("{} = {} {} {}, {}", reg, pred, llty, lv, rv));
         Ok(reg)
+    }
+
+    // 文字列の連結 <> と等価 ==/!=（中身比較）。
+    fn str_binop(&mut self, op: &Token, lv: &str, rv: &str) -> Result<String> {
+        let r = format!("%t{}", self.fresh());
+        match op {
+            Token::Concat => {
+                self.line(&format!("{} = call ptr @awa_concat(ptr {}, ptr {})", r, lv, rv));
+                Ok(r)
+            }
+            Token::EqEq | Token::NotEq => {
+                let c = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i32 @strcmp(ptr {}, ptr {})", c, lv, rv));
+                let pred = if matches!(op, Token::EqEq) { "eq" } else { "ne" };
+                self.line(&format!("{} = icmp {} i32 {}, 0", r, pred, c));
+                Ok(r)
+            }
+            _ => unsupported("文字列にこの演算子は使えません"),
+        }
+    }
+
+    // 組込変換関数（すべて単項）。
+    fn builtin_call(&mut self, name: &str, arg: &str, arg_ty: &Type) -> Result<String> {
+        let r = format!("%t{}", self.fresh());
+        match name {
+            "int_to_float" => {
+                self.line(&format!("{} = sitofp i64 {} to double", r, arg));
+                Ok(r)
+            }
+            "float_to_int" => {
+                self.line(&format!("{} = fptosi double {} to i64", r, arg));
+                Ok(r)
+            }
+            // i64 ↔ i64（nominal 区別のみ）。実体は同じ。
+            "int_to_long" | "long_to_int" => Ok(arg.to_string()),
+            "int_to_string" | "float_to_string" => {
+                let (fmt, llty) = if matches!(arg_ty, Type::Float) {
+                    ("@.ff", "double")
+                } else {
+                    ("@.fi", "i64")
+                };
+                let buf = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call ptr @malloc(i64 32)", buf));
+                let n = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call i32 (ptr, i64, ptr, ...) @snprintf(ptr {}, i64 32, ptr {}, {} {})",
+                    n, buf, fmt, llty, arg
+                ));
+                Ok(buf)
+            }
+            _ => unsupported(format!("組込関数 {}", name)),
+        }
     }
 
     fn if_expr(&mut self, c: &TExpr, t: &TExpr, e: &TExpr, m: &mut Module) -> Result<String> {
@@ -408,6 +505,13 @@ impl Gen {
     fn call(&mut self, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
         // 引数の型と値。
         let mut arg_parts = Vec::with_capacity(args.len());
+        // callee が組込変換関数なら専用 IR（すべて単項）。
+        if let TExprKind::Var(name) = &callee.kind {
+            if is_builtin(name) {
+                let v = self.expr(&args[0], m)?;
+                return self.builtin_call(name, &v, &args[0].ty);
+            }
+        }
         // callee が構築子なら、引数を評価して Data ブロックを構築。
         if let TExprKind::Var(name) = &callee.kind {
             if let Some(ci) = m.ctors.get(name).cloned() {
@@ -731,6 +835,8 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
         fn_ctr: 0,
         globals,
         ctors,
+        strings: String::new(),
+        str_ctr: 0,
     };
 
     // トップレベル関数を @name で出力（キャプチャなし＝env は使わない）。
@@ -754,13 +860,37 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     let main = compile_main(stmts, &mut m)?;
 
     let mut module = String::new();
+    // ランタイム宣言。
     module.push_str("declare i32 @printf(ptr, ...)\n");
     module.push_str("declare ptr @malloc(i64)\n");
+    module.push_str("declare i64 @strlen(ptr)\n");
+    module.push_str("declare ptr @memcpy(ptr, ptr, i64)\n");
+    module.push_str("declare i32 @strcmp(ptr, ptr)\n");
+    module.push_str("declare i32 @snprintf(ptr, i64, ptr, ...)\n");
+    // 書式・定数文字列。
     module.push_str("@.di = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n");
     module.push_str("@.df = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"\n");
     module.push_str("@.ds = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"\n");
+    module.push_str("@.fi = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n");
+    module.push_str("@.ff = private unnamed_addr constant [3 x i8] c\"%g\\00\"\n");
     module.push_str("@.t = private unnamed_addr constant [5 x i8] c\"true\\00\"\n");
-    module.push_str("@.f = private unnamed_addr constant [6 x i8] c\"false\\00\"\n\n");
+    module.push_str("@.f = private unnamed_addr constant [6 x i8] c\"false\\00\"\n");
+    module.push_str(&m.strings);
+    // 文字列連結ランタイム。
+    module.push_str(
+        "\ndefine ptr @awa_concat(ptr %a, ptr %b) {\n\
+         \x20 %la = call i64 @strlen(ptr %a)\n\
+         \x20 %lb = call i64 @strlen(ptr %b)\n\
+         \x20 %lab = add i64 %la, %lb\n\
+         \x20 %sz = add i64 %lab, 1\n\
+         \x20 %buf = call ptr @malloc(i64 %sz)\n\
+         \x20 %c1 = call ptr @memcpy(ptr %buf, ptr %a, i64 %la)\n\
+         \x20 %tail = getelementptr i8, ptr %buf, i64 %la\n\
+         \x20 %lb1 = add i64 %lb, 1\n\
+         \x20 %c2 = call ptr @memcpy(ptr %tail, ptr %b, i64 %lb1)\n\
+         \x20 ret ptr %buf\n\
+         }\n\n",
+    );
     module.push_str(&m.funcs);
     module.push_str(&main);
     Ok(module)
@@ -811,6 +941,13 @@ fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
                 r, s
             ));
         }
+        Type::Str => {
+            let r = g.fresh();
+            g.line(&format!(
+                "%p{} = call i32 (ptr, ...) @printf(ptr @.ds, ptr {})",
+                r, operand
+            ));
+        }
         other => return unsupported(format!("出力できない型 {}", other)),
     }
     Ok(())
@@ -858,8 +995,10 @@ mod tests {
     }
 
     #[test]
-    fn 文字列は未対応() {
-        assert!(matches!(try_ir(r#""hi""#), Err(AwaError::Unsupported(_))));
+    fn 文字列の連結を出力する() {
+        let out = ir(r#""a" <> "b""#);
+        assert!(out.contains("@awa_concat"));
+        assert!(out.contains("constant")); // 文字列リテラルのグローバル
     }
 
     #[test]
