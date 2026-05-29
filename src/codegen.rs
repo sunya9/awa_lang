@@ -18,13 +18,19 @@ fn unsupported<T>(what: impl Into<String>) -> Result<T> {
     Err(AwaError::Unsupported(what.into()))
 }
 
-// awa の型 → LLVM 型。マイルストーン1 は Int/Bool のみ。
+// awa の型 → LLVM 型。Int/Long=i64、Float=double、Bool=i1。
 fn llvm_ty(ty: &Type) -> Result<&'static str> {
     match ty {
-        Type::Int => Ok("i64"),
+        Type::Int | Type::Long => Ok("i64"),
+        Type::Float => Ok("double"),
         Type::Bool => Ok("i1"),
         other => unsupported(format!("型 {}", other)),
     }
+}
+
+// 浮動小数か（命令選択用）。
+fn is_float(ty: &Type) -> bool {
+    matches!(ty, Type::Float)
 }
 
 // トップレベル関数のシグネチャ。
@@ -81,7 +87,9 @@ impl<'a> Gen<'a> {
     // 式をコンパイルし、結果の LLVM オペランド（即値 or レジスタ）を返す。
     fn expr(&mut self, e: &TExpr) -> Result<String> {
         match &e.kind {
-            TExprKind::Int(n) => Ok(n.to_string()),
+            TExprKind::Int(n) | TExprKind::Long(n) => Ok(n.to_string()),
+            // LLVM の double リテラルはビットパターンの 16 進で出すのが確実。
+            TExprKind::Float(n) => Ok(format!("0x{:016X}", n.to_bits())),
             TExprKind::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
             TExprKind::Var(name) => {
                 if let Some((slot, ty)) = self.locals.get(name).cloned() {
@@ -99,49 +107,60 @@ impl<'a> Gen<'a> {
             TExprKind::Neg(x) => {
                 let v = self.expr(x)?;
                 let r = format!("%t{}", self.fresh());
-                self.line(&format!("{} = sub i64 0, {}", r, v));
+                if is_float(&x.ty) {
+                    self.line(&format!("{} = fneg double {}", r, v));
+                } else {
+                    self.line(&format!("{} = sub i64 0, {}", r, v));
+                }
                 Ok(r)
             }
             TExprKind::BinOp(l, op, r) => self.binop(l, op, r),
             TExprKind::If(c, t, e) => self.if_expr(c, t, e),
             TExprKind::Call(callee, args) => self.call(callee, args),
             TExprKind::Block(stmts) => self.block(stmts),
+            TExprKind::Str(_) => unsupported("型 String"),
             TExprKind::Lambda(..) => unsupported("ネストした関数/クロージャ"),
             TExprKind::Case(..) => unsupported("case（パターンマッチ）"),
-            TExprKind::Long(_) | TExprKind::Float(_) | TExprKind::Str(_) => {
-                unsupported(format!("型 {}", e.ty))
-            }
         }
     }
 
     fn binop(&mut self, l: &TExpr, op: &Token, r: &TExpr) -> Result<String> {
         let lv = self.expr(l)?;
         let rv = self.expr(r)?;
+        let llty = llvm_ty(&l.ty)?; // l と r は同型（型検査済み）
+        let float = is_float(&l.ty);
         let r_reg = format!("%t{}", self.fresh());
-        let instr = match op {
-            Token::Plus => "add i64",
-            Token::Minus => "sub i64",
-            Token::Star => "mul i64",
-            Token::Slash => "sdiv i64", // 注: 0 除算は v1 では未チェック（UB）
-            // 比較。オペランドの LLVM 型は l の型から（Int/Bool）。
-            Token::Lt => return self.icmp("slt", l, &lv, &rv),
-            Token::Gt => return self.icmp("sgt", l, &lv, &rv),
-            Token::Le => return self.icmp("sle", l, &lv, &rv),
-            Token::Ge => return self.icmp("sge", l, &lv, &rv),
-            Token::EqEq => return self.icmp("eq", l, &lv, &rv),
-            Token::NotEq => return self.icmp("ne", l, &lv, &rv),
-            Token::Concat => return unsupported("文字列連結 <>"),
-            other => unreachable!("二項演算子でないトークン: {:?}", other),
+        // 算術: 整数は add/sub/mul/sdiv、浮動小数は fadd/fsub/fmul/fdiv。
+        let arith = match op {
+            Token::Plus => Some(if float { "fadd" } else { "add" }),
+            Token::Minus => Some(if float { "fsub" } else { "sub" }),
+            Token::Star => Some(if float { "fmul" } else { "mul" }),
+            Token::Slash => Some(if float { "fdiv" } else { "sdiv" }), // 整数 0 除算は v1 未チェック(UB)
+            _ => None,
         };
-        self.line(&format!("{} = {} {}, {}", r_reg, instr, lv, rv));
+        if let Some(instr) = arith {
+            self.line(&format!("{} = {} {} {}, {}", r_reg, instr, llty, lv, rv));
+            return Ok(r_reg);
+        }
+        // 比較: 整数/Bool は icmp、浮動小数は fcmp（ordered）。
+        let pred = match (op, float) {
+            (Token::Lt, false) => "icmp slt",
+            (Token::Gt, false) => "icmp sgt",
+            (Token::Le, false) => "icmp sle",
+            (Token::Ge, false) => "icmp sge",
+            (Token::EqEq, false) => "icmp eq",
+            (Token::NotEq, false) => "icmp ne",
+            (Token::Lt, true) => "fcmp olt",
+            (Token::Gt, true) => "fcmp ogt",
+            (Token::Le, true) => "fcmp ole",
+            (Token::Ge, true) => "fcmp oge",
+            (Token::EqEq, true) => "fcmp oeq",
+            (Token::NotEq, true) => "fcmp one",
+            (Token::Concat, _) => return unsupported("文字列連結 <>"),
+            (other, _) => unreachable!("二項演算子でないトークン: {:?}", other),
+        };
+        self.line(&format!("{} = {} {} {}, {}", r_reg, pred, llty, lv, rv));
         Ok(r_reg)
-    }
-
-    fn icmp(&mut self, pred: &str, operand_expr: &TExpr, lv: &str, rv: &str) -> Result<String> {
-        let llty = llvm_ty(&operand_expr.ty)?;
-        let r = format!("%t{}", self.fresh());
-        self.line(&format!("{} = icmp {} {} {}, {}", r, pred, llty, lv, rv));
-        Ok(r)
     }
 
     fn if_expr(&mut self, c: &TExpr, t: &TExpr, e: &TExpr) -> Result<String> {
@@ -262,6 +281,7 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     // target triple はあえて出力しない（clang がホスト既定を使う＝上書き警告を避ける）。
     module.push_str("declare i32 @printf(ptr, ...)\n");
     module.push_str("@.di = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n");
+    module.push_str("@.df = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"\n");
     module.push_str("@.ds = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"\n");
     module.push_str("@.t = private unnamed_addr constant [5 x i8] c\"true\\00\"\n");
     module.push_str("@.f = private unnamed_addr constant [6 x i8] c\"false\\00\"\n\n");
@@ -336,10 +356,17 @@ fn compile_main(stmts: &[TStmt], funcs: &HashMap<String, FnSig>) -> Result<Strin
 // 値を型に応じて printf する。
 fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
     match ty {
-        Type::Int => {
+        Type::Int | Type::Long => {
             let r = g.fresh();
             g.line(&format!(
                 "%p{} = call i32 (ptr, ...) @printf(ptr @.di, i64 {})",
+                r, operand
+            ));
+        }
+        Type::Float => {
+            let r = g.fresh();
+            g.line(&format!(
+                "%p{} = call i32 (ptr, ...) @printf(ptr @.df, double {})",
                 r, operand
             ));
         }

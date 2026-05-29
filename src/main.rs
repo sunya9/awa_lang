@@ -956,6 +956,13 @@ mod tests {
     }
 
     #[test]
+    fn codegen_floatとlong() {
+        // Float の fadd/fdiv と Long の整数演算がネイティブ実行される。
+        let out = compile_and_run("1.0 + 0.5\n7.0 / 2.0\n5L + 6L");
+        assert_eq!(out, "1.5\n3.5\n11\n");
+    }
+
+    #[test]
     fn codegen_算術と比較() {
         // 7, true の順に出力される。
         let out = compile_and_run("let add = fn(a: Int, b: Int) -> Int { a + b }; add(3, 4)\n1 < 2");
