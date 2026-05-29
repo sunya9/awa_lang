@@ -316,8 +316,15 @@ impl Parser {
         })
     }
 
-    // 1 メソッド: fn name(self, 引数: 型?, ...) -> 戻り型? { 本体 }。先頭引数が self。
+    // 1 メソッド: [pub] fn name(self, 引数: 型?, ...) -> 戻り型? { 本体 }。先頭引数が self。
     fn parse_method(&mut self) -> Result<Method, LocatedError> {
+        // 任意の pub（このメソッドだけ公開）。
+        let is_pub = if self.peek() == Some(&Token::Pub) {
+            self.next();
+            true
+        } else {
+            false
+        };
         self.expect(Token::Fn)?;
         let name = match self.next() {
             Some(Token::Ident(name)) => name,
@@ -362,6 +369,7 @@ impl Parser {
             params,
             ret,
             body,
+            is_pub,
         })
     }
 

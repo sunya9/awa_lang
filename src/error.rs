@@ -134,7 +134,7 @@ impl fmt::Display for AwaError {
             }
             AwaError::PrivateMethod { ty, method } => write!(
                 f,
-                "メソッド {}.{} は非公開です（定義モジュールで pub impl にしてください）",
+                "メソッド {}.{} は非公開です（定義側で pub fn か pub impl にしてください）",
                 ty, method
             ),
         }

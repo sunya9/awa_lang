@@ -193,4 +193,5 @@ pub struct Method {
     pub params: Vec<(String, Option<TypeExpr>)>, // 先頭が self（型注釈は通常省略）
     pub ret: Option<TypeExpr>,
     pub body: Expr,
+    pub is_pub: bool, // pub fn なら（impl が非 pub でも）このメソッドだけ公開
 }

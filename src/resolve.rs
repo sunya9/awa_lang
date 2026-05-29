@@ -124,9 +124,10 @@ pub fn resolve(modules: &[LoadedModule]) -> Result<Resolved, LocatedError> {
                     b.type_name.clone()
                 };
                 for meth in &b.methods {
+                    // 公開 = pub impl ブロック または pub fn メソッド。
                     method_vis.insert(
                         format!("{}#{}", head, meth.name),
-                        (m.prefix.clone(), b.is_pub),
+                        (m.prefix.clone(), b.is_pub || meth.is_pub),
                     );
                 }
             }

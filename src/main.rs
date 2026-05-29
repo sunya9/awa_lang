@@ -1318,6 +1318,34 @@ mod tests {
     }
 
     #[test]
+    fn module_per_method_pub() {
+        // pub fn だけ越境公開、無印 fn はモジュール内限定（pub メソッドからは呼べる）。
+        let shapes = "pub type Shape { Circle(Int) }\n\
+                      impl Shape {\n\
+                        pub fn area(self) -> Int { case self { Circle(r) -> self.r2(r) } }\n\
+                        fn r2(self, r: Int) -> Int { r * r }\n\
+                      }\n";
+        // pub fn area は越境呼び出しでき、内部で private r2 を使える。
+        let (out, code) = compile_modules_status(
+            &[("shapes.awa", shapes), ("main.awa", "import shapes\nshapes.Circle(6).area()\n")],
+            "main",
+        );
+        assert_eq!(out, "36\n");
+        assert_eq!(code, 0);
+        // private な r2 の越境呼び出しは拒否。
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_mod_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shapes.awa"), shapes).unwrap();
+        std::fs::write(dir.join("main.awa"), "import shapes\nshapes.Circle(6).r2(3)\n").unwrap();
+        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let err = check_program_modules(&modules).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("非公開"), "実際のエラー: {}", err);
+    }
+
+    #[test]
     fn module_非公開メソッドの越境呼び出しはエラー() {
         // pub なし impl のメソッドを他モジュールから呼ぶと PrivateMethod。
         let id = std::process::id() as u64 * 1_000_000
