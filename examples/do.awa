@@ -1,0 +1,43 @@
+// ===== do 記法のデモ =====
+// do { v <- e; ...; 最後はモナド式 } は flatMap 連鎖へ脱糖される（型クラス不要）。
+//   v <- e    → e.flatMap(fn(v){ 残り })
+//   let x = e → { let x = e; 残り }
+//   最後の式  → そのまま結果（モナド値を自分で書く）
+// 使う型は flatMap メソッドを impl していること。
+
+type Option(a) {
+  Some(a)
+  None
+}
+impl Option(a) {
+  fn flatMap(self, f) {
+    case self {
+      Some(x) -> f(x)
+      None -> None
+    }
+  }
+}
+
+// 全部 Some なら計算が進む。途中に let（普通の束縛）も書ける。
+let total = do {
+  x <- Some(2)
+  y <- Some(3)
+  let scaled = x * 10
+  Some(scaled + y)
+}
+total                       // Some(23)
+
+// どれかが None なら短絡して None。
+do {
+  x <- Some(1)
+  y <- None
+  Some(x + y)
+}                           // None
+
+// ネストした Option も自然に。
+let pair = do {
+  a <- Some(10)
+  b <- Some(20)
+  Some(a + b)
+}
+pair                        // 末尾（統合テストで Some(30) を検査）

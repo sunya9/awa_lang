@@ -91,6 +91,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                 if chars.get(i + 1) == Some(&'=') {
                     tokens.push(Spanned::new(Token::Le, Span::new(start, start + 2)));
                     i += 2;
+                } else if chars.get(i + 1) == Some(&'-') {
+                    // <- は do の束縛。比較の `<` に負数を続けるときは空白を空ける（x < -3）。
+                    tokens.push(Spanned::new(Token::LArrow, Span::new(start, start + 2)));
+                    i += 2;
                 } else {
                     tokens.push(Spanned::new(Token::Lt, Span::new(start, start + 1)));
                     i += 1;
@@ -198,6 +202,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     "type" => Token::Type,
                     "case" => Token::Case,
                     "impl" => Token::Impl,
+                    "do" => Token::Do,
                     "true" => Token::Bool(true),
                     "false" => Token::Bool(false),
                     _ => Token::Ident(word),

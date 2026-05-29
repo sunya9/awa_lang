@@ -28,7 +28,9 @@ fn is_upper(name: &str) -> bool {
 //   unary      = '-' unary | call
 //   call       = factor ('(' args? ')' | '.' Ident '(' args? ')')*
 //   args       = expr (',' expr)*
-//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block | case
+//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block | case | do
+//   do         = 'do' '{' (doitem terminator)* doitem? '}'   （flatMap 連鎖へ脱糖）
+//   doitem     = 'let' Ident '=' expr | Ident '<-' expr | expr
 //   case       = 'case' expr '{' (arm terminator)* arm? '}'
 //   arm        = pattern '->' expr
 //   pattern    = primary ('|' primary)*
@@ -742,6 +744,8 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 Ok(self.finish(start, ExprKind::Case(Box::new(subject), arms)))
             }
+            // do 記法（モナド糖衣）。flatMap 連鎖へ脱糖する。
+            Some(Token::Do) => self.parse_do(start),
             // 単独のブロック式 { ... }。parse_block が span つきで返す。
             Some(Token::LBrace) => self.parse_block(),
             Some(Token::LParen) => {
@@ -752,5 +756,118 @@ impl Parser {
             Some(other) => Err(self.unexpected(&other)),
             None => Err(self.eof()),
         }
+    }
+
+    // do 記法。'do' は消費済み（start はその開始位置）。`{ 文... }` を読み、
+    //   v <- e   （束縛）   → e.flatMap(fn(v){ 残り })
+    //   let x = e（普通の束縛）→ { let x = e; 残り }
+    //   e        （式）      最後ならそのまま結果（モナド式）、途中なら捨て flatMap
+    // へパース時に脱糖する（既存ノードのみ生成。型クラス不要）。
+    fn parse_do(&mut self, start: usize) -> Result<Expr, LocatedError> {
+        self.expect(Token::LBrace)?;
+        let mut items = Vec::new();
+        self.skip_terminators();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(self.eof());
+            }
+            items.push(self.parse_do_item()?);
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                Some(Token::RBrace) => break,
+                None => return Err(self.eof()),
+                Some(other) => {
+                    let other = other.clone();
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedToken(format!("{:?}", other)),
+                        self.span_here(),
+                    ));
+                }
+            }
+        }
+        self.expect(Token::RBrace)?;
+        let span = Span::new(start, self.last_span().end);
+        desugar_do(&items, span)
+    }
+
+    // do の 1 項目。`let x = e` / `v <- e`（Ident の次が <-）/ それ以外は式。
+    fn parse_do_item(&mut self) -> Result<DoItem, LocatedError> {
+        if self.peek() == Some(&Token::Let) {
+            self.next(); // 'let'
+            let name = match self.next() {
+                Some(Token::Ident(n)) => n,
+                Some(other) => return Err(self.unexpected(&other)),
+                None => return Err(self.eof()),
+            };
+            self.expect(Token::Equal)?;
+            let e = self.parse_expr()?;
+            return Ok(DoItem::Let(name, e));
+        }
+        // `v <- e`: 現トークンが Ident で次が <- なら束縛。
+        let is_bind = matches!(self.peek(), Some(Token::Ident(_)))
+            && self.tokens.get(self.pos + 1).map(|s| &s.node) == Some(&Token::LArrow);
+        if is_bind {
+            let name = match self.next() {
+                Some(Token::Ident(n)) => n,
+                _ => unreachable!(),
+            };
+            self.next(); // '<-'
+            let e = self.parse_expr()?;
+            return Ok(DoItem::Bind(name, e));
+        }
+        Ok(DoItem::Expr(self.parse_expr()?))
+    }
+}
+
+// do の 1 項目。
+enum DoItem {
+    Bind(String, Expr), // v <- e
+    Let(String, Expr),  // let x = e
+    Expr(Expr),         // e
+}
+
+// do 項目列を flatMap 連鎖へ脱糖する。最後は式（モナド値）でなければならない。
+fn desugar_do(items: &[DoItem], span: Span) -> Result<Expr, LocatedError> {
+    match items {
+        [] => Err(LocatedError::at(
+            AwaError::UnexpectedToken("空の do ブロック".to_string()),
+            span,
+        )),
+        // 最後の項目: 式ならそれが結果。束縛/let で終わるのは不可。
+        [DoItem::Expr(e)] => Ok(e.clone()),
+        [_] => Err(LocatedError::at(
+            AwaError::UnexpectedToken("do は式で終わる必要があります".to_string()),
+            span,
+        )),
+        [first, rest @ ..] => {
+            let cont = desugar_do(rest, span)?;
+            match first {
+                // v <- e  → e.flatMap(fn(v){ cont })
+                DoItem::Bind(v, e) => Ok(flatmap_call(e.clone(), v.clone(), cont, span)),
+                // 途中の式 e → e.flatMap(fn(_){ cont })（結果を捨てる）
+                DoItem::Expr(e) => Ok(flatmap_call(e.clone(), "_".to_string(), cont, span)),
+                // let x = e → { let x = e; cont }
+                DoItem::Let(x, e) => Ok(Expr {
+                    kind: ExprKind::Block(vec![
+                        Stmt::Let(x.clone(), None, e.clone()),
+                        Stmt::Expr(cont),
+                    ]),
+                    span,
+                }),
+            }
+        }
+    }
+}
+
+// recv.flatMap(fn(var){ cont }) を組む。
+fn flatmap_call(recv: Expr, var: String, cont: Expr, span: Span) -> Expr {
+    let lambda = Expr {
+        kind: ExprKind::Lambda(vec![(var, None)], None, Box::new(cont)),
+        span,
+    };
+    let recv_span = recv.span;
+    Expr {
+        kind: ExprKind::MethodCall(Box::new(recv), "flatMap".to_string(), vec![lambda]),
+        span: Span::new(recv_span.start, span.end),
     }
 }

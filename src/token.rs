@@ -11,12 +11,14 @@ pub enum Token {
     Type,          // キーワード type（ADT 宣言）
     Case,          // キーワード case（パターンマッチ）
     Impl,          // キーワード impl（メソッド定義）
+    Do,            // キーワード do（モナド糖衣）
     Comma,         // ,
     Dot,           // .（メソッド呼び出し）
     Colon,         // :（型注釈）
     Pipe,          // |（or パターン）
     PipeArrow,     // |>（パイプ演算子）
     Arrow,         // ->（case の腕・関数型）
+    LArrow,        // <-（do の束縛）
     Equal,         // =
     EqEq,          // ==
     NotEq,         // !=

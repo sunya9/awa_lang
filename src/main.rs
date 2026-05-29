@@ -752,4 +752,57 @@ mod tests {
             Err(AwaError::UnknownMethod { ty: "Opt".to_string(), method: "ghost".to_string() })
         );
     }
+
+    // ===== do 記法（Phase 7）=====
+
+    // flatMap を持つ Option（do はこれへ脱糖する）。
+    const MOPT: &str = "type Opt(a) { Some(a); None }; \
+        impl Opt(a) { fn flatMap(self, f) { case self { Some(x) -> f(x); None -> None } } }; ";
+
+    #[test]
+    fn example_do() {
+        let src = include_str!("../examples/do.awa");
+        let mut env = Env::new();
+        let mut checker = Checker::new();
+        let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        // 末尾 pair = Some(30)。Data 比較で確認。
+        match rows.last().map(|(v, _)| v.clone()) {
+            Some(Value::Data { ctor, args }) => {
+                assert_eq!(ctor, "Some");
+                assert_eq!(args, vec![num(30.0)]);
+            }
+            other => panic!("Some(30) のはず: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn doは全て成功なら計算が進む() {
+        assert!(matches!(
+            eval(&format!("{MOPT} do {{ x <- Some(2); y <- Some(3); Some(x + y) }}")),
+            Ok(Value::Data { .. })
+        ));
+    }
+
+    #[test]
+    fn doは失敗で短絡する() {
+        // 途中の None.flatMap(...) = None。具体的なレシーバで解決される。
+        assert_eq!(
+            eval(&format!("{MOPT} do {{ x <- Some(5); y <- None; Some(x + y) }}")),
+            eval(&format!("{MOPT} None"))
+        );
+    }
+
+    #[test]
+    fn doの中でletが書ける() {
+        // let z = x * 10 を挟む。Some(2) → z=20 → Some(22)。
+        match eval(&format!(
+            "{MOPT} do {{ x <- Some(2); let z = x * 10; Some(z + 2) }}"
+        )) {
+            Ok(Value::Data { ctor, args }) => {
+                assert_eq!(ctor, "Some");
+                assert_eq!(args, vec![num(22.0)]);
+            }
+            other => panic!("Some(22) のはず: {:?}", other),
+        }
+    }
 }
