@@ -347,4 +347,63 @@ mod tests {
         // 末尾は fact(6) = 720 : Num。
         assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(num(720.0)));
     }
+
+    #[test]
+    fn example_adt() {
+        let src = include_str!("../examples/adt.awa");
+        let mut env = Env::new();
+        let mut checker = Checker::new();
+        let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        // 末尾は sum(Cons(1, Cons(2, Cons(3, Nil)))) = 6。
+        assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(num(6.0)));
+    }
+
+    // ===== ADT / パターンマッチ（Phase 3a）=====
+
+    #[test]
+    fn caseで構築子を分解する() {
+        assert_eq!(
+            eval("type Opt(a) { Some(a); None }; let x = Some(3); case x { Some(n) -> n + 1; None -> 0 }"),
+            Ok(num(4.0))
+        );
+    }
+
+    #[test]
+    fn ヌル構築子にマッチする() {
+        assert_eq!(
+            eval("type Opt(a) { Some(a); None }; case None { Some(n) -> n; None -> 42 }"),
+            Ok(num(42.0))
+        );
+    }
+
+    #[test]
+    fn リテラルパターンが網羅されないとnomatch() {
+        // 型は通る（Num の主語に Num パターン）が、5 はどの腕にも当たらず実行時 NoMatch。
+        assert_eq!(eval("case 5 { 1 -> 10; 2 -> 20 }"), Err(AwaError::NoMatch));
+    }
+
+    #[test]
+    fn caseの腕の型が食い違うと型エラー() {
+        // 一方の腕が Num、他方が Bool。本体型の unify で CannotUnify。
+        assert!(matches!(
+            eval("type Opt(a) { Some(a); None }; case Some(1) { Some(n) -> n; None -> true }"),
+            Err(AwaError::CannotUnify { .. })
+        ));
+    }
+
+    #[test]
+    fn 未定義の構築子は型エラー() {
+        assert_eq!(
+            eval("case 1 { Ghost(x) -> x }"),
+            Err(AwaError::UnknownConstructor("Ghost".to_string()))
+        );
+    }
+
+    #[test]
+    fn 構築子の引数個数違いは型エラー() {
+        assert_eq!(
+            eval("type Pair(a) { Two(a, a) }; Two(1)"),
+            Err(AwaError::ArityMismatch { expected: 2, found: 1 })
+        );
+    }
 }

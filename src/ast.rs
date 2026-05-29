@@ -19,6 +19,44 @@ pub enum Expr {
     // ブロック { 文; ...; 式 }。新しいスコープを作り、最後の文が式ならその値、
     // そうでなければ（空 or 末尾が let なら）Unit を返す式。
     Block(Vec<Stmt>),
+    // パターンマッチ case 主語 { パターン -> 本体; ... }。腕を上から試す。
+    Case(Box<Expr>, Vec<(Pattern, Expr)>),
+}
+
+// ===== パターン（case の腕の左辺）=====
+// 値を分解しつつ変数を束縛する。先頭大文字の名前は構築子、小文字は変数束縛。
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Wildcard,                    // _ : 何にでも当たるが束縛しない
+    Var(String),                 // 小文字名 : 何にでも当たり、その名前で束縛する
+    Bool(bool),                  // リテラル true / false
+    Num(f64),                    // リテラル数値
+    Ctor(String, Vec<Pattern>),  // 構築子 Some(x), Cons(h, t), None（部分パターンは入れ子）
+}
+
+// ===== 型式（ユーザーが書く型の構文表現）=====
+// type 宣言のフィールド型や（将来の）型注釈で使う。意味論的な types::Type とは別物で、
+// infer.rs の resolve_type_expr が型変数 ID へ解決する。
+#[derive(Debug, Clone)]
+pub enum TypeExpr {
+    Con(String, Vec<TypeExpr>),               // Option(a), Num, List(a)
+    Var(String),                              // a（小文字の型変数）
+    Fun(Vec<TypeExpr>, Box<TypeExpr>),        // fn(a) -> b
+}
+
+// ADT 宣言 type Name(params) { Variant(fields) ... }。
+#[derive(Debug, Clone)]
+pub struct TypeDef {
+    pub name: String,            // "Option"
+    pub params: Vec<String>,     // ["a"]（型パラメータ名）
+    pub variants: Vec<Variant>,
+}
+
+// 1 つの構築子（variant）。fields が空ならヌル構築子（None など）。
+#[derive(Debug, Clone)]
+pub struct Variant {
+    pub name: String,            // "Some"
+    pub fields: Vec<TypeExpr>,   // [Var("a")]
 }
 
 // 文（statement）。プログラムやブロックは文の並び。
@@ -28,4 +66,6 @@ pub enum Expr {
 pub enum Stmt {
     Let(String, Expr),
     Expr(Expr),
+    // 型宣言。値は返さない（評価では構築子を環境に登録し、結果行は出さない）。
+    Type(TypeDef),
 }

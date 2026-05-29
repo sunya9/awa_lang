@@ -32,6 +32,10 @@ pub enum AwaError {
         left: String,
         right: String,
     },
+    // ----- ADT / パターンマッチ（Phase 3） -----
+    UnknownType(String),        // 型式が参照する型名が未定義
+    UnknownConstructor(String), // パターン等が参照する構築子が未定義
+    NoMatch,                    // 評価: どのパターンにも当たらなかった
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -63,6 +67,9 @@ impl fmt::Display for AwaError {
             AwaError::CannotUnify { left, right } => {
                 write!(f, "型エラー: {} と {} は一致しません", left, right)
             }
+            AwaError::UnknownType(name) => write!(f, "未定義の型です: {}", name),
+            AwaError::UnknownConstructor(name) => write!(f, "未定義の構築子です: {}", name),
+            AwaError::NoMatch => write!(f, "どのパターンにも一致しませんでした"),
         }
     }
 }

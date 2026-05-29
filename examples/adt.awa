@@ -1,0 +1,71 @@
+// ===== 代数的データ型（ADT）＋パターンマッチのデモ =====
+// 先頭大文字 = 型名／構築子、小文字 = 変数／型変数（Gleam と同じ規約）。
+
+// 直和型 Option(a)。Some(値) か None のどちらか。
+type Option(a) {
+  Some(a)
+  None
+}
+
+// case でパターンマッチ。Some なら中身、None なら既定値を返す。
+// 推論される型は fn(Option(a), a) -> a（多相）。
+let unwrap_or = fn(o, d) {
+  case o {
+    Some(x) -> x
+    None -> d
+  }
+}
+unwrap_or(Some(5), 0)     // 5 : Num
+unwrap_or(None, 99)       // 99 : Num
+
+// 再帰的な総称データ型 List(a)。Cons(先頭, 残り) か Nil。
+type List(a) {
+  Cons(a, List(a))
+  Nil
+}
+
+// 長さ。要素型に依らないので fn(List(a)) -> Num に一般化される。
+let length = fn(xs) {
+  case xs {
+    Nil -> 0
+    Cons(h, t) -> 1 + length(t)
+  }
+}
+
+// 合計。要素を + するので fn(List(Num)) -> Num（単相化される）。
+let sum = fn(xs) {
+  case xs {
+    Nil -> 0
+    Cons(h, t) -> h + sum(t)
+  }
+}
+
+let nums = Cons(1, Cons(2, Cons(3, Nil)))
+length(nums)             // 3 : Num
+
+// ヌル構築子だけの列挙型（exhaustiveness は Phase 3b で静的検査予定）。
+type Color {
+  Red
+  Green
+  Blue
+}
+let code = fn(c) {
+  case c {
+    Red -> 1
+    Green -> 2
+    Blue -> 3
+  }
+}
+code(Green)              // 2 : Num
+
+// 入れ子パターン: Some(Cons(先頭, _)) で「中身があり、その先頭」を取り出す。
+let head_or = fn(o, d) {
+  case o {
+    Some(Cons(h, _)) -> h
+    Some(Nil) -> d
+    None -> d
+  }
+}
+head_or(Some(Cons(7, Nil)), 0)   // 7 : Num
+
+sum(nums)                // 6 : Num（末尾。統合テストで 6 を検査）

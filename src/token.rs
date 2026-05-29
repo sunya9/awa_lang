@@ -8,7 +8,10 @@ pub enum Token {
     If,            // キーワード if
     Else,          // キーワード else
     Fn,            // キーワード fn
+    Type,          // キーワード type（ADT 宣言）
+    Case,          // キーワード case（パターンマッチ）
     Comma,         // ,
+    Arrow,         // ->（case の腕・関数型）
     Equal,         // =
     EqEq,          // ==
     NotEq,         // !=

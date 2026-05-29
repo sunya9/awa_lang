@@ -1,11 +1,19 @@
-use crate::ast::{Expr, Stmt};
+use crate::ast::{Expr, Pattern, Stmt, TypeDef, TypeExpr, Variant};
 use crate::error::AwaError;
 use crate::token::Token;
+
+// 先頭大文字なら型名／構築子、小文字なら変数／型変数（Gleam と同じ規約）。
+fn is_upper(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_uppercase())
+}
 
 // ===== 構文解析（Parser）=====
 // 再帰下降パーサ。優先順位を文法の階層で表現する（上ほど緩い＝後で結合）。
 //   program    = (stmt terminator)* stmt?
-//   stmt       = 'let' Ident '=' expr | expr
+//   stmt       = 'let' Ident '=' expr | typedef | expr
+//   typedef    = 'type' UIdent ('(' names ')')? '{' (variant terminator)* variant? '}'
+//   variant    = UIdent ('(' typeexpr (',' typeexpr)* ')')?
+//   typeexpr   = UIdent ('(' typeexpr,* ')')? | Ident | 'fn' '(' typeexpr,* ')' '->' typeexpr
 //   expr       = equality
 //   equality   = comparison (('==' | '!=') comparison)*
 //   comparison = additive  (('<' | '>' | '<=' | '>=') additive)*
@@ -14,7 +22,10 @@ use crate::token::Token;
 //   unary      = '-' unary | call
 //   call       = factor ('(' args? ')')*
 //   args       = expr (',' expr)*
-//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block
+//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block | case
+//   case       = 'case' expr '{' (arm terminator)* arm? '}'
+//   arm        = pattern '->' expr
+//   pattern    = '_' | Ident | Num | Bool | UIdent ('(' pattern,* ')')?
 //   if         = 'if' expr block 'else' block
 //   lambda     = 'fn' '(' params? ')' block
 //   block      = '{' (stmt terminator)* stmt? '}'
@@ -92,20 +103,203 @@ impl Parser {
         Ok(Expr::Block(stmts))
     }
 
-    // 文 = `let ident = expr`（束縛）または `expr`（式文）。
+    // 文 = `let ident = expr`（束縛）/ `type ...`（型宣言）/ `expr`（式文）。
     fn parse_stmt(&mut self) -> Result<Stmt, AwaError> {
-        if let Some(Token::Let) = self.peek() {
-            self.next(); // 'let' を消費
-            let name = match self.next() {
-                Some(Token::Ident(name)) => name,
-                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-                None => return Err(AwaError::UnexpectedEof),
-            };
-            self.expect(Token::Equal)?;
-            let value = self.parse_expr()?;
-            Ok(Stmt::Let(name, value))
+        match self.peek() {
+            Some(Token::Let) => {
+                self.next(); // 'let' を消費
+                let name = match self.next() {
+                    Some(Token::Ident(name)) => name,
+                    Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                    None => return Err(AwaError::UnexpectedEof),
+                };
+                self.expect(Token::Equal)?;
+                let value = self.parse_expr()?;
+                Ok(Stmt::Let(name, value))
+            }
+            Some(Token::Type) => Ok(Stmt::Type(self.parse_type_def()?)),
+            _ => Ok(Stmt::Expr(self.parse_expr()?)),
+        }
+    }
+
+    // 型宣言 type Name(params) { Variant(fields) ... }。
+    // params/variants は終端（改行 or ;）区切り、ブロックと同じ流儀で読む。
+    fn parse_type_def(&mut self) -> Result<TypeDef, AwaError> {
+        self.next(); // 'type' を消費
+        let name = self.expect_upper_ident()?;
+        let params = if self.peek() == Some(&Token::LParen) {
+            self.parse_name_list()?
         } else {
-            Ok(Stmt::Expr(self.parse_expr()?))
+            Vec::new()
+        };
+        self.expect(Token::LBrace)?;
+        let mut variants = Vec::new();
+        self.skip_terminators();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(AwaError::UnexpectedEof);
+            }
+            let vname = self.expect_upper_ident()?;
+            // フィールドがあれば (型式, ...)。無ければヌル構築子。
+            let fields = if self.peek() == Some(&Token::LParen) {
+                self.next(); // '('
+                let mut fs = Vec::new();
+                if self.peek() != Some(&Token::RParen) {
+                    loop {
+                        fs.push(self.parse_type_expr()?);
+                        match self.peek() {
+                            Some(Token::Comma) => {
+                                self.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                self.expect(Token::RParen)?;
+                fs
+            } else {
+                Vec::new()
+            };
+            variants.push(Variant { name: vname, fields });
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                Some(Token::RBrace) => break,
+                None => return Err(AwaError::UnexpectedEof),
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(TypeDef {
+            name,
+            params,
+            variants,
+        })
+    }
+
+    // 大文字始まりの識別子を 1 つ消費する（型名・構築子名）。
+    fn expect_upper_ident(&mut self) -> Result<String, AwaError> {
+        match self.next() {
+            Some(Token::Ident(name)) if is_upper(&name) => Ok(name),
+            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            None => Err(AwaError::UnexpectedEof),
+        }
+    }
+
+    // '(' name (',' name)* ')' の小文字名リスト（型パラメータ）。'(' から読む。
+    fn parse_name_list(&mut self) -> Result<Vec<String>, AwaError> {
+        self.expect(Token::LParen)?;
+        let mut names = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                match self.next() {
+                    Some(Token::Ident(name)) => names.push(name),
+                    Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                    None => return Err(AwaError::UnexpectedEof),
+                }
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.next();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok(names)
+    }
+
+    // 型式: 大文字名→Con（任意の型引数）、小文字名→型変数、fn(...) -> ...→関数型。
+    fn parse_type_expr(&mut self) -> Result<TypeExpr, AwaError> {
+        match self.next() {
+            Some(Token::Ident(name)) => {
+                if is_upper(&name) {
+                    // 構築子適用の型引数（任意）。
+                    let args = if self.peek() == Some(&Token::LParen) {
+                        self.next(); // '('
+                        let mut args = Vec::new();
+                        if self.peek() != Some(&Token::RParen) {
+                            loop {
+                                args.push(self.parse_type_expr()?);
+                                match self.peek() {
+                                    Some(Token::Comma) => {
+                                        self.next();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                        args
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(TypeExpr::Con(name, args))
+                } else {
+                    Ok(TypeExpr::Var(name))
+                }
+            }
+            // fn(引数型, ...) -> 戻り型。
+            Some(Token::Fn) => {
+                self.expect(Token::LParen)?;
+                let mut params = Vec::new();
+                if self.peek() != Some(&Token::RParen) {
+                    loop {
+                        params.push(self.parse_type_expr()?);
+                        match self.peek() {
+                            Some(Token::Comma) => {
+                                self.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                self.expect(Token::RParen)?;
+                self.expect(Token::Arrow)?;
+                let ret = self.parse_type_expr()?;
+                Ok(TypeExpr::Fun(params, Box::new(ret)))
+            }
+            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            None => Err(AwaError::UnexpectedEof),
+        }
+    }
+
+    // パターン: _ →ワイルドカード、小文字名→束縛変数、大文字名→構築子（任意の部分パターン列）、
+    // リテラル Num/Bool。構築子は入れ子の部分パターンを持てる（Some(Cons(x, _)) など）。
+    fn parse_pattern(&mut self) -> Result<Pattern, AwaError> {
+        match self.next() {
+            Some(Token::Num(n)) => Ok(Pattern::Num(n)),
+            Some(Token::Bool(b)) => Ok(Pattern::Bool(b)),
+            Some(Token::Ident(name)) => {
+                if name == "_" {
+                    Ok(Pattern::Wildcard)
+                } else if is_upper(&name) {
+                    // 構築子パターン。続く ( があれば部分パターン列。
+                    let subs = if self.peek() == Some(&Token::LParen) {
+                        self.next(); // '('
+                        let mut subs = Vec::new();
+                        if self.peek() != Some(&Token::RParen) {
+                            loop {
+                                subs.push(self.parse_pattern()?);
+                                match self.peek() {
+                                    Some(Token::Comma) => {
+                                        self.next();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                        subs
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Pattern::Ctor(name, subs))
+                } else {
+                    Ok(Pattern::Var(name))
+                }
+            }
+            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            None => Err(AwaError::UnexpectedEof),
         }
     }
 
@@ -247,6 +441,32 @@ impl Parser {
                     Box::new(then_branch),
                     Box::new(else_branch),
                 ))
+            }
+            // パターンマッチ case 主語 { パターン -> 本体; ... }。
+            Some(Token::Case) => {
+                let subject = self.parse_expr()?;
+                self.expect(Token::LBrace)?;
+                let mut arms = Vec::new();
+                self.skip_terminators();
+                while self.peek() != Some(&Token::RBrace) {
+                    if self.peek().is_none() {
+                        return Err(AwaError::UnexpectedEof);
+                    }
+                    let pat = self.parse_pattern()?;
+                    self.expect(Token::Arrow)?;
+                    let body = self.parse_expr()?;
+                    arms.push((pat, body));
+                    match self.peek() {
+                        Some(Token::Terminator) => self.skip_terminators(),
+                        Some(Token::RBrace) => break,
+                        None => return Err(AwaError::UnexpectedEof),
+                        Some(other) => {
+                            return Err(AwaError::UnexpectedToken(format!("{:?}", other)));
+                        }
+                    }
+                }
+                self.expect(Token::RBrace)?;
+                Ok(Expr::Case(Box::new(subject), arms))
             }
             // 単独のブロック式 { ... }。
             Some(Token::LBrace) => self.parse_block(),

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::ast::{Expr, Stmt};
+use crate::ast::{Expr, Pattern, Stmt, TypeDef};
 use crate::error::AwaError;
 use crate::token::Token;
 use crate::value::{Closure, Env, Value, type_name};
@@ -77,10 +77,27 @@ pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
         }))),
         // 関数呼び出し。
         Expr::Call(callee, args) => {
-            // 1. 呼ぶ対象を評価し、関数であることを確認する。
+            // 1. 呼ぶ対象を評価する。構築子なら Data を組み立てて返す。
             let callee_val = eval_expr(callee, env)?;
             let closure = match callee_val {
                 Value::Func(c) => c,
+                // 構築子適用: 引数を評価して Data を作る。
+                Value::Ctor { name, arity } => {
+                    if args.len() != arity {
+                        return Err(AwaError::ArityMismatch {
+                            expected: arity,
+                            found: args.len(),
+                        });
+                    }
+                    let mut arg_values = Vec::with_capacity(args.len());
+                    for arg in args {
+                        arg_values.push(eval_expr(arg, env)?);
+                    }
+                    return Ok(Value::Data {
+                        ctor: name,
+                        args: arg_values,
+                    });
+                }
                 other => return Err(AwaError::NotCallable(type_name(&other))),
             };
             // 2. 引数の個数チェック。
@@ -121,11 +138,78 @@ pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
                         block_env.insert(name.clone(), v);
                         Value::Unit // let 文はブロック値に寄与しない
                     }
+                    Stmt::Type(def) => {
+                        register_ctors(def, &mut block_env);
+                        Value::Unit // 型宣言もブロック値に寄与しない
+                    }
                     Stmt::Expr(e) => eval_expr(e, &block_env)?,
                 };
             }
             Ok(value)
         }
+        // パターンマッチ。主語を評価し、腕を上から試して最初に当たったものを評価する。
+        Expr::Case(subject, arms) => {
+            let value = eval_expr(subject, env)?;
+            for (pattern, body) in arms {
+                if let Some(bindings) = match_pattern(pattern, &value) {
+                    // 当たった腕の束縛を環境に入れて本体を評価する。
+                    let mut arm_env = env.clone();
+                    for (name, v) in bindings {
+                        arm_env.insert(name, v);
+                    }
+                    return eval_expr(body, &arm_env);
+                }
+            }
+            // どの腕にも当たらなかった（網羅性チェックは Phase 3b で静的に防ぐ）。
+            Err(AwaError::NoMatch)
+        }
+    }
+}
+
+// パターンを値に照合する。当たれば束縛（変数名→値）のリストを Some で返す。
+// 当たらなければ None。Ctor は ctor 名と arity が一致したとき、部分パターンを
+// 引数に再帰照合して束縛を連結する。
+fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)>> {
+    match pattern {
+        Pattern::Wildcard => Some(Vec::new()),
+        Pattern::Var(name) => Some(vec![(name.clone(), value.clone())]),
+        Pattern::Bool(b) => match value {
+            Value::Bool(v) if v == b => Some(Vec::new()),
+            _ => None,
+        },
+        Pattern::Num(n) => match value {
+            Value::Num(v) if v == n => Some(Vec::new()),
+            _ => None,
+        },
+        Pattern::Ctor(name, subs) => match value {
+            Value::Data { ctor, args } if ctor == name && args.len() == subs.len() => {
+                let mut bindings = Vec::new();
+                for (sub, arg) in subs.iter().zip(args.iter()) {
+                    bindings.extend(match_pattern(sub, arg)?);
+                }
+                Some(bindings)
+            }
+            _ => None,
+        },
+    }
+}
+
+// 型宣言の各構築子を環境に登録する。ヌル構築子は直接 Data 値、
+// 引数を取る構築子は Ctor 値（呼び出し時に Data を組み立てる）。
+fn register_ctors(def: &TypeDef, env: &mut Env) {
+    for variant in &def.variants {
+        let value = if variant.fields.is_empty() {
+            Value::Data {
+                ctor: variant.name.clone(),
+                args: Vec::new(),
+            }
+        } else {
+            Value::Ctor {
+                name: variant.name.clone(),
+                arity: variant.fields.len(),
+            }
+        };
+        env.insert(variant.name.clone(), value);
     }
 }
 
@@ -170,15 +254,16 @@ fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
 pub fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
     let mut results = Vec::new();
     for stmt in stmts {
-        let value = match stmt {
+        match stmt {
             Stmt::Let(name, expr) => {
                 let value = bind_name(eval_expr(expr, env)?, name);
                 env.insert(name.clone(), value.clone());
-                value
+                results.push(value);
             }
-            Stmt::Expr(expr) => eval_expr(expr, env)?,
+            Stmt::Expr(expr) => results.push(eval_expr(expr, env)?),
+            // 型宣言は構築子を登録するだけ。結果行は出さない。
+            Stmt::Type(def) => register_ctors(def, env),
         };
-        results.push(value);
     }
     Ok(results)
 }

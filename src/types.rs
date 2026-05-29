@@ -16,6 +16,9 @@ pub enum Type {
     Fun(Vec<Type>, Box<Type>),
     // 型変数。一意な ID で識別する（a, b, ... に相当）。
     Var(u32),
+    // 型構築子の適用（ADT）。name と型引数のリスト。例: Option(Num), List(a), Result(a, e)。
+    // 名前で同一性を見る nominal な型。引数ゼロでも Con（例: ユーザー定義の Color）。
+    Con(String, Vec<Type>),
 }
 
 impl fmt::Display for Type {
@@ -43,6 +46,20 @@ impl fmt::Display for Type {
                 } else {
                     write!(f, "{}{}", letter, suffix)
                 }
+            }
+            Type::Con(name, args) => {
+                write!(f, "{}", name)?;
+                if !args.is_empty() {
+                    write!(f, "(")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", a)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
             }
         }
     }
@@ -75,6 +92,19 @@ pub fn render_type(ty: &Type) -> String {
                     c
                 });
                 out.push(c);
+            }
+            Type::Con(name, args) => {
+                out.push_str(name);
+                if !args.is_empty() {
+                    out.push('(');
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        go(a, names, next, out);
+                    }
+                    out.push(')');
+                }
             }
         }
     }
@@ -113,6 +143,10 @@ pub fn apply(subst: &Subst, ty: &Type) -> Type {
             let params = params.iter().map(|p| apply(subst, p)).collect();
             let ret = Box::new(apply(subst, ret));
             Type::Fun(params, ret)
+        }
+        Type::Con(name, args) => {
+            let args = args.iter().map(|a| apply(subst, a)).collect();
+            Type::Con(name.clone(), args)
         }
         Type::Var(id) => match subst.get(id) {
             // 埋まっていれば、その先も再帰的に解決する（チェーンを辿る）。
@@ -156,6 +190,13 @@ pub fn ftv(subst: &Subst, ty: &Type) -> HashSet<u32> {
             s.extend(ftv(subst, &ret));
             s
         }
+        Type::Con(_, args) => {
+            let mut s = HashSet::new();
+            for a in &args {
+                s.extend(ftv(subst, a));
+            }
+            s
+        }
         Type::Num | Type::Bool | Type::Unit => HashSet::new(),
     }
 }
@@ -177,6 +218,7 @@ fn occurs(subst: &Subst, id: u32, ty: &Type) -> bool {
         Type::Fun(params, ret) => {
             params.iter().any(|p| occurs(subst, id, p)) || occurs(subst, id, &ret)
         }
+        Type::Con(_, args) => args.iter().any(|a| occurs(subst, id, a)),
         Type::Num | Type::Bool | Type::Unit => false,
     }
 }
@@ -238,6 +280,20 @@ pub fn unify(subst: &mut Subst, t1: &Type, t2: &Type) -> Result<(), AwaError> {
             }
             // 戻り値同士を単一化
             unify(subst, &r1, &r2)
+        }
+        // 型構築子同士: 名前が同じで引数の個数が一致するなら、引数をペアごとに単一化。
+        // 例: Option(a) と Option(Num) → a = Num。List(a) と Option(a) → 名前違いでエラー。
+        (Type::Con(n1, a1), Type::Con(n2, a2)) => {
+            if n1 != n2 || a1.len() != a2.len() {
+                return Err(AwaError::CannotUnify {
+                    left: Type::Con(n1, a1).to_string(),
+                    right: Type::Con(n2, a2).to_string(),
+                });
+            }
+            for (x, y) in a1.iter().zip(a2.iter()) {
+                unify(subst, x, y)?;
+            }
+            Ok(())
         }
         // それ以外は単一化不可能
         (a, b) => Err(AwaError::CannotUnify {

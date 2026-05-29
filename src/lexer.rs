@@ -99,8 +99,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                 i += 1;
             }
             '-' => {
-                tokens.push(Token::Minus);
-                i += 1;
+                // -> は case の腕・関数型の矢印。それ以外は減算/単項マイナス。
+                if chars.get(i + 1) == Some(&'>') {
+                    tokens.push(Token::Arrow);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Minus);
+                    i += 1;
+                }
             }
             '*' => {
                 tokens.push(Token::Star);
@@ -150,6 +156,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                     "if" => Token::If,
                     "else" => Token::Else,
                     "fn" => Token::Fn,
+                    "type" => Token::Type,
+                    "case" => Token::Case,
                     "true" => Token::Bool(true),
                     "false" => Token::Bool(false),
                     _ => Token::Ident(word),

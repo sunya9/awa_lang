@@ -15,6 +15,11 @@ pub enum Value {
     Func(Rc<Closure>),
     // 空の値（Gleam の Nil 相当）。末尾が式でないブロックや空ブロックの値。
     Unit,
+    // n 引数の構築子そのもの（まだ適用されていない）。呼び出すと Data になる。
+    // 例: Some は Ctor{name:"Some", arity:1}。ヌル構築子は直接 Data になる。
+    Ctor { name: String, arity: usize },
+    // 構築済みの ADT 値。構築子名と引数。例: Some(3) → Data{ctor:"Some", args:[Num(3)]}。
+    Data { ctor: String, args: Vec<Value> },
 }
 
 // クロージャ = 関数 + 定義時の環境。
@@ -40,6 +45,11 @@ impl PartialEq for Value {
             (Value::Num(a), Value::Num(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Unit, Value::Unit) => true,
+            // ADT 値は構築子名と引数で構造比較（Cons(1, Nil) 同士など）。
+            (
+                Value::Data { ctor: c1, args: a1 },
+                Value::Data { ctor: c2, args: a2 },
+            ) => c1 == c2 && a1 == a2,
             _ => false,
         }
     }
@@ -52,6 +62,22 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{}", b),
             Value::Func(c) => write!(f, "<fn/{}>", c.params.len()),
             Value::Unit => write!(f, "Nil"),
+            Value::Ctor { name, arity } => write!(f, "<ctor {}/{}>", name, arity),
+            // 構築済み値は Some(3) / None / Cons(1, Nil) のように表示。
+            Value::Data { ctor, args } => {
+                write!(f, "{}", ctor)?;
+                if !args.is_empty() {
+                    write!(f, "(")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", a)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -61,8 +87,9 @@ pub fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Num(_) => "Num",
         Value::Bool(_) => "Bool",
-        Value::Func(_) => "Func",
+        Value::Func(_) | Value::Ctor { .. } => "Func",
         Value::Unit => "Nil",
+        Value::Data { .. } => "Data",
     }
 }
 
