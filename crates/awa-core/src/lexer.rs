@@ -374,6 +374,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                                 lit.push('\n');
                                 i += 2;
                             }
+                            Some('r') => {
+                                lit.push('\r');
+                                i += 2;
+                            }
                             Some('t') => {
                                 lit.push('\t');
                                 i += 2;

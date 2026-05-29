@@ -2090,6 +2090,38 @@ mod tests {
     }
 
     #[test]
+    fn std_http_parse_and_build() {
+        // ソケットを使わない純粋関数（parse_response / parse_request / response_to_string）を検証。
+        let out = std_build_run(
+            "import std/io\n\
+             import std/http\n\
+             import std/result\n\
+             let raw = \"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\nhello\"\n\
+             io.println(case http.parse_response(raw) {\n\
+               result.Ok(r) -> \"${http.resp_status(r)}:${http.resp_body(r)}\"\n\
+               result.Err(e) -> e\n\
+             })\n\
+             let req = \"POST /submit HTTP/1.1\\r\\nHost: x\\r\\n\\r\\nbody\"\n\
+             io.println(case http.parse_request(req) {\n\
+               result.Ok(q) -> \"${http.req_method(q)} ${http.req_path(q)} ${http.req_body(q)}\"\n\
+               result.Err(e) -> e\n\
+             })\n\
+             io.println(case http.parse_response(http.response_to_string(http.response(201, \"hi\"))) {\n\
+               result.Ok(r) -> \"${http.resp_status(r)}:${http.resp_body(r)}\"\n\
+               result.Err(e) -> e\n\
+             })\n",
+        );
+        // レスポンス解析 / リクエスト解析 / 組み立て→解析の往復。
+        assert_eq!(out, "200:hello\nPOST /submit body\n201:hi\n");
+    }
+
+    #[test]
+    fn 文字列はバックスラッシュrでcrになる() {
+        // \r エスケープ（HTTP の CRLF で必要）。
+        assert_eq!(eval(r#""a\r\nb""#), Ok(Value::Str("a\r\nb".to_string())));
+    }
+
+    #[test]
     fn 焼き込み標準ライブラリは_stdlibパスなしで解決できる() {
         // stdlib=None でも `import std/...` がバイナリ焼き込みソースから解決される
         // （cwd・環境変数に非依存）。エントリは std/ を持たない一時ディレクトリに置く。

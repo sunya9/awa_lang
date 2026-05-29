@@ -1,0 +1,7 @@
+// 標準ライブラリ: 汎用ペア（awa にタプルが無いので、その代わり）。
+// JSON のオブジェクト要素や HTTP ヘッダなど「2 つ組のリスト」に使う。
+pub type Pair(k, v) { Pair(k, v) }
+
+pub let fst = fn(p: Pair(k, v)) -> k { case p { Pair(a, _) -> a } }
+
+pub let snd = fn(p: Pair(k, v)) -> v { case p { Pair(_, b) -> b } }

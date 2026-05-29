@@ -7,18 +7,17 @@
 import std/list
 import std/result
 import std/string
-
-// 汎用ペア（awa にタプルが無い）。Json を参照しないので先に定義する。
-type Pair(k, v) { Pair(k, v) }
+import std/pair
 
 // JSON 値。数値は JSON 仕様どおりすべて Float。
+// オブジェクト要素は共有の pair.Pair（pub なので利用側で分解できる）。
 pub type Json {
   JNull
   JBool(Bool)
   JNum(Float)
   JStr(String)
   JArr(list.List(Json))
-  JObj(list.List(Pair(String, Json)))
+  JObj(list.List(pair.Pair(String, Json)))
 }
 
 // パーサの途中状態: 値と次の位置。
@@ -178,10 +177,10 @@ let parse_members = fn(s, i, acc, pv) {
               let n = skip_ws(s, m);
               let cc = string_char_at(s, n);
               if cc == 44 {
-                parse_members(s, n + 1, list.Cons(Pair(key, v), acc), pv)
+                parse_members(s, n + 1, list.Cons(pair.Pair(key, v), acc), pv)
               } else {
                 if cc == 125 {
-                  result.Ok(Parsed(list.Cons(Pair(key, v), acc), n + 1))
+                  result.Ok(Parsed(list.Cons(pair.Pair(key, v), acc), n + 1))
                 } else {
                   result.Err("expected , or } in object")
                 }
@@ -288,7 +287,7 @@ pub let stringify = fn(j: Json) -> String {
     JObj(fields) -> {
       let parts = list.map(fields, fn(p) {
         case p {
-          Pair(k, v) -> escape_str(k) <> ":" <> stringify(v)
+          pair.Pair(k, v) -> escape_str(k) <> ":" <> stringify(v)
         }
       });
       "{" <> string.join(parts, ",") <> "}"

@@ -17,7 +17,9 @@ pub const STDLIB: &[(&str, &str)] = &[
     ("std/int", include_str!("../../../std/int.awa")),
     ("std/float", include_str!("../../../std/float.awa")),
     ("std/string", include_str!("../../../std/string.awa")),
+    ("std/pair", include_str!("../../../std/pair.awa")),
     ("std/json", include_str!("../../../std/json.awa")),
+    ("std/http", include_str!("../../../std/http.awa")),
 ];
 
 // 焼き込み済み標準ライブラリのソースを返す（無ければ None）。
