@@ -647,6 +647,32 @@ mod tests {
     }
 
     #[test]
+    fn ブロック内相互再帰はインタプリタで動く() {
+        let src = "{\n\
+                   let ev = fn(n: Int) -> Bool { case n == 0 { true -> true; false -> od(n - 1) } }\n\
+                   let od = fn(n: Int) -> Bool { case n == 0 { true -> false; false -> ev(n - 1) } }\n\
+                   ev(10)\n\
+                   }";
+        assert_eq!(eval(src), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn ブロック内相互再帰はnativeで明確なエラー() {
+        // 兄弟関数を捕獲すると参照が循環し RC GC と衝突するため native 未対応。
+        let src = "{\n\
+                   let ev = fn(n: Int) -> Bool { case n == 0 { true -> true; false -> od(n - 1) } }\n\
+                   let od = fn(n: Int) -> Bool { case n == 0 { true -> false; false -> ev(n - 1) } }\n\
+                   ev(4)\n\
+                   }";
+        let err = compile_to_llvm(src).unwrap_err();
+        assert!(
+            format!("{}", err.error).contains("トップレベル"),
+            "got: {:?}",
+            err.error
+        );
+    }
+
+    #[test]
     fn codegen_相互再帰がネイティブ実行される() {
         let (out, code) = compile_run_status(
             "let is_even = fn(n: Int) -> Bool { case n == 0 { true -> true; false -> is_odd(n - 1) } }\n\

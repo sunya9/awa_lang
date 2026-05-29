@@ -44,13 +44,10 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
         TExprKind::Str(s) => Ok(Value::Str(s.clone())),
         TExprKind::Bool(b) => Ok(Value::Bool(*b)),
         // 値はもう Copy ではないので .cloned() で複製する。
-        // レキシカル env を引き、無ければトップレベル GLOBALS にフォールバックする。
-        // クロージャは定義時点の env スナップショットを捕獲するので、後で定義された
-        // 兄弟トップレベル関数を捕獲できない。GLOBALS 経由で相互再帰を解決する。
-        TExprKind::Var(name) => env
-            .get(name)
-            .cloned()
-            .or_else(|| GLOBALS.with(|g| g.borrow().get(name).cloned()))
+        // 名前解決: レキシカル env → ブロック内相互再帰スコープ（内側優先）→ トップレベル GLOBALS。
+        // クロージャは定義時の env スナップショットを捕獲するので後で定義された兄弟を含まない。
+        // フォールバックのスコープ群で相互再帰を解決する（循環参照を作らない）。
+        TExprKind::Var(name) => lookup_var(name, env)
             .ok_or_else(|| LocatedError::at(AwaError::UndefinedVariable(name.clone()), span)),
         // 単項マイナス。型検査済みなので数値のはず。
         TExprKind::Neg(operand) => match eval_expr(operand, env)? {
@@ -96,29 +93,7 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
         // ブロックは新しいスコープ。親 env をコピーして始め、抜けると破棄する
         // （ブロック内の let は外に漏れない）。値は最後の文が式ならその値、
         // そうでなければ（空 or 末尾が let）Unit。
-        TExprKind::Block(stmts) => {
-            let mut block_env = env.clone();
-            let mut value = Value::Unit;
-            for stmt in stmts {
-                value = match stmt {
-                    TStmt::Let(name, e) => {
-                        let v = bind_name(eval_expr(e, &block_env)?, name);
-                        block_env.insert(name.clone(), v);
-                        Value::Unit // let 文はブロック値に寄与しない
-                    }
-                    TStmt::Type(def) => {
-                        register_ctors(def, &mut block_env);
-                        Value::Unit // 型宣言もブロック値に寄与しない
-                    }
-                    TStmt::Impl(ms) => {
-                        register_methods(ms, &mut block_env);
-                        Value::Unit // impl もブロック値に寄与しない
-                    }
-                    TStmt::Expr(e) => eval_expr(e, &block_env)?,
-                };
-            }
-            Ok(value)
-        }
+        TExprKind::Block(stmts) => eval_block_scoped(stmts, env),
         // パターンマッチ。主語を評価し、腕を上から試して最初に当たったものを評価する。
         TExprKind::Case(subject, arms) => {
             let value = eval_expr(subject, env)?;
@@ -275,6 +250,69 @@ fn num_cmp(l: &Value, r: &Value) -> std::cmp::Ordering {
     }
 }
 
+// ブロック内に関数 let があるか（相互再帰スコープが要るか）。
+fn has_block_fns(stmts: &[TStmt]) -> bool {
+    stmts.iter().any(|s| matches!(s, TStmt::Let(_, e) if matches!(e.kind, TExprKind::Lambda(..))))
+}
+
+// ブロック内の関数 let をすべてクロージャ化したスコープ（相互再帰のフォールバック用）。
+// Lambda 評価はクロージャ生成のみ＝本体は走らないので失敗しない。
+fn block_rec_scope(stmts: &[TStmt], base: &Env) -> Env {
+    let mut scope = Env::new();
+    for s in stmts {
+        if let TStmt::Let(name, e) = s {
+            if matches!(e.kind, TExprKind::Lambda(..)) {
+                if let Ok(v) = eval_expr(e, base) {
+                    scope.insert(name.clone(), bind_name(v, name));
+                }
+            }
+        }
+    }
+    scope
+}
+
+// ブロック本体を順に評価し、末尾の値を返す（スコープ管理は呼び出し側）。
+fn eval_block_body(stmts: &[TStmt], block_env: &mut Env) -> Result<Value, LocatedError> {
+    let mut value = Value::Unit;
+    for stmt in stmts {
+        value = match stmt {
+            TStmt::Let(name, e) => {
+                let v = bind_name(eval_expr(e, block_env)?, name);
+                block_env.insert(name.clone(), v);
+                Value::Unit
+            }
+            TStmt::Type(def) => {
+                register_ctors(def, block_env);
+                Value::Unit
+            }
+            TStmt::Impl(ms) => {
+                register_methods(ms, block_env);
+                Value::Unit
+            }
+            TStmt::Expr(e) => eval_expr(e, block_env)?,
+        };
+    }
+    Ok(value)
+}
+
+// 新スコープでブロックを評価。関数 let があれば相互再帰スコープを push してから走らせ、
+// 終わったら pop する（エラー時も pop）。
+fn eval_block_scoped(stmts: &[TStmt], env: &Env) -> Result<Value, LocatedError> {
+    let mut block_env = env.clone();
+    let pushed = has_block_fns(stmts);
+    if pushed {
+        let rec = block_rec_scope(stmts, &block_env);
+        LOCAL_RECS.with(|st| st.borrow_mut().push(rec));
+    }
+    let result = eval_block_body(stmts, &mut block_env);
+    if pushed {
+        LOCAL_RECS.with(|st| {
+            st.borrow_mut().pop();
+        });
+    }
+    result
+}
+
 // 末尾位置評価の結果。Value=確定、Tail=末尾の関数呼び出し（呼び出し元のループが処理する）。
 enum Step {
     Value(Value),
@@ -295,8 +333,13 @@ fn eval_tail(expr: &TExpr, env: &Env) -> Result<Step, LocatedError> {
             }
             Ok(Step::Tail(callee_val, arg_values, span))
         }
-        // ブロック: 最後の式だけが末尾位置。それ以外は通常評価。
+        // ブロック: 最後の式だけが末尾位置。
+        // ただし相互再帰スコープが要るブロックは TCO せず、スコープ生存中に完全評価する
+        //（末尾呼び出しを返すとスコープを pop した後に実行され、兄弟関数が見えなくなるため）。
         TExprKind::Block(stmts) => {
+            if has_block_fns(stmts) {
+                return Ok(Step::Value(eval_block_scoped(stmts, env)?));
+            }
             let mut block_env = env.clone();
             let n = stmts.len();
             for (i, stmt) in stmts.iter().enumerate() {
@@ -448,12 +491,31 @@ thread_local! {
     static LOOP: RefCell<EventLoop> = RefCell::new(EventLoop::new());
     // トップレベル束縛のスコープ。Var 解決のフォールバック先（相互再帰のため）。
     static GLOBALS: RefCell<Env> = RefCell::new(Env::new());
+    // ブロック内相互再帰のスコープスタック（評価中のブロックの関数群。内側が末尾）。
+    static LOCAL_RECS: RefCell<Vec<Env>> = const { RefCell::new(Vec::new()) };
+}
+
+// 名前を解決する: レキシカル env → LOCAL_RECS（内側優先）→ GLOBALS。
+fn lookup_var(name: &str, env: &Env) -> Option<Value> {
+    if let Some(v) = env.get(name) {
+        return Some(v.clone());
+    }
+    let local = LOCAL_RECS.with(|st| {
+        for scope in st.borrow().iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return Some(v.clone());
+            }
+        }
+        None
+    });
+    local.or_else(|| GLOBALS.with(|g| g.borrow().get(name).cloned()))
 }
 
 // プログラム実行の冒頭でループとトップレベルスコープを初期化する（状態を持ち越さない）。
 fn loop_reset() {
     LOOP.with(|l| *l.borrow_mut() = EventLoop::new());
     GLOBALS.with(|g| g.borrow_mut().clear());
+    LOCAL_RECS.with(|s| s.borrow_mut().clear());
 }
 
 // GLOBALS にトップレベル束縛を 1 つ登録する（eval_program が定義ごとに呼ぶ）。

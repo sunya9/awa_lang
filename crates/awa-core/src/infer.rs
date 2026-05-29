@@ -1024,6 +1024,18 @@ fn infer_stmts(
     let mut local_methods = methods.clone();
     let mut tstmts = Vec::with_capacity(stmts.len());
     let mut last = Type::Unit;
+    // ブロック内の相互再帰: 関数 let を本体推論の前に fresh プレースホルダで pre-declare する
+    // （トップレベルと同じ letrec 化。定義順に関係なく互いを参照できる）。
+    let mut prebound: HashMap<String, Type> = HashMap::new();
+    for stmt in stmts {
+        if let Stmt::Let(name, _, expr) = stmt {
+            if matches!(expr.kind, ExprKind::Lambda(..)) {
+                let ph = vargen.fresh();
+                env.insert(name.clone(), Scheme::mono(ph.clone()));
+                prebound.insert(name.clone(), ph);
+            }
+        }
+    }
     for stmt in stmts {
         match stmt {
             Stmt::Let(name, annotation, expr) => {
@@ -1036,7 +1048,7 @@ fn infer_stmts(
                     vargen,
                     &local_arities,
                     &local_methods,
-                    None, // ブロック内 let は逐次（相互再帰はトップレベルのみ）
+                    prebound.get(name).cloned(),
                 )?;
                 tstmts.push(TStmt::Let(name.clone(), te));
                 last = Type::Unit; // let 文はブロック値に寄与しない

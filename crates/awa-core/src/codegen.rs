@@ -1369,7 +1369,14 @@ impl Gen {
             }
             match self.scope.get(name) {
                 Some((_, ty)) => caps.push((name.clone(), ty.clone())),
-                None => return unsupported(format!("捕獲できない変数: {}", name)),
+                // 後方で定義される兄弟（ブロック内の相互再帰関数）はここに来る。互いを捕獲すると
+                // 参照の循環ができ、awa の参照カウント GC（無循環前提）と衝突するため native では未対応。
+                // インタプリタでは動く。トップレベルに定義すれば native でも相互再帰できる。
+                None => {
+                    return unsupported(format!(
+                        "{name} を捕獲できません（ブロック内の相互再帰は native 未対応＝参照が循環し RC GC と衝突。トップレベルに定義してください）"
+                    ));
+                }
             }
         }
         let fn_name = m.fresh_fn();
