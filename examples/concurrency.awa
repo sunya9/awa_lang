@@ -13,6 +13,7 @@ type List(a) {
 let all: fn(List(Future(a))) -> Future(List(a)) = fn(fs) {
   case fs {
     Nil -> pure(Nil)
+
     Cons(f, rest) -> do {
       x <- f
       xs <- all(rest)

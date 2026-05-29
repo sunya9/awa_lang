@@ -204,11 +204,26 @@ struct Fmt {
     ci: usize,
     line_starts: Vec<usize>,
     exports: HashSet<String>,
+    last_line: usize, // 直近に出力した構文要素の終端行（空行保持の判定用）
 }
 
 impl Fmt {
     fn line_of(&self, off: usize) -> usize {
         self.line_starts.partition_point(|&s| s <= off)
+    }
+
+    // 連続する項目の区切り。基本は改行 1 つだが、ソースで項目（または直前コメント）との間に
+    // 空行があれば改行 2 つにして 1 行ぶんの空行を残す（ユーザーの段落分けを保持）。
+    fn sep_before(&mut self, item_start: usize) -> D {
+        let next_line = match self.comments.get(self.ci) {
+            Some(c) if c.span.start < item_start => self.line_of(c.span.start),
+            _ => self.line_of(item_start),
+        };
+        if self.last_line > 0 && next_line > self.last_line + 1 {
+            cat(hard(), hard())
+        } else {
+            hard()
+        }
     }
 
     // off より前（前の行）にあるコメントを、それぞれ独立行として吐く。
@@ -259,25 +274,28 @@ impl Fmt {
         let mut parts = vec![];
         let mut first = true;
         for imp in &m.imports {
-            if !first {
-                parts.push(hard());
+            if first {
+                first = false;
+            } else {
+                parts.push(self.sep_before(imp.span.start));
             }
-            first = false;
             parts.push(self.leading(imp.span.start));
             parts.push(import_doc(imp));
             parts.push(self.trailing(imp.span.end));
+            self.last_line = self.line_of(imp.span.end);
         }
         for s in &m.stmts {
             let (start, end) = stmt_bounds(s);
-            if !first {
-                parts.push(hard());
-                parts.push(hard()); // 定義の間は空行
+            if first {
+                first = false;
+            } else {
+                parts.push(self.sep_before(start));
             }
-            first = false;
             parts.push(self.leading(start));
             let p = self.is_pub(s);
             parts.push(self.stmt(s, p));
             parts.push(self.trailing(end));
+            self.last_line = self.line_of(end);
         }
         parts.push(self.rest());
         concat(parts)
@@ -338,12 +356,13 @@ impl Fmt {
         let mut parts = vec![];
         for (i, mth) in b.methods.iter().enumerate() {
             if i > 0 {
-                parts.push(hard());
+                parts.push(self.sep_before(mth.body.span.start));
             }
             parts.push(self.leading(mth.body.span.start));
             // pub impl は impl 側で公開済み。メソッド個別の pub fn だけを再出力する。
             parts.push(self.method(mth, mth.is_pub));
             parts.push(self.trailing(mth.body.span.end));
+            self.last_line = self.line_of(mth.body.span.end);
         }
         braced(header, concat(parts))
     }
@@ -444,11 +463,12 @@ impl Fmt {
                 let mut parts = vec![];
                 for (i, (pat, body)) in arms.iter().enumerate() {
                     if i > 0 {
-                        parts.push(hard());
+                        parts.push(self.sep_before(body.span.start));
                     }
                     parts.push(self.leading(body.span.start));
                     parts.push(concat(vec![pattern_doc(pat), text(" -> "), self.expr(body)]));
                     parts.push(self.trailing(body.span.end));
+                    self.last_line = self.line_of(body.span.end);
                 }
                 braced(header, concat(parts))
             }
@@ -593,11 +613,12 @@ impl Fmt {
         for (i, s) in stmts.iter().enumerate() {
             let (start, end) = stmt_bounds(s);
             if i > 0 {
-                parts.push(hard());
+                parts.push(self.sep_before(start));
             }
             parts.push(self.leading(start));
             parts.push(self.stmt(s, false));
             parts.push(self.trailing(end));
+            self.last_line = self.line_of(end);
         }
         // 最後の文と '}' の間のコメント。
         parts.push(self.leading(close));
@@ -780,11 +801,18 @@ mod tests {
     #[test]
     fn 文字列補間が復元される() {
         // ${} は lexer で __interp へ脱糖されるが、fmt は補間文字列へ戻す。
-        assert_eq!(fmt("let x = 1\n\"n=${x + 2}\""), "let x = 1\n\n\"n=${x + 2}\"\n");
+        assert_eq!(fmt("let x = 1\n\"n=${x + 2}\""), "let x = 1\n\"n=${x + 2}\"\n");
         // リテラルの $ は \$ に保つ（補間に化けない）。
         assert_eq!(fmt("\"price \\${5}\""), "\"price \\${5}\"\n");
         // 補間でない素の連結はそのまま。
         assert_eq!(fmt("\"a\" <> \"b\""), "\"a\" <> \"b\"\n");
+    }
+
+    #[test]
+    fn ソースの空行を1行だけ保持する() {
+        assert_eq!(fmt("let a = 1\nlet b = 2"), "let a = 1\nlet b = 2\n"); // 隣接は詰める
+        assert_eq!(fmt("let a = 1\n\nlet b = 2"), "let a = 1\n\nlet b = 2\n"); // 空行は残す
+        assert_eq!(fmt("let a = 1\n\n\n\nlet b = 2"), "let a = 1\n\nlet b = 2\n"); // 連続は 1 つに
     }
 
     #[test]
@@ -805,9 +833,16 @@ pub fn format_source(src: &str) -> Result<String, LocatedError> {
         ci: 0,
         line_starts: compute_line_starts(src),
         exports: module.exports.clone(),
+        last_line: 0,
     };
     let doc = f.module(&module);
-    let mut out = render(&doc, WIDTH);
+    let rendered = render(&doc, WIDTH);
+    // 各行の末尾空白を除去（空行に残るインデント等を消す）。
+    let mut out: String = rendered
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
     while out.ends_with('\n') {
         out.pop();
     }
