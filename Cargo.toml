@@ -1,12 +1,6 @@
-[package]
-name = "awa_lang"
-version = "0.1.0"
-edition = "2024"
-
-# 正式名は awa_lang だが、コマンド名は短く awa にする。
-# これで `awa foo.awa` / `awa`（REPL）と叩ける。
-[[bin]]
-name = "awa"
-path = "src/main.rs"
-
-[dependencies]
+# awa はモノレポ（Cargo ワークスペース）。
+#   crates/awa-core … コンパイラ＋ランタイム（ライブラリ。CLI と LSP が共有）
+#   crates/awa-cli  … `awa` コマンド（インタプリタ実行・emit・build・REPL）
+[workspace]
+members = ["crates/awa-core", "crates/awa-cli"]
+resolver = "2"

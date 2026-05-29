@@ -1,18 +1,17 @@
-use std::io::{Write, stdout};
 
-mod ast;
-mod codegen;
-mod error;
-mod eval;
-mod infer;
-mod lexer;
-mod match_check;
-mod parser;
-mod resolve;
-mod span;
-mod token;
-mod types;
-mod value;
+pub mod ast;
+pub mod codegen;
+pub mod error;
+pub mod eval;
+pub mod infer;
+pub mod lexer;
+pub mod match_check;
+pub mod parser;
+pub mod resolve;
+pub mod span;
+pub mod token;
+pub mod types;
+pub mod value;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -22,9 +21,12 @@ use error::{LocatedError, report};
 use eval::eval_program;
 use infer::Checker;
 use parser::Parser;
-use resolve::LoadedModule;
-use types::{Type, render_type};
+use types::Type;
 use value::{Env, Value};
+
+// CLI / LSP など下流クレートが使う公開再エクスポート。
+pub use codegen::ASYNC_RUNTIME_C;
+pub use resolve::LoadedModule;
 
 // ===== パイプライン =====
 // tokenize → parse → type-check → eval を ? で連結。どこで失敗しても Err が伝わる。
@@ -34,7 +36,7 @@ use value::{Env, Value};
 // REPL（行をまたいで持ち越す）もこの 1 つの関数で賄える。
 // 各文の (値, 型) を順に返す。型検査は型付き AST（TStmt）を返し、eval はそれを実行する。
 // 型宣言は値文を生まないので、値と型はどちらも Let/Expr 文だけから同順で取れる。
-fn run(
+pub fn run(
     source: &str,
     env: &mut Env,
     checker: &mut Checker,
@@ -52,108 +54,8 @@ fn run(
     Ok(values.into_iter().zip(types).collect())
 }
 
-// CLI のエントリパスを (root, エントリファイル名) に分解する。
-// root はエントリの親ディレクトリ（モジュール解決の基点）。`import util` は root/util.awa を指す。
-// 例: "examples/app/main.awa" → (root="examples/app", name="main.awa")。
-fn entry_root_and_name(path: &str) -> (PathBuf, String) {
-    let p = std::path::Path::new(path);
-    let root = match p.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let name = p
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
-    (root, name)
-}
-
-// エントリパスからローダを走らせて全モジュールを得る。失敗したら整形済みメッセージを出して終了。
-fn load_or_exit(path: &str) -> Vec<LoadedModule> {
-    let (root, name) = entry_root_and_name(path);
-    load_program(&root, &name).unwrap_or_else(|msg| {
-        eprintln!("{}", msg);
-        std::process::exit(1);
-    })
-}
-
-// ===== ファイル実行 =====
-// エントリ .awa を import ごと読み込み、名前解決→型検査→評価して一括実行する。
-// 表示するのはエントリモジュールの行だけ（import したモジュールの定義は出力しない）。
-fn run_file(path: &str) {
-    let modules = load_or_exit(path);
-    // エントリ（依存順で最後）の Let/Expr 文数＝表示する行数。
-    let entry_rows = modules
-        .last()
-        .map(|m| {
-            m.stmts
-                .iter()
-                .filter(|s| matches!(s, ast::Stmt::Let(..) | ast::Stmt::Expr(..)))
-                .count()
-        })
-        .unwrap_or(0);
-    let typed = match check_program_modules(&modules) {
-        Ok(t) => t,
-        Err(msg) => {
-            eprintln!("{}", msg);
-            std::process::exit(1);
-        }
-    };
-    let mut env = eval::builtins_env();
-    let values = match eval_program(&typed, &mut env) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", format_error(&e, &modules));
-            std::process::exit(1);
-        }
-    };
-    let types = typed.iter().filter_map(|ts| match ts {
-        TStmt::Let(_, te) | TStmt::Expr(te) => Some(te.ty.clone()),
-        TStmt::Type(_) | TStmt::Impl(_) => None,
-    });
-    let rows: Vec<(Value, Type)> = values.into_iter().zip(types).collect();
-    let start = rows.len().saturating_sub(entry_rows);
-    for (v, t) in &rows[start..] {
-        // Unit（Nil）の結果行は表示しない（print/write_file 等の副作用文のノイズを抑える）。
-        if matches!(v, Value::Unit) {
-            continue;
-        }
-        println!("{} : {}", v, render_type(t));
-    }
-}
-
-// ===== REPL（対話実行）=====
-// 1 行読んでは評価する。env はループの外で持つので、let で束縛した変数を
-// 次の行から参照できる（セッション状態）。run がエラーを返しても落とさず、
-// 表示して次の入力へ進む（ファイル実行とは逆の方針）。
-fn repl() -> std::io::Result<()> {
-    println!("awa REPL — Ctrl-D で終了");
-    let mut env = eval::builtins_env();
-    let mut checker = Checker::new();
-    let stdin = std::io::stdin();
-    loop {
-        print!("awa> ");
-        stdout().flush()?;
-        let mut line = String::new();
-        let n = stdin.read_line(&mut line);
-        if n? == 0 {
-            break; // EOF
-        }
-        match run(&line, &mut env, &mut checker) {
-            Ok(rows) => {
-                for (v, t) in rows {
-                    println!("{} : {}", v, render_type(&t));
-                }
-            }
-            Err(e) => eprintln!("{}", report(&e, &line)),
-        }
-    }
-    Ok(())
-}
-
-// ソースを型検査し、型付きプログラムを LLVM IR テキストへコンパイルする（単一ソース・テスト用）。
-#[cfg_attr(not(test), allow(dead_code))]
-fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
+// ソースを型検査し、型付きプログラムを LLVM IR テキストへコンパイルする（単一ソース）。
+pub fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
     let tokens = lexer::tokenize(source)?;
     let program = Parser::new(tokens).parse_program()?;
     let mut checker = Checker::new();
@@ -165,7 +67,7 @@ fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
 // エントリファイルから import を辿って全モジュールを読み込み、依存順（依存先が先）に並べる。
 // import パスは root（= 既定でカレントディレクトリ）からの相対 `seg/seg.awa`。
 // 循環 import は検出してエラー。各ファイルは自分のソースで構文エラーを報告（位置を保てる）。
-fn load_program(root: &PathBuf, entry_path: &str) -> Result<Vec<LoadedModule>, String> {
+pub fn load_program(root: &PathBuf, entry_path: &str) -> Result<Vec<LoadedModule>, String> {
     // エントリのモジュールパス: ".awa" を外して "/" で分割。
     let rel = entry_path.strip_suffix(".awa").unwrap_or(entry_path);
     let entry_segs: Vec<String> = rel.split('/').map(|s| s.to_string()).collect();
@@ -230,7 +132,7 @@ fn load_module(
 
 // ローダ＋名前解決＋型検査を通し、フラットな型付きプログラムを返す。
 // エラーは整形済み文字列で返す（単一モジュールなら位置つき、複数なら簡易表示）。
-fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, String> {
+pub fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, String> {
     let resolved = resolve::resolve(modules).map_err(|e| format_error(&e, modules))?;
     let mut checker = Checker::new();
     let typed = checker
@@ -243,7 +145,7 @@ fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, String>
 
 // エラー整形: 連結後の span がどのモジュールの座標かを逆引きし、そのファイルのソース＋
 // ローカル位置で報告する（複数モジュールでもファイル名つきで「行:列」とキャレットを出せる）。
-fn format_error(e: &LocatedError, modules: &[LoadedModule]) -> String {
+pub fn format_error(e: &LocatedError, modules: &[LoadedModule]) -> String {
     let Some(span) = e.span else {
         return format!("error: {}", e.error);
     };
@@ -265,84 +167,9 @@ fn format_error(e: &LocatedError, modules: &[LoadedModule]) -> String {
 }
 
 // 全モジュールを名前解決・型検査し、LLVM IR テキストへコンパイルする。
-fn compile_modules_to_ir(modules: &[LoadedModule]) -> Result<String, String> {
+pub fn compile_modules_to_ir(modules: &[LoadedModule]) -> Result<String, String> {
     let typed = check_program_modules(modules)?;
     codegen::compile_program(&typed).map_err(|e| format_error(&LocatedError::from(e), modules))
-}
-
-// `awa emit <file>`: LLVM IR を標準出力へ（import を辿って全モジュールを結合）。
-fn emit_file(path: &str) {
-    let modules = load_or_exit(path);
-    match compile_modules_to_ir(&modules) {
-        Ok(ir) => print!("{}", ir),
-        Err(msg) => {
-            eprintln!("{}", msg);
-            std::process::exit(1);
-        }
-    }
-}
-
-// `awa build <file>`: IR を生成し clang でネイティブ実行ファイルを作る。
-fn build_file(path: &str) {
-    let modules = load_or_exit(path);
-    let ir = match compile_modules_to_ir(&modules) {
-        Ok(ir) => ir,
-        Err(msg) => {
-            eprintln!("{}", msg);
-            std::process::exit(1);
-        }
-    };
-    let base = path.strip_suffix(".awa").unwrap_or(path);
-    let ll_path = format!("{}.ll", base);
-    if let Err(e) = std::fs::write(&ll_path, &ir) {
-        eprintln!("IR を書けません ({}): {}", ll_path, e);
-        std::process::exit(1);
-    }
-    // 非同期イベントループの C ランタイムも書き出して一緒にリンクする。
-    let rt_path = format!("{}.async_rt.c", base);
-    if let Err(e) = std::fs::write(&rt_path, codegen::ASYNC_RUNTIME_C) {
-        eprintln!("ランタイムを書けません ({}): {}", rt_path, e);
-        std::process::exit(1);
-    }
-    let status = std::process::Command::new("clang")
-        .args([&rt_path, &ll_path, "-o", base])
-        .status();
-    match status {
-        Ok(s) if s.success() => println!("built: {}", base),
-        Ok(s) => {
-            eprintln!("clang が失敗しました: {}", s);
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("clang を起動できません: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn main() {
-    // 引数: awa emit/build <file> はコンパイル、awa <file> はインタプリタ実行、引数なしは REPL。
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(|s| s.as_str()) {
-        Some("emit") | Some("build") => {
-            let Some(path) = args.get(2) else {
-                eprintln!("使い方: awa {} <file.awa>", &args[1]);
-                std::process::exit(1);
-            };
-            if args[1] == "emit" {
-                emit_file(path);
-            } else {
-                build_file(path);
-            }
-        }
-        Some(path) => run_file(path),
-        None => {
-            if let Err(e) = repl() {
-                eprintln!("REPL エラー: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
 }
 
 // ===== テスト =====
@@ -408,7 +235,7 @@ mod tests {
 
     #[test]
     fn example_async() {
-        let src = include_str!("../examples/async.awa");
+        let src = include_str!("../../../examples/async.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let vals = run_values(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -689,7 +516,7 @@ mod tests {
 
     #[test]
     fn example_polymorphism() {
-        let src = include_str!("../examples/polymorphism.awa");
+        let src = include_str!("../../../examples/polymorphism.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -699,7 +526,7 @@ mod tests {
 
     #[test]
     fn example_adt() {
-        let src = include_str!("../examples/adt.awa");
+        let src = include_str!("../../../examples/adt.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -824,7 +651,7 @@ mod tests {
 
     #[test]
     fn example_annotations() {
-        let src = include_str!("../examples/annotations.awa");
+        let src = include_str!("../../../examples/annotations.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -999,7 +826,7 @@ mod tests {
 
     #[test]
     fn example_pipe() {
-        let src = include_str!("../examples/pipe.awa");
+        let src = include_str!("../../../examples/pipe.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -1050,7 +877,7 @@ mod tests {
 
     #[test]
     fn example_methods() {
-        let src = include_str!("../examples/methods.awa");
+        let src = include_str!("../../../examples/methods.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -1116,7 +943,7 @@ mod tests {
 
     #[test]
     fn example_do() {
-        let src = include_str!("../examples/do.awa");
+        let src = include_str!("../../../examples/do.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -1151,7 +978,7 @@ mod tests {
 
     #[test]
     fn example_types() {
-        let src = include_str!("../examples/types.awa");
+        let src = include_str!("../../../examples/types.awa");
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
@@ -1848,11 +1675,25 @@ mod tests {
             let n = s.read(&mut buf).ok()?;
             Some(String::from_utf8_lossy(&buf[..n]).to_string())
         })();
-        let status = child.wait();
+        // サーバの終了をポーリングで待つ（接続失敗時も最大 ~3 秒で諦めて kill＝ハングしない）。
+        let mut code = None;
+        for _ in 0..150 {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    code = st.code();
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        if code.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(echoed.as_deref(), Some("hello awa socket"));
         // 継続 env も解放されるのでサーバは終了コード 0（リークなし）。
-        assert_eq!(status.ok().and_then(|s| s.code()), Some(0), "サーバがリークしている");
+        assert_eq!(code, Some(0), "サーバが正常終了していない");
     }
 
     #[test]
@@ -1907,7 +1748,7 @@ mod tests {
 
     #[test]
     fn example_native() {
-        let src = include_str!("../examples/native.awa");
+        let src = include_str!("../../../examples/native.awa");
         let out = compile_and_run(src);
         assert_eq!(out, "7\n120\n55\ntrue\n");
     }

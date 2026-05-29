@@ -1,0 +1,12 @@
+[package]
+name = "awa-core"
+version = "0.1.0"
+edition = "2024"
+
+# コンパイラ＋ランタイムのライブラリ（lexer/parser/infer/codegen/eval/loader）。
+# CLI（awa-cli）と将来の LSP サーバ（awa-lsp）が共有する。
+[lib]
+name = "awa_core"
+path = "src/lib.rs"
+
+[dependencies]

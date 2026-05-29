@@ -1,0 +1,12 @@
+[package]
+name = "awa-cli"
+version = "0.1.0"
+edition = "2024"
+
+# 正式名は awa-cli だが、コマンド名は短く awa にする（`awa foo.awa` / `awa`=REPL）。
+[[bin]]
+name = "awa"
+path = "src/main.rs"
+
+[dependencies]
+awa-core = { path = "../awa-core" }
