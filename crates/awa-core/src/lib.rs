@@ -81,13 +81,24 @@ pub fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
 // import パスは root（= 既定でカレントディレクトリ）からの相対 `seg/seg.awa`。
 // 循環 import は検出してエラー。各ファイルは自分のソースで構文エラーを報告（位置を保てる）。
 // root: プロジェクトのルート（エントリの親）。stdlib: 標準ライブラリのルート（`std/` を含むディレクトリ）。
-// `import std/...` は stdlib から、それ以外は root から解決する。
+// `import std/...` は stdlib から、依存名で始まれば依存ルートから、それ以外は root から解決する。
 pub fn load_program(
     root: &PathBuf,
     stdlib: Option<&Path>,
     entry_path: &str,
 ) -> Result<Vec<LoadedModule>, String> {
-    load_program_with_overrides(root, stdlib, entry_path, &HashMap::new())
+    load_all(root, stdlib, entry_path, &HashMap::new(), &HashMap::new())
+}
+
+// path 依存つきでロードする（awa.toml の [dependencies] name = { path } 用）。
+// deps: 依存名 → そのパッケージのソースディレクトリ。`import name/x` を <dir>/x.awa に解決する。
+pub fn load_program_with_deps(
+    root: &PathBuf,
+    stdlib: Option<&Path>,
+    entry_path: &str,
+    deps: &HashMap<String, PathBuf>,
+) -> Result<Vec<LoadedModule>, String> {
+    load_all(root, stdlib, entry_path, &HashMap::new(), deps)
 }
 
 // 1 モジュールのソースだけを解決して返す（LSP の補完がモジュールのメンバーを引くのに使う）。
@@ -121,88 +132,130 @@ pub fn load_program_with_overrides(
     entry_path: &str,
     overrides: &HashMap<String, String>,
 ) -> Result<Vec<LoadedModule>, String> {
+    load_all(root, stdlib, entry_path, overrides, &HashMap::new())
+}
+
+// ローダの状態と設定。引数が増えすぎたので 1 つにまとめた。
+struct LoadCtx<'a> {
+    root: &'a Path,
+    stdlib: Option<&'a Path>,
+    overrides: &'a HashMap<String, String>,
+    deps: &'a HashMap<String, PathBuf>,
+    loaded: Vec<LoadedModule>,
+    done: HashSet<String>,
+    in_progress: HashSet<String>,
+}
+
+fn load_all(
+    root: &Path,
+    stdlib: Option<&Path>,
+    entry_path: &str,
+    overrides: &HashMap<String, String>,
+    deps: &HashMap<String, PathBuf>,
+) -> Result<Vec<LoadedModule>, String> {
     // エントリのモジュールパス: ".awa" を外して "/" で分割。
     let rel = entry_path.strip_suffix(".awa").unwrap_or(entry_path);
     let entry_segs: Vec<String> = rel.split('/').map(|s| s.to_string()).collect();
-    let mut loaded: Vec<LoadedModule> = Vec::new();
-    let mut done: HashSet<String> = HashSet::new();
-    let mut in_progress: HashSet<String> = HashSet::new();
-    load_module(
-        root, stdlib, &entry_segs, true, overrides, &mut loaded, &mut done, &mut in_progress,
-    )?;
-    Ok(loaded)
+    let mut ctx = LoadCtx {
+        root,
+        stdlib,
+        overrides,
+        deps,
+        loaded: Vec::new(),
+        done: HashSet::new(),
+        in_progress: HashSet::new(),
+    };
+    ctx.load(&entry_segs, true)?;
+    Ok(ctx.loaded)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn load_module(
-    root: &PathBuf,
-    stdlib: Option<&Path>,
-    segs: &[String],
-    is_entry: bool,
-    overrides: &HashMap<String, String>,
-    loaded: &mut Vec<LoadedModule>,
-    done: &mut HashSet<String>,
-    in_progress: &mut HashSet<String>,
-) -> Result<(), String> {
-    let key = segs.join("/");
-    if done.contains(&key) {
-        return Ok(()); // 既に読み込み済み（共有 import）
-    }
-    if !in_progress.insert(key.clone()) {
-        return Err(format!("import が循環しています: {}", key));
-    }
-    // `std/...` は stdlib ルートから、それ以外はプロジェクトルートから解決する。
-    let is_std = segs.first().map(|s| s.as_str()) == Some("std");
-    let mut path = match (is_std, stdlib) {
-        (true, Some(s)) => s.to_path_buf(),
-        _ => root.clone(),
-    };
-    for s in segs {
-        path.push(s);
-    }
-    path.set_extension("awa");
-    // 上書き（LSP のバッファ）が最優先。次に std はバイナリ焼き込み（cwd/環境に非依存。
-    // ただし実ファイルがあればそれを優先＝標準ライブラリ開発の上書き）。最後に通常のディスク読み。
-    let source = if let Some(buf) = overrides.get(&key) {
-        buf.clone()
-    } else if is_std {
-        match std::fs::read_to_string(&path) {
-            Ok(disk) => disk,
-            Err(disk_err) => stdlib::embedded_source(segs).map(str::to_string).ok_or_else(|| {
-                format!("標準ライブラリモジュールがありません: {key} ({disk_err})")
-            })?,
+impl LoadCtx<'_> {
+    // segs を解決すべきファイルパスと is_std を返す。
+    //  - "std/..."        → stdlib ルート配下（無ければ後で焼き込みにフォールバック）
+    //  - "<dep>/rest..."  → 依存ディレクトリ配下 rest.awa（依存名は接頭辞。bare は <dir>/<dep>.awa）
+    //  - それ以外          → プロジェクト root 配下
+    fn module_path(&self, segs: &[String]) -> (PathBuf, bool) {
+        let head = segs.first().map(|s| s.as_str()).unwrap_or("");
+        if head == "std" {
+            let mut p = self.stdlib.unwrap_or(self.root).to_path_buf();
+            for s in segs {
+                p.push(s);
+            }
+            p.set_extension("awa");
+            return (p, true);
         }
-    } else {
-        std::fs::read_to_string(&path)
-            .map_err(|e| format!("モジュールを読めません ({}): {}", path.display(), e))?
-    };
-    // 構文解析（このファイルのソースでエラー位置を出す）。
-    let parsed = (|| {
-        let tokens = lexer::tokenize(&source)?;
-        Parser::new(tokens).parse_module()
-    })()
-    .map_err(|e| report(&e, &source))?;
-    // 依存先を先に読み込む（post-order で依存順に並ぶ）。
-    for imp in &parsed.imports {
-        load_module(root, stdlib, &imp.path, false, overrides, loaded, done, in_progress)?;
+        if let Some(dir) = self.deps.get(head) {
+            let mut p = dir.clone();
+            if segs.len() == 1 {
+                p.push(head); // bare `import dep` → <dir>/<dep>.awa
+            } else {
+                for s in &segs[1..] {
+                    p.push(s); // 依存名を剥がして残りを dir 配下へ
+                }
+            }
+            p.set_extension("awa");
+            return (p, false);
+        }
+        let mut p = self.root.to_path_buf();
+        for s in segs {
+            p.push(s);
+        }
+        p.set_extension("awa");
+        (p, false)
     }
-    in_progress.remove(&key);
-    done.insert(key);
-    // エントリは接頭辞なし（既存の単一ファイル挙動・@main を維持）、他は "seg.seg." で修飾。
-    let prefix = if is_entry {
-        String::new()
-    } else {
-        format!("{}.", segs.join("."))
-    };
-    loaded.push(LoadedModule {
-        path: segs.to_vec(),
-        prefix,
-        imports: parsed.imports,
-        exports: parsed.exports,
-        stmts: parsed.stmts,
-        source,
-    });
-    Ok(())
+
+    fn load(&mut self, segs: &[String], is_entry: bool) -> Result<(), String> {
+        let key = segs.join("/");
+        if self.done.contains(&key) {
+            return Ok(()); // 既に読み込み済み（共有 import）
+        }
+        if !self.in_progress.insert(key.clone()) {
+            return Err(format!("import が循環しています: {}", key));
+        }
+        let (path, is_std) = self.module_path(segs);
+        // 上書き（LSP のバッファ）が最優先。次に std はバイナリ焼き込み（cwd/環境に非依存。
+        // ただし実ファイルがあればそれを優先＝標準ライブラリ開発の上書き）。最後に通常のディスク読み。
+        let source = if let Some(buf) = self.overrides.get(&key) {
+            buf.clone()
+        } else if is_std {
+            match std::fs::read_to_string(&path) {
+                Ok(disk) => disk,
+                Err(disk_err) => stdlib::embedded_source(segs).map(str::to_string).ok_or_else(
+                    || format!("標準ライブラリモジュールがありません: {key} ({disk_err})"),
+                )?,
+            }
+        } else {
+            std::fs::read_to_string(&path)
+                .map_err(|e| format!("モジュールを読めません ({}): {}", path.display(), e))?
+        };
+        // 構文解析（このファイルのソースでエラー位置を出す）。
+        let parsed = (|| {
+            let tokens = lexer::tokenize(&source)?;
+            Parser::new(tokens).parse_module()
+        })()
+        .map_err(|e| report(&e, &source))?;
+        // 依存先を先に読み込む（post-order で依存順に並ぶ）。
+        for imp in &parsed.imports {
+            self.load(&imp.path, false)?;
+        }
+        self.in_progress.remove(&key);
+        self.done.insert(key);
+        // エントリは接頭辞なし（既存の単一ファイル挙動・@main を維持）、他は "seg.seg." で修飾。
+        let prefix = if is_entry {
+            String::new()
+        } else {
+            format!("{}.", segs.join("."))
+        };
+        self.loaded.push(LoadedModule {
+            path: segs.to_vec(),
+            prefix,
+            imports: parsed.imports,
+            exports: parsed.exports,
+            stmts: parsed.stmts,
+            source,
+        });
+        Ok(())
+    }
 }
 
 // ローダ＋名前解決＋型検査を通し、フラットな型付きプログラムを返す。

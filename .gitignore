@@ -13,3 +13,6 @@ examples/concurrency
 # vscode 拡張
 editors/vscode/node_modules
 editors/vscode/*.vsix
+
+# awa build 出力
+build/

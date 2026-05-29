@@ -1,7 +1,8 @@
 // awa コマンド（CLI）。コンパイラ本体は awa-core ライブラリにあり、ここは
 // 引数解釈・ファイル I/O・clang 呼び出し・REPL といった「実行環境」だけを持つ。
+use std::collections::HashMap;
 use std::io::{Write, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use awa_core::ast::{self, TStmt};
 use awa_core::error::report;
@@ -11,8 +12,9 @@ use awa_core::types::{Type, render_type};
 use awa_core::value::Value;
 use awa_core::{
     ASYNC_RUNTIME_C, LoadedModule, check_program_modules, compile_modules_to_ir, format_error,
-    load_program, run,
+    load_program_with_deps, run,
 };
+use serde::Deserialize;
 
 // CLI のエントリパスを (root, エントリファイル名) に分解する。
 // root はエントリの親ディレクトリ（モジュール解決の基点）。`import util` は root/util.awa を指す。
@@ -49,9 +51,10 @@ fn stdlib_root() -> Option<PathBuf> {
 }
 
 // エントリパスからローダを走らせて全モジュールを得る。失敗したら整形済みメッセージを出して終了。
-fn load_or_exit(path: &str) -> Vec<LoadedModule> {
+// deps: awa.toml の path 依存（依存名 → ソースディレクトリ）。
+fn load_or_exit(path: &str, deps: &HashMap<String, PathBuf>) -> Vec<LoadedModule> {
     let (root, name) = entry_root_and_name(path);
-    load_program(&root, stdlib_root().as_deref(), &name).unwrap_or_else(|msg| {
+    load_program_with_deps(&root, stdlib_root().as_deref(), &name, deps).unwrap_or_else(|msg| {
         eprintln!("{}", msg);
         std::process::exit(1);
     })
@@ -60,8 +63,8 @@ fn load_or_exit(path: &str) -> Vec<LoadedModule> {
 // ===== ファイル実行 =====
 // エントリ .awa を import ごと読み込み、名前解決→型検査→評価して一括実行する。
 // 表示するのはエントリモジュールの行だけ（import したモジュールの定義は出力しない）。
-fn run_file(path: &str) {
-    let modules = load_or_exit(path);
+fn run_file(path: &str, deps: &HashMap<String, PathBuf>) {
+    let modules = load_or_exit(path, deps);
     // エントリ（依存順で最後）の Let/Expr 文数＝表示する行数。
     let entry_rows = modules
         .last()
@@ -132,8 +135,8 @@ fn repl() -> std::io::Result<()> {
 }
 
 // `awa emit <file>`: LLVM IR を標準出力へ（import を辿って全モジュールを結合）。
-fn emit_file(path: &str) {
-    let modules = load_or_exit(path);
+fn emit_file(path: &str, deps: &HashMap<String, PathBuf>) {
+    let modules = load_or_exit(path, deps);
     match compile_modules_to_ir(&modules) {
         Ok(ir) => print!("{}", ir),
         Err(msg) => {
@@ -143,10 +146,11 @@ fn emit_file(path: &str) {
     }
 }
 
-// `awa build <file>`: IR を生成し clang でネイティブ実行ファイルを作る。
-// out_name が Some なら実行ファイル名をそれにする（awa.toml の name 用）。
-fn build_file(path: &str, out_name: Option<&str>) {
-    let modules = load_or_exit(path);
+// `awa build`: IR を生成し clang でネイティブ実行ファイルを作る。
+// 中間生成物（.ll / .async_rt.c）と実行ファイルはすべて out_dir に吐く（ソース木を汚さない）。
+// 実行ファイル名は bin。
+fn build_file(target: &BuildTarget) {
+    let modules = load_or_exit(&target.entry, &target.deps);
     let ir = match compile_modules_to_ir(&modules) {
         Ok(ir) => ir,
         Err(msg) => {
@@ -154,23 +158,30 @@ fn build_file(path: &str, out_name: Option<&str>) {
             std::process::exit(1);
         }
     };
-    let base = path.strip_suffix(".awa").unwrap_or(path);
-    let exe = out_name.unwrap_or(base);
-    let ll_path = format!("{}.ll", base);
+    if let Err(e) = std::fs::create_dir_all(&target.out_dir) {
+        eprintln!("出力先を作れません ({}): {}", target.out_dir, e);
+        std::process::exit(1);
+    }
+    let stem = std::path::Path::new(&target.entry)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    let ll_path = format!("{}/{}.ll", target.out_dir, stem);
     if let Err(e) = std::fs::write(&ll_path, &ir) {
         eprintln!("IR を書けません ({}): {}", ll_path, e);
         std::process::exit(1);
     }
     // 非同期イベントループの C ランタイムも書き出して一緒にリンクする。
-    let rt_path = format!("{}.async_rt.c", base);
+    let rt_path = format!("{}/{}.async_rt.c", target.out_dir, stem);
     if let Err(e) = std::fs::write(&rt_path, ASYNC_RUNTIME_C) {
         eprintln!("ランタイムを書けません ({}): {}", rt_path, e);
         std::process::exit(1);
     }
+    let exe = format!("{}/{}", target.out_dir, target.bin);
     // -O2: LLVM の sibling-call 最適化で末尾再帰が定数スタックになる（ループ相当）。
     // 併せて未使用関数の除去（globaldce）など一般的な最適化も効く。
     let status = std::process::Command::new("clang")
-        .args(["-O2", &rt_path, &ll_path, "-o", exe])
+        .args(["-O2", &rt_path, &ll_path, "-o", &exe])
         .status();
     match status {
         Ok(s) if s.success() => println!("built: {}", exe),
@@ -229,36 +240,92 @@ fn fmt_file(args: &[String]) {
 }
 
 // プロジェクトマニフェスト awa.toml（最小）。name と entry だけ見る。
+// awa.toml（本物の TOML を serde でパース）。
+#[derive(Deserialize, Default)]
 struct Manifest {
     name: Option<String>,
+    #[allow(dead_code)]
+    version: Option<String>,
     entry: Option<String>,
+    #[serde(default)]
+    build: BuildConfig,
+    #[serde(default)]
+    dependencies: std::collections::BTreeMap<String, Dependency>,
 }
 
-// 最小 TOML パーサ: `key = "value"` 行のみ。コメント(#)・空行・[section] は無視。
-fn parse_manifest(src: &str) -> Manifest {
-    let mut name = None;
-    let mut entry = None;
-    for line in src.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim().trim_matches('"').to_string();
-            match k.trim() {
-                "name" => name = Some(v),
-                "entry" => entry = Some(v),
-                _ => {}
-            }
+#[derive(Deserialize, Default)]
+struct BuildConfig {
+    #[serde(rename = "out-dir")]
+    out_dir: Option<String>,
+    bin: Option<String>,
+}
+
+// 依存の指定。今は path 依存のみ（`name = { path = "../foo" }`）。
+#[derive(Deserialize)]
+struct Dependency {
+    path: String,
+}
+
+// ビルド/実行の確定ターゲット。
+struct BuildTarget {
+    entry: String,
+    out_dir: String,
+    bin: String,
+    deps: HashMap<String, PathBuf>,
+}
+
+// ./awa.toml を読み、TOML としてパースする（無ければ None、壊れていれば終了）。
+fn load_manifest() -> Option<Manifest> {
+    let src = std::fs::read_to_string("awa.toml").ok()?;
+    match toml::from_str::<Manifest>(&src) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            eprintln!("awa.toml の解析に失敗しました:\n{e}");
+            std::process::exit(1);
         }
     }
-    Manifest { name, entry }
 }
 
-fn load_manifest() -> Option<Manifest> {
-    std::fs::read_to_string("awa.toml")
-        .ok()
-        .map(|s| parse_manifest(&s))
+// [dependencies] を「依存名 → ソースディレクトリ（awa.toml のある場所からの相対）」へ。
+fn manifest_deps(m: &Manifest) -> HashMap<String, PathBuf> {
+    m.dependencies
+        .iter()
+        .map(|(name, dep)| (name.clone(), PathBuf::from(&dep.path)))
+        .collect()
+}
+
+// build/emit/run の対象を、明示パスや awa.toml から確定する。
+fn resolve_target(explicit: Option<&str>) -> BuildTarget {
+    let manifest = load_manifest();
+    let deps = manifest.as_ref().map(manifest_deps).unwrap_or_default();
+    let out_dir = manifest
+        .as_ref()
+        .and_then(|m| m.build.out_dir.clone())
+        .unwrap_or_else(|| "build".to_string());
+    let entry = explicit
+        .map(String::from)
+        .or_else(|| manifest.as_ref().and_then(|m| m.entry.clone()))
+        .unwrap_or_else(|| {
+            eprintln!("ビルド対象がありません: ファイルを指定するか awa.toml に entry を書いてください");
+            std::process::exit(1);
+        });
+    let stem = Path::new(&entry)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    // 実行ファイル名: [build] bin > （明示パスなら stem）> name > stem。
+    let bin = manifest
+        .as_ref()
+        .and_then(|m| m.build.bin.clone())
+        .or_else(|| {
+            if explicit.is_some() {
+                Some(stem.clone())
+            } else {
+                manifest.as_ref().and_then(|m| m.name.clone())
+            }
+        })
+        .unwrap_or(stem);
+    BuildTarget { entry, out_dir, bin, deps }
 }
 
 // `awa init [name]`: awa.toml と src/main.awa の雛形を作る。
@@ -274,7 +341,16 @@ fn init_project(name: Option<&str>) {
             .unwrap_or_else(|| "app".to_string())
     });
     let manifest = format!(
-        "# awa プロジェクト設定\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"src/main.awa\"\n"
+        "# awa プロジェクト設定\n\
+         name = \"{name}\"\n\
+         version = \"0.1.0\"\n\
+         entry = \"src/main.awa\"\n\
+         \n\
+         [build]\n\
+         out-dir = \"build\"\n\
+         \n\
+         [dependencies]\n\
+         # mylib = {{ path = \"../mylib\" }}\n"
     );
     if let Err(e) = std::fs::write("awa.toml", manifest) {
         eprintln!("awa.toml を書けません: {e}");
@@ -308,37 +384,28 @@ fn run_cli() {
     // awa <file> はインタプリタ実行。ファイル省略時は awa.toml の entry、無ければ REPL。
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("emit") | Some("build") => {
-            let is_emit = args[1] == "emit";
-            // ファイル引数があればそれ、無ければ awa.toml の entry。
-            let (path, out_name) = match args.get(2) {
-                Some(p) => (p.clone(), None),
-                None => {
-                    let m = load_manifest().unwrap_or_else(|| {
-                        eprintln!("使い方: awa {} <file.awa>（または awa.toml に entry）", args[1]);
-                        std::process::exit(1);
-                    });
-                    let entry = m.entry.unwrap_or_else(|| {
-                        eprintln!("awa.toml に entry がありません");
-                        std::process::exit(1);
-                    });
-                    (entry, m.name)
-                }
-            };
-            if is_emit {
-                emit_file(&path);
-            } else {
-                build_file(&path, out_name.as_deref());
-            }
+        Some("emit") => {
+            let t = resolve_target(args.get(2).map(|s| s.as_str()));
+            emit_file(&t.entry, &t.deps);
+        }
+        Some("build") => {
+            let t = resolve_target(args.get(2).map(|s| s.as_str()));
+            build_file(&t);
         }
         Some("fmt") => fmt_file(&args),
         Some("init") => init_project(args.get(2).map(|s| s.as_str())),
-        Some(path) => run_file(path),
+        Some(path) => {
+            // 明示ファイルでも awa.toml があれば依存を使う。
+            let deps = load_manifest().as_ref().map(manifest_deps).unwrap_or_default();
+            run_file(path, &deps);
+        }
         None => {
             // 引数なし: awa.toml の entry を実行、無ければ REPL。
-            if let Some(entry) = load_manifest().and_then(|m| m.entry) {
-                run_file(&entry);
-                return;
+            if let Some(m) = load_manifest() {
+                if let Some(entry) = m.entry.clone() {
+                    run_file(&entry, &manifest_deps(&m));
+                    return;
+                }
             }
             if let Err(e) = repl() {
                 eprintln!("REPL エラー: {}", e);
@@ -350,20 +417,27 @@ fn run_cli() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_manifest;
+    use super::Manifest;
 
     #[test]
-    fn manifest_の最小パース() {
-        let src = "# project\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.awa\"\n";
-        let m = parse_manifest(src);
+    fn manifest_のtomlパース() {
+        let src = "name = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.awa\"\n\
+                   [build]\nout-dir = \"dist\"\nbin = \"demoapp\"\n\
+                   [dependencies]\nmylib = { path = \"../mylib\" }\n";
+        let m: Manifest = toml::from_str(src).unwrap();
         assert_eq!(m.name.as_deref(), Some("demo"));
         assert_eq!(m.entry.as_deref(), Some("src/main.awa"));
+        assert_eq!(m.build.out_dir.as_deref(), Some("dist"));
+        assert_eq!(m.build.bin.as_deref(), Some("demoapp"));
+        assert_eq!(m.dependencies.get("mylib").map(|d| d.path.as_str()), Some("../mylib"));
     }
 
     #[test]
-    fn manifest_は欠落キーを許容() {
-        let m = parse_manifest("name = \"x\"\n");
+    fn manifest_は欠落セクションを許容() {
+        let m: Manifest = toml::from_str("name = \"x\"\n").unwrap();
         assert_eq!(m.name.as_deref(), Some("x"));
         assert_eq!(m.entry, None);
+        assert!(m.dependencies.is_empty());
+        assert_eq!(m.build.out_dir, None);
     }
 }

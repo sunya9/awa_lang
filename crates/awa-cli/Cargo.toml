@@ -10,3 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 awa-core = { path = "../awa-core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
