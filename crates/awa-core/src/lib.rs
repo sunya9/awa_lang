@@ -1040,6 +1040,16 @@ mod tests {
     }
 
     #[test]
+    fn 三連引用符は複数行生文字列() {
+        // 改行はそのまま保持される。
+        assert_eq!(eval("\"\"\"a\nb\"\"\""), Ok(Value::Str("a\nb".to_string())));
+        // 生（エスケープ非解釈）: \n はバックスラッシュ+n のまま。
+        assert_eq!(eval("\"\"\"x\\ny\"\"\""), Ok(Value::Str("x\\ny".to_string())));
+        // 内部の " はそのまま含められる（末尾以外）。
+        assert_eq!(eval("\"\"\"say \"hi\" loud\"\"\""), Ok(Value::Str("say \"hi\" loud".to_string())));
+    }
+
+    #[test]
     fn 数値変換の組込関数() {
         assert_eq!(eval("int_to_float(3)"), Ok(Value::Float(3.0)));
         assert_eq!(eval("int_to_string(5)"), Ok(Value::Str("5".to_string())));

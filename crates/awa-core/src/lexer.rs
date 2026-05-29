@@ -210,6 +210,29 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                 }
             }
             // 文字列リテラル "..."。最小のエスケープ \n \t \\ \" に対応。
+            // 三連引用符 """..."""：生（エスケープ解釈なし）・改行保持の複数行文字列。
+            '"' if chars.get(i + 1) == Some(&'"') && chars.get(i + 2) == Some(&'"') => {
+                i += 3; // 開き """
+                let mut s = String::new();
+                loop {
+                    if chars.get(i).is_none() {
+                        return Err(LocatedError::at(
+                            AwaError::UnterminatedString,
+                            Span::new(start, i),
+                        ));
+                    }
+                    if chars.get(i) == Some(&'"')
+                        && chars.get(i + 1) == Some(&'"')
+                        && chars.get(i + 2) == Some(&'"')
+                    {
+                        i += 3; // 閉じ """
+                        break;
+                    }
+                    s.push(chars[i]); // 中身はそのまま（改行も含めて）
+                    i += 1;
+                }
+                tokens.push(Spanned::new(Token::Str(s), Span::new(start, i)));
+            }
             '"' => {
                 i += 1; // 開き "
                 let mut s = String::new();
