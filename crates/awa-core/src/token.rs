@@ -8,8 +8,6 @@ pub enum Token {
     Bool(bool),    // 真偽値リテラル（true / false）
     Ident(String), // 識別子（変数名）
     Let,           // キーワード let
-    If,            // キーワード if
-    Else,          // キーワード else
     Fn,            // キーワード fn
     Type,          // キーワード type（ADT 宣言）
     Case,          // キーワード case（パターンマッチ）

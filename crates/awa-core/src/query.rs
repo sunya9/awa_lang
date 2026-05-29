@@ -68,11 +68,6 @@ fn smallest_in_expr(te: &TExpr, offset: usize, best: &mut Option<(Span, Type)>) 
             smallest_in_expr(l, offset, best);
             smallest_in_expr(r, offset, best);
         }
-        TExprKind::If(c, t, e) => {
-            smallest_in_expr(c, offset, best);
-            smallest_in_expr(t, offset, best);
-            smallest_in_expr(e, offset, best);
-        }
         TExprKind::Lambda(_, body) => smallest_in_expr(body, offset, best),
         TExprKind::Call(callee, args) => {
             smallest_in_expr(callee, offset, best);

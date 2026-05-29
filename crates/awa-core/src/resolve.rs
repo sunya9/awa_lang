@@ -197,11 +197,6 @@ fn check_vis_expr(te: &TExpr, r: &Resolved) -> Result<(), LocatedError> {
             check_vis_expr(l, r)?;
             check_vis_expr(rr, r)?;
         }
-        TExprKind::If(c, t, e) => {
-            check_vis_expr(c, r)?;
-            check_vis_expr(t, r)?;
-            check_vis_expr(e, r)?;
-        }
         TExprKind::Lambda(_, body) => check_vis_expr(body, r)?,
         TExprKind::Call(callee, args) => {
             check_vis_expr(callee, r)?;
@@ -381,11 +376,6 @@ impl Resolver<'_> {
                 Box::new(self.expr(l, locals)?),
                 op.clone(),
                 Box::new(self.expr(r, locals)?),
-            ),
-            ExprKind::If(c, t, e2) => ExprKind::If(
-                Box::new(self.expr(c, locals)?),
-                Box::new(self.expr(t, locals)?),
-                Box::new(self.expr(e2, locals)?),
             ),
             ExprKind::Lambda(params, ret, body) => {
                 let params = params

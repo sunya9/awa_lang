@@ -367,11 +367,6 @@ fn subst_types(te: &mut TExpr, s: &crate::types::Subst) {
             subst_types(l, s);
             subst_types(r, s);
         }
-        TExprKind::If(c, t, e) => {
-            subst_types(c, s);
-            subst_types(t, s);
-            subst_types(e, s);
-        }
         TExprKind::Lambda(_, b) => subst_types(b, s),
         TExprKind::Call(c, args) => {
             subst_types(c, s);
@@ -568,7 +563,6 @@ impl Gen {
                 Ok(r)
             }
             TExprKind::BinOp(l, op, r) => self.binop(l, op, r, m),
-            TExprKind::If(c, t, e2) => self.if_expr(c, t, e2, m),
             TExprKind::Call(callee, args) => self.call(callee, args, m),
             TExprKind::Block(stmts) => self.block(stmts, m),
             TExprKind::Lambda(params, body) => self.lambda(params, body, &e.ty, m),
@@ -876,28 +870,6 @@ impl Gen {
             }
             _ => unsupported(format!("組込関数 {}", name)),
         }
-    }
-
-    fn if_expr(&mut self, c: &TExpr, t: &TExpr, e: &TExpr, m: &mut Module) -> Result<String> {
-        let res_ty = llvm_ty(&t.ty)?;
-        let slot = format!("%v{}", self.fresh());
-        self.line(&format!("{} = alloca {}", slot, res_ty));
-        let cond = self.expr(c, m)?;
-        let id = self.fresh();
-        let (tl, el, ml) = (format!("then{id}"), format!("else{id}"), format!("merge{id}"));
-        self.line(&format!("br i1 {}, label %{}, label %{}", cond, tl, el));
-        self.label(&tl);
-        let tv = self.expr(t, m)?;
-        self.line(&format!("store {} {}, ptr {}", res_ty, tv, slot));
-        self.line(&format!("br label %{}", ml));
-        self.label(&el);
-        let ev = self.expr(e, m)?;
-        self.line(&format!("store {} {}, ptr {}", res_ty, ev, slot));
-        self.line(&format!("br label %{}", ml));
-        self.label(&ml);
-        let r = format!("%t{}", self.fresh());
-        self.line(&format!("{} = load {}, ptr {}", r, res_ty, slot));
-        Ok(r)
     }
 
     // 構築子ブロックを malloc して tag と各フィールドを格納し、その ptr を返す。
@@ -1549,11 +1521,6 @@ fn fv(e: &TExpr, bound: &HashSet<String>, free: &mut Vec<String>) {
             fv(l, bound, free);
             fv(r, bound, free);
         }
-        TExprKind::If(c, t, e2) => {
-            fv(c, bound, free);
-            fv(t, bound, free);
-            fv(e2, bound, free);
-        }
         TExprKind::Lambda(ps, b) => {
             let mut b2 = bound.clone();
             for p in ps {
@@ -1975,8 +1942,8 @@ mod tests {
     }
 
     #[test]
-    fn 再帰関数とifを出力する() {
-        let out = ir("let fact = fn(n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)");
+    fn 再帰関数とcaseを出力する() {
+        let out = ir("let fact = fn(n: Int) -> Int { case n == 0 { true -> 1; false -> n * fact(n - 1) } }; fact(5)");
         assert!(out.contains("define i64 @fact"));
         assert!(out.contains("icmp eq i64"));
         assert!(out.contains("mul i64"));

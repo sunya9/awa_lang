@@ -2,8 +2,23 @@
 // to_string は組込 float_to_string のラッパ（別名）。abs/max/min は純粋 awa。
 pub let to_string = fn(x: Float) -> String { float_to_string(x) }
 
-pub let abs = fn(x: Float) -> Float { if x < 0.0 { -x } else { x } }
+pub let abs = fn(x: Float) -> Float {
+  case x < 0.0 {
+    true -> -x
+    false -> x
+  }
+}
 
-pub let max: fn(Float, Float) -> Float = fn(a, b) { if a > b { a } else { b } }
+pub let max: fn(Float, Float) -> Float = fn(a, b) {
+  case a > b {
+    true -> a
+    false -> b
+  }
+}
 
-pub let min: fn(Float, Float) -> Float = fn(a, b) { if a < b { a } else { b } }
+pub let min: fn(Float, Float) -> Float = fn(a, b) {
+  case a < b {
+    true -> a
+    false -> b
+  }
+}

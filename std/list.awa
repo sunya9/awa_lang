@@ -27,7 +27,10 @@ pub let map: fn(List(a), fn(a) -> b) -> List(b) = fn(xs, f) {
 pub let filter: fn(List(a), fn(a) -> Bool) -> List(a) = fn(xs, pred) {
   case xs {
     Nil -> Nil
-    Cons(h, t) -> if pred(h) { Cons(h, filter(t, pred)) } else { filter(t, pred) }
+    Cons(h, t) -> case pred(h) {
+      true -> Cons(h, filter(t, pred))
+      false -> filter(t, pred)
+    }
   }
 }
 
@@ -54,7 +57,10 @@ pub let reverse: fn(List(a)) -> List(a) = fn(xs) { fold(xs, Nil, fn(acc, x) { Co
 pub let any: fn(List(a), fn(a) -> Bool) -> Bool = fn(xs, pred) {
   case xs {
     Nil -> false
-    Cons(h, t) -> if pred(h) { true } else { any(t, pred) }
+    Cons(h, t) -> case pred(h) {
+      true -> true
+      false -> any(t, pred)
+    }
   }
 }
 
@@ -62,7 +68,10 @@ pub let any: fn(List(a), fn(a) -> Bool) -> Bool = fn(xs, pred) {
 pub let all: fn(List(a), fn(a) -> Bool) -> Bool = fn(xs, pred) {
   case xs {
     Nil -> true
-    Cons(h, t) -> if pred(h) { all(t, pred) } else { false }
+    Cons(h, t) -> case pred(h) {
+      true -> all(t, pred)
+      false -> false
+    }
   }
 }
 
@@ -71,14 +80,18 @@ pub let all: fn(List(a), fn(a) -> Bool) -> Bool = fn(xs, pred) {
 pub let find = fn(xs, pred) {
   case xs {
     Nil -> option.None
-    Cons(h, t) -> if pred(h) { option.Some(h) } else { find(t, pred) }
+    Cons(h, t) -> case pred(h) {
+      true -> option.Some(h)
+      false -> find(t, pred)
+    }
   }
 }
 
 // 先頭から最大 n 個。
 pub let take: fn(List(a), Int) -> List(a) = fn(xs, n) {
-  if n <= 0 { Nil } else {
-    case xs {
+  case n <= 0 {
+    true -> Nil
+    false -> case xs {
       Nil -> Nil
       Cons(h, t) -> Cons(h, take(t, n - 1))
     }
@@ -87,8 +100,9 @@ pub let take: fn(List(a), Int) -> List(a) = fn(xs, n) {
 
 // 先頭の n 個を捨てた残り。
 pub let drop: fn(List(a), Int) -> List(a) = fn(xs, n) {
-  if n <= 0 { xs } else {
-    case xs {
+  case n <= 0 {
+    true -> xs
+    false -> case xs {
       Nil -> Nil
       Cons(_, t) -> drop(t, n - 1)
     }

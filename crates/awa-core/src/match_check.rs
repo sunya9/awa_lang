@@ -363,11 +363,6 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
             check_expr(l, sigs)?;
             check_expr(r, sigs)
         }
-        ExprKind::If(c, t, e) => {
-            check_expr(c, sigs)?;
-            check_expr(t, sigs)?;
-            check_expr(e, sigs)
-        }
         ExprKind::Lambda(_, _, body) => check_expr(body, sigs),
         ExprKind::Call(callee, args) => {
             check_expr(callee, sigs)?;

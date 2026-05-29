@@ -249,11 +249,6 @@ fn resolve_texpr(te: &mut TExpr, subst: &Subst) {
             resolve_texpr(l, subst);
             resolve_texpr(r, subst);
         }
-        TExprKind::If(c, t, e) => {
-            resolve_texpr(c, subst);
-            resolve_texpr(t, subst);
-            resolve_texpr(e, subst);
-        }
         TExprKind::Lambda(_, body) => resolve_texpr(body, subst),
         TExprKind::Call(callee, args) => {
             resolve_texpr(callee, subst);
@@ -332,11 +327,6 @@ fn check_numeric(te: &TExpr) -> Result<(), LocatedError> {
             }
             check_numeric(l)?;
             check_numeric(r)
-        }
-        TExprKind::If(c, t, e) => {
-            check_numeric(c)?;
-            check_numeric(t)?;
-            check_numeric(e)
         }
         TExprKind::Lambda(_, body) => check_numeric(body),
         TExprKind::Call(callee, args) => {
@@ -735,16 +725,6 @@ fn infer_expr(
             let ty = at(infer_binop(&lt.ty, op, &rt.ty, subst), span)?;
             (TExprKind::BinOp(Box::new(lt), op.clone(), Box::new(rt)), ty)
         }
-        // if: 条件は Bool、両腕は同じ型でなければならない。結果はその腕の型。
-        ExprKind::If(cond, then_branch, else_branch) => {
-            let ct = infer_expr(cond, env, subst, vargen, arities, methods)?;
-            at(unify(subst, &ct.ty, &Type::Bool), ct.span)?;
-            let tt = infer_expr(then_branch, env, subst, vargen, arities, methods)?;
-            let et = infer_expr(else_branch, env, subst, vargen, arities, methods)?;
-            at(unify(subst, &tt.ty, &et.ty), et.span)?;
-            let ty = apply(subst, &tt.ty);
-            (TExprKind::If(Box::new(ct), Box::new(tt), Box::new(et)), ty)
-        }
         // 無名関数: 各引数に型を割り当て（注釈があればその型、無ければ fresh）、
         // その下で本体を推論する。戻り型注釈があれば本体型と unify する。
         // 注釈中の型変数はこのシグネチャ内で共有する（sig_vars を引数・戻り型で使い回す）。
@@ -811,14 +791,16 @@ fn infer_expr(
                             conv("long_to_int", arg, Type::Int),
                             Type::Str,
                         ),
-                        // Bool は専用組込を持たないので if で分岐（評価は 1 回）。
+                        // Bool は専用組込を持たないので case で分岐（評価は 1 回）。
                         Type::Bool => TExpr {
                             ty: Type::Str,
                             span,
-                            kind: TExprKind::If(
+                            kind: TExprKind::Case(
                                 Box::new(arg),
-                                Box::new(lit("true")),
-                                Box::new(lit("false")),
+                                vec![
+                                    (Pattern::Bool(true), lit("true")),
+                                    (Pattern::Bool(false), lit("false")),
+                                ],
                             ),
                         },
                         other => {
@@ -1172,14 +1154,9 @@ mod tests {
     }
 
     #[test]
-    fn ifの条件はboolでなければならない() {
-        assert!(infer("if 1 { 2 } else { 3 }").is_err());
-    }
-
-    #[test]
-    fn ifの両腕は同じ型() {
-        assert_eq!(infer("if true { 1 } else { 2 }"), Ok(Type::Int));
-        assert!(infer("if true { 1 } else { false }").is_err());
+    fn case両腕は同じ型() {
+        assert_eq!(infer("case true { true -> 1; false -> 2 }"), Ok(Type::Int));
+        assert!(infer("case true { true -> 1; false -> false }").is_err());
     }
 
     #[test]
@@ -1212,7 +1189,7 @@ mod tests {
     #[test]
     fn 再帰関数の型推論() {
         assert_eq!(
-            infer("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)"),
+            infer("let fact = fn(n) { case n == 0 { true -> 1; false -> n * fact(n - 1) } }; fact(5)"),
             Ok(Type::Int)
         );
     }

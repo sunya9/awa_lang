@@ -451,8 +451,11 @@ mod tests {
     }
 
     #[test]
-    fn if_は選ばれた腕だけを評価する() {
-        assert_eq!(eval("let x = 0; if x == 0 { 100 } else { 1 / x }"), Ok(num(100.0)));
+    fn caseは選ばれた腕だけを評価する() {
+        assert_eq!(
+            eval("let x = 0; case x == 0 { true -> 100; false -> 1 / x }"),
+            Ok(num(100.0))
+        );
     }
 
     #[test]
@@ -477,14 +480,6 @@ mod tests {
         assert_eq!(
             eval("true + 1"),
             Err(AwaError::CannotUnify { left: "Bool".to_string(), right: "Int".to_string() })
-        );
-    }
-
-    #[test]
-    fn 型エラー_ifの条件が数値() {
-        assert_eq!(
-            eval("if 1 { 2 } else { 3 }"),
-            Err(AwaError::CannotUnify { left: "Int".to_string(), right: "Bool".to_string() })
         );
     }
 
@@ -535,7 +530,7 @@ mod tests {
     #[test]
     fn 再帰関数() {
         assert_eq!(
-            eval("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)"),
+            eval("let fact = fn(n) { case n == 0 { true -> 1; false -> n * fact(n - 1) } }; fact(5)"),
             Ok(num(120.0))
         );
     }
@@ -1697,7 +1692,7 @@ mod tests {
     #[test]
     fn codegen_再帰factがネイティブ実行される() {
         let out = compile_and_run(
-            "let fact = fn(n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)",
+            "let fact = fn(n: Int) -> Int { case n == 0 { true -> 1; false -> n * fact(n - 1) } }; fact(5)",
         );
         assert_eq!(out, "120\n");
     }
@@ -2026,7 +2021,7 @@ mod tests {
             "import std/io\n\
              import std/result\n\
              let safe_div = fn(a: Int, b: Int) -> result.Result(Int, String) {\n\
-               if b == 0 { result.Err(\"div0\") } else { result.Ok(a / b) }\n\
+               case b == 0 { true -> result.Err(\"div0\"); false -> result.Ok(a / b) }\n\
              }\n\
              let ok = do {\n\
                x <- safe_div(100, 5)\n\

@@ -43,6 +43,11 @@ always3(true)  // 3 : Num
 always3(999)  // 3 : Num
 
 // 再帰関数も型推論される（単相再帰）。fn(Num) -> Num。
-let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }
+let fact = fn(n) {
+  case n == 0 {
+    true -> 1
+    false -> n * fact(n - 1)
+  }
+}
 
 fact(6)  // 720 : Num

@@ -381,14 +381,6 @@ impl Fmt {
                     self.binop_operand(r, p, true),
                 ])
             }
-            ExprKind::If(c, t, e2) => concat(vec![
-                text("if "),
-                self.expr(c),
-                text(" "),
-                self.expr(t),
-                text(" else "),
-                self.expr(e2),
-            ]),
             ExprKind::Lambda(params, ret, body) => {
                 let ps: Vec<D> = params
                     .iter()
@@ -505,7 +497,6 @@ impl Fmt {
             ExprKind::BinOp(..)
                 | ExprKind::Neg(..)
                 | ExprKind::Lambda(..)
-                | ExprKind::If(..)
                 | ExprKind::Case(..)
         ) {
             concat(vec![text("("), self.expr(e), text(")")])

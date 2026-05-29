@@ -5,13 +5,19 @@ let y = x * 2 + 1
 
 x + y
 
-// if は式。各腕はブロック
-if x < y { x } else { y }
+// case は式。Bool を true/false で分岐（awa に if は無い）
+case x < y {
+  true -> x
+  false -> y
+}
 
 // ブロックは新しいスコープを作り、末尾の式が値になる
 let abs = {
   let d = x - 10
-  if d < 0 { -d } else { d }
+  case d < 0 {
+    true -> -d
+    false -> d
+  }
 }
 
 abs

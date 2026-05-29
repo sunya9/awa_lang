@@ -14,7 +14,10 @@ let total = do {
 
 // Result: Err は伝播。安全な割り算を do でつなぐ。
 let safe_div = fn(a: Int, b: Int) -> result.Result(Int, String) {
-  if b == 0 { result.Err("division by zero") } else { result.Ok(a / b) }
+  case b == 0 {
+    true -> result.Err("division by zero")
+    false -> result.Ok(a / b)
+  }
 }
 
 let computed = do {

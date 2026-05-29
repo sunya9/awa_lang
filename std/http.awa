@@ -72,7 +72,10 @@ let header_find = fn(headers, name) {
   case headers {
     list.Nil -> option.None
     list.Cons(h, t) -> case h {
-      pair.Pair(k, v) -> if k == name { option.Some(v) } else { header_find(t, name) }
+      pair.Pair(k, v) -> case k == name {
+        true -> option.Some(v)
+        false -> header_find(t, name)
+      }
     }
   }
 }
@@ -84,8 +87,12 @@ pub let get_header = fn(headers, name: String) -> option.Option(String) {
 // ----- 文字列ユーティリティ（このモジュール内）-----
 // sub が最初に現れる位置（無ければ -1）。
 let find_from = fn(s, sub, i, len, sublen) {
-  if i + sublen > len { -1 } else {
-    if string.slice(s, i, i + sublen) == sub { i } else { find_from(s, sub, i + 1, len, sublen) }
+  case i + sublen > len {
+    true -> -1
+    false -> case string.slice(s, i, i + sublen) == sub {
+      true -> i
+      false -> find_from(s, sub, i + 1, len, sublen)
+    }
   }
 }
 
@@ -93,21 +100,30 @@ let find_sub = fn(s, sub) { find_from(s, sub, 0, string_length(s), string_length
 
 // 行末の \r（CR）を落とす。
 let strip_cr = fn(line) {
-  if string.ends_with(line, "\r") { string.slice(line, 0, string_length(line) - 1) } else { line }
+  case string.ends_with(line, "\r") {
+    true -> string.slice(line, 0, string_length(line) - 1)
+    false -> line
+  }
 }
 
 // 先頭の半角スペースを落とす。
 let ltrim = fn(s) {
-  if string.starts_with(s, " ") { ltrim(string.slice(s, 1, string_length(s))) } else { s }
+  case string.starts_with(s, " ") {
+    true -> ltrim(string.slice(s, 1, string_length(s)))
+    false -> s
+  }
 }
 
 // "Key: Value" 行を Pair へ（: が無ければ None）。
 let parse_header_line = fn(line) {
   let colon = string.index_of(line, 58)
-  if colon == -1 { option.None } else {
-    let k = string.slice(line, 0, colon)
-    let v = ltrim(string.slice(line, colon + 1, string_length(line)))
-    option.Some(pair.Pair(k, v))
+  case colon == -1 {
+    true -> option.None
+    false -> {
+      let k = string.slice(line, 0, colon)
+      let v = ltrim(string.slice(line, colon + 1, string_length(line)))
+      option.Some(pair.Pair(k, v))
+    }
   }
 }
 
@@ -117,8 +133,9 @@ let parse_headers = fn(lines) {
     list.Nil -> list.Nil
     list.Cons(h, t) -> {
       let line = strip_cr(h)
-      if string.is_empty(line) { parse_headers(t) } else {
-        case parse_header_line(line) {
+      case string.is_empty(line) {
+        true -> parse_headers(t)
+        false -> case parse_header_line(line) {
           option.Some(p) -> list.Cons(p, parse_headers(t))
           option.None -> parse_headers(t)
         }
@@ -131,17 +148,20 @@ let parse_headers = fn(lines) {
 // 生のレスポンス文字列 → Response。
 pub let parse_response = fn(raw: String) -> result.Result(Response, String) {
   let b = find_sub(raw, "\r\n\r\n")
-  if b == -1 { result.Err("no header/body boundary") } else {
-    let head = string.slice(raw, 0, b)
-    let body = string.slice(raw, b + 4, string_length(raw))
-    case string.split(head, 10) {
-      list.Nil -> result.Err("empty response")
-      list.Cons(statusline, rest) -> {
-        let code = case string.split(strip_cr(statusline), 32) {
-          list.Cons(_, list.Cons(codestr, _)) -> string.to_int(codestr)
-          _ -> 0
+  case b == -1 {
+    true -> result.Err("no header/body boundary")
+    false -> {
+      let head = string.slice(raw, 0, b)
+      let body = string.slice(raw, b + 4, string_length(raw))
+      case string.split(head, 10) {
+        list.Nil -> result.Err("empty response")
+        list.Cons(statusline, rest) -> {
+          let code = case string.split(strip_cr(statusline), 32) {
+            list.Cons(_, list.Cons(codestr, _)) -> string.to_int(codestr)
+            _ -> 0
+          }
+          result.Ok(Response(code, parse_headers(rest), body))
         }
-        result.Ok(Response(code, parse_headers(rest), body))
       }
     }
   }
@@ -150,9 +170,15 @@ pub let parse_response = fn(raw: String) -> result.Result(Response, String) {
 // 生のリクエスト文字列 → Request。
 pub let parse_request = fn(raw: String) -> result.Result(Request, String) {
   let b = find_sub(raw, "\r\n\r\n")
-  let bound = if b == -1 { string_length(raw) } else { b }
+  let bound = case b == -1 {
+    true -> string_length(raw)
+    false -> b
+  }
   let head = string.slice(raw, 0, bound)
-  let body = if b == -1 { "" } else { string.slice(raw, b + 4, string_length(raw)) }
+  let body = case b == -1 {
+    true -> ""
+    false -> string.slice(raw, b + 4, string_length(raw))
+  }
   case string.split(head, 10) {
     list.Nil -> result.Err("empty request")
     list.Cons(reqline, rest) -> {
@@ -168,8 +194,15 @@ pub let parse_request = fn(raw: String) -> result.Result(Request, String) {
 
 // ----- 組み立て -----
 let reason = fn(status) {
-  if status == 200 { "OK" } else {
-    if status == 404 { "Not Found" } else { if status == 400 { "Bad Request" } else { "OK" } }
+  case status == 200 {
+    true -> "OK"
+    false -> case status == 404 {
+      true -> "Not Found"
+      false -> case status == 400 {
+        true -> "Bad Request"
+        false -> "OK"
+      }
+    }
   }
 }
 
@@ -203,7 +236,10 @@ pub let get_request = fn(host: String, path: String) -> String {
 let read_all = fn(sock, acc) -> Future(String) {
   do {
     chunk <- sock_read(sock)
-    if string.is_empty(chunk) { pure(acc) } else { read_all(sock, acc <> chunk) }
+    case string.is_empty(chunk) {
+      true -> pure(acc)
+      false -> read_all(sock, acc <> chunk)
+    }
   }
 }
 

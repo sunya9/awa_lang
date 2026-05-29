@@ -34,7 +34,7 @@
       "patterns": [
         {
           "name": "keyword.control.awa",
-          "match": "\\b(let|if|else|fn|type|case|impl|do|import|pub|as)\\b"
+          "match": "\\b(let|fn|type|case|impl|do|import|pub|as)\\b"
         }
       ]
     },

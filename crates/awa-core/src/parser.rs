@@ -836,23 +836,6 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(self.finish(start, ExprKind::Lambda(params, ret_annotation, Box::new(body))))
             }
-            // if 条件 { ブロック } else { ブロック }。各腕はブロック式。
-            Some(Token::If) => {
-                let cond = self.parse_expr()?;
-                self.expect(Token::LBrace)?;
-                let then_branch = self.parse_block()?;
-                self.expect(Token::Else)?;
-                self.expect(Token::LBrace)?;
-                let else_branch = self.parse_block()?;
-                Ok(self.finish(
-                    start,
-                    ExprKind::If(
-                        Box::new(cond),
-                        Box::new(then_branch),
-                        Box::new(else_branch),
-                    ),
-                ))
-            }
             // パターンマッチ case 主語 { パターン -> 本体; ... }。
             Some(Token::Case) => {
                 let subject = self.parse_expr()?;

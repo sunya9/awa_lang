@@ -21,17 +21,6 @@ fn at<T>(r: Result<T, AwaError>, span: Span) -> Result<T, LocatedError> {
     r.map_err(|e| LocatedError::at(e, span))
 }
 
-// 値から bool を取り出す。真偽値でなければ型エラー（if の条件は Bool 専用）。
-fn as_bool(v: Value) -> Result<bool, AwaError> {
-    match v {
-        Value::Bool(b) => Ok(b),
-        other => Err(AwaError::TypeError {
-            expected: "Bool",
-            found: type_name(&other),
-        }),
-    }
-}
-
 // 関数値に名前を刻む（再帰のため）。関数以外はそのまま返す。
 // let で束縛するときに使い、呼び出し時に「名前→自分自身」を注入できるようにする。
 fn bind_name(value: Value, name: &str) -> Value {
@@ -70,15 +59,6 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
             let l = eval_expr(left, env)?;
             let r = eval_expr(right, env)?;
             at(eval_binop(l, op, r), span)
-        }
-        // if は選ばれた腕だけを評価する（短絡評価）。
-        TExprKind::If(cond, then_branch, else_branch) => {
-            let c = eval_expr(cond, env)?;
-            if at(as_bool(c), span)? {
-                eval_expr(then_branch, env)
-            } else {
-                eval_expr(else_branch, env)
-            }
         }
         // 無名関数を評価すると Closure（関数 + 現在の環境のコピー）になる。
         // env.clone() がキャプチャの実体。呼び出し時にこの env をベースに使う。

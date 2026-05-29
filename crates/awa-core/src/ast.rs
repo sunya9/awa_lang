@@ -23,8 +23,6 @@ pub enum ExprKind {
     Var(String),    // 変数参照
     Neg(Box<Expr>), // 単項マイナス（例: -3, -(x + 1)）
     BinOp(Box<Expr>, Token, Box<Expr>),
-    // if 条件 { ブロック } else { ブロック }。三項とも式。
-    If(Box<Expr>, Box<Expr>, Box<Expr>),
     // 無名関数 fn(引数: 型?, ...) -> 戻り型? { 本体 }。
     // 各引数は名前と任意の型注釈、加えて任意の戻り型注釈、そして本体の式。
     Lambda(Vec<(String, Option<TypeExpr>)>, Option<TypeExpr>, Box<Expr>),
@@ -104,7 +102,6 @@ pub enum TExprKind {
     Var(String),
     Neg(Box<TExpr>),
     BinOp(Box<TExpr>, Token, Box<TExpr>),
-    If(Box<TExpr>, Box<TExpr>, Box<TExpr>),
     // 引数名のみ持つ（各引数の型は自身の ty=Fun(...) に入っている）。
     Lambda(Vec<String>, Box<TExpr>),
     Call(Box<TExpr>, Vec<TExpr>),

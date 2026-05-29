@@ -457,8 +457,6 @@ fn tokenize_collecting(
                 let word: String = chars[start..i].iter().collect();
                 let token = match word.as_str() {
                     "let" => Token::Let,
-                    "if" => Token::If,
-                    "else" => Token::Else,
                     "fn" => Token::Fn,
                     "type" => Token::Type,
                     "case" => Token::Case,
