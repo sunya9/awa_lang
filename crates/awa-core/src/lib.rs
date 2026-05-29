@@ -10,6 +10,7 @@ pub mod parser;
 pub mod query;
 pub mod resolve;
 pub mod span;
+pub mod stdlib;
 pub mod token;
 pub mod types;
 pub mod value;
@@ -121,8 +122,19 @@ fn load_module(
         path.push(s);
     }
     path.set_extension("awa");
-    let source = std::fs::read_to_string(&path)
-        .map_err(|e| format!("モジュールを読めません ({}): {}", path.display(), e))?;
+    // std モジュールはバイナリ焼き込みのソースを既定で使う（cwd/環境に非依存）。
+    // ただし実ファイルが見つかればそれを優先する＝標準ライブラリ自体を開発するときの上書き。
+    let source = if is_std {
+        match std::fs::read_to_string(&path) {
+            Ok(disk) => disk,
+            Err(disk_err) => stdlib::embedded_source(segs).map(str::to_string).ok_or_else(|| {
+                format!("標準ライブラリモジュールがありません: {key} ({disk_err})")
+            })?,
+        }
+    } else {
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("モジュールを読めません ({}): {}", path.display(), e))?
+    };
     // 構文解析（このファイルのソースでエラー位置を出す）。
     let parsed = (|| {
         let tokens = lexer::tokenize(&source)?;
@@ -1846,6 +1858,28 @@ mod tests {
         );
         // length=3、fold(sum)=6、map の長さ=3、max(abs(-9),3)=9。
         assert_eq!(out, "3\n6\n3\n9\n");
+    }
+
+    #[test]
+    fn 焼き込み標準ライブラリは_stdlibパスなしで解決できる() {
+        // stdlib=None でも `import std/...` がバイナリ焼き込みソースから解決される
+        // （cwd・環境変数に非依存）。エントリは std/ を持たない一時ディレクトリに置く。
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_embed_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.awa"),
+            "import std/string\nstring.length(\"awa\")\n",
+        )
+        .unwrap();
+        // stdlib パスを渡さない＝焼き込みのみで解決する。
+        let modules = load_program(&dir, None, "main").expect("焼き込みから解決できる");
+        let typed = check_program_modules(&modules).expect("型検査成功");
+        let _ = std::fs::remove_dir_all(&dir);
+        // std/string と main の 2 モジュールが読めていること。
+        assert!(modules.iter().any(|m| m.path == vec!["std".to_string(), "string".to_string()]));
+        assert!(!typed.is_empty());
     }
 
     #[test]

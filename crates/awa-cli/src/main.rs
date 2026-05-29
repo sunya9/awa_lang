@@ -30,8 +30,11 @@ fn entry_root_and_name(path: &str) -> (PathBuf, String) {
     (root, name)
 }
 
-// 標準ライブラリ（`std/` を含むディレクトリ）の場所。
-//   1) 環境変数 AWA_STDLIB（インストール先などを明示）
+// 標準ライブラリの「ディスク上書き」パス。`import std/...` の既定はバイナリ焼き込み
+// （awa-core の stdlib モジュール）で解決されるので、通常は None で構わない。
+// ここで返したパスに実ファイルがあれば焼き込みより優先される＝標準ライブラリ自体を
+// 編集しながら試すための上書き。
+//   1) 環境変数 AWA_STDLIB（明示的に別の std/ を指す）
 //   2) カレントディレクトリに std/ があればそれ（リポジトリルートでの開発用）
 fn stdlib_root() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("AWA_STDLIB") {
