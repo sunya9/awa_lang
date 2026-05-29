@@ -2,5 +2,5 @@
 #   crates/awa-core … コンパイラ＋ランタイム（ライブラリ。CLI と LSP が共有）
 #   crates/awa-cli  … `awa` コマンド（インタプリタ実行・emit・build・REPL）
 [workspace]
-members = ["crates/awa-core", "crates/awa-cli"]
+members = ["crates/awa-core", "crates/awa-cli", "crates/awa-lsp"]
 resolver = "2"

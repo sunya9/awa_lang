@@ -54,6 +54,16 @@ pub fn run(
     Ok(values.into_iter().zip(types).collect())
 }
 
+// 単一ソースを字句解析→構文解析→型検査するだけ（eval/codegen はしない）。
+// LSP の診断などで「エラーの有無と位置」を得るのに使う。awa は最初のエラーで止まる。
+pub fn check_source(source: &str) -> Result<(), LocatedError> {
+    let tokens = lexer::tokenize(source)?;
+    let program = Parser::new(tokens).parse_program()?;
+    let mut checker = Checker::new();
+    checker.check_program(&program)?;
+    Ok(())
+}
+
 // ソースを型検査し、型付きプログラムを LLVM IR テキストへコンパイルする（単一ソース）。
 pub fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
     let tokens = lexer::tokenize(source)?;
@@ -1656,34 +1666,43 @@ mod tests {
             .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang");
         assert!(st.success(), "clang が失敗");
         let mut child = std::process::Command::new(&exe).spawn().expect("起動");
-        // ポートファイルが書かれるまで待つ。
+        // ポートファイルが書かれるまで待つ（並列テストで CPU 飽和しても十分なよう ~15 秒）。
         let mut port = String::new();
-        for _ in 0..100 {
+        for _ in 0..300 {
             if let Ok(s) = std::fs::read_to_string(&pf) {
                 if !s.trim().is_empty() {
                     port = s.trim().to_string();
                     break;
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let echoed = (|| {
             let port: u16 = port.parse().ok()?;
-            let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+            // 接続も数回リトライ（サーバプロセスのスケジューリング待ち）。
+            let mut stream = None;
+            for _ in 0..50 {
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                    stream = Some(s);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let mut s = stream?;
             s.write_all(b"hello awa socket").ok()?;
             let mut buf = [0u8; 64];
             let n = s.read(&mut buf).ok()?;
             Some(String::from_utf8_lossy(&buf[..n]).to_string())
         })();
-        // サーバの終了をポーリングで待つ（接続失敗時も最大 ~3 秒で諦めて kill＝ハングしない）。
+        // サーバの終了をポーリングで待つ（接続失敗時も最大 ~15 秒で諦めて kill＝ハングしない）。
         let mut code = None;
-        for _ in 0..150 {
+        for _ in 0..300 {
             match child.try_wait() {
                 Ok(Some(st)) => {
                     code = st.code();
                     break;
                 }
-                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
         }
         if code.is_none() {
