@@ -12,6 +12,7 @@ mod token;
 mod types;
 mod value;
 
+use ast::TStmt;
 use error::AwaError;
 use eval::eval_program;
 use infer::Checker;
@@ -25,14 +26,19 @@ use value::{Env, Value};
 // 実行前に捕まり、eval には well-typed なプログラムだけが進む。
 // env / checker をともに借用で受け取るので、ファイル実行（使い捨て）も
 // REPL（行をまたいで持ち越す）もこの 1 つの関数で賄える。
-// 各文の (値, 型) を順に返す。check_program と eval_program はどちらも 1 文につき
-// 1 要素を同順で返すので zip して対応づけられる。
+// 各文の (値, 型) を順に返す。型検査は型付き AST（TStmt）を返し、eval はそれを実行する。
+// 型宣言は値文を生まないので、値と型はどちらも Let/Expr 文だけから同順で取れる。
 fn run(source: &str, env: &mut Env, checker: &mut Checker) -> Result<Vec<(Value, Type)>, AwaError> {
     let tokens = lexer::tokenize(source)?;
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
-    let types = checker.check_program(&program)?;
-    let values = eval_program(&program, env)?;
+    let typed = checker.check_program(&program)?;
+    let values = eval_program(&typed, env)?;
+    // 表示用に各 Let/Expr 文の型を取り出す（Type 文は飛ばす）。
+    let types = typed.iter().filter_map(|ts| match ts {
+        TStmt::Let(_, te) | TStmt::Expr(te) => Some(te.ty.clone()),
+        TStmt::Type(_) => None,
+    });
     Ok(values.into_iter().zip(types).collect())
 }
 

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::ast::{Expr, Pattern, Stmt, TypeDef};
+use crate::ast::{Pattern, TExpr, TExprKind, TStmt, TypeDef};
 use crate::error::AwaError;
 use crate::token::Token;
 use crate::value::{Closure, Env, Value, type_name};
@@ -43,24 +43,24 @@ fn bind_name(value: Value, name: &str) -> Value {
     }
 }
 
-pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
-    match expr {
-        Expr::Num(n) => Ok(Value::Num(*n)),
-        Expr::Bool(b) => Ok(Value::Bool(*b)),
+pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, AwaError> {
+    match &expr.kind {
+        TExprKind::Num(n) => Ok(Value::Num(*n)),
+        TExprKind::Bool(b) => Ok(Value::Bool(*b)),
         // 値はもう Copy ではないので .cloned() で複製する。
         // Num/Bool は安価、Func は Rc のカウント増加で済む。
-        Expr::Var(name) => env
+        TExprKind::Var(name) => env
             .get(name)
             .cloned()
             .ok_or_else(|| AwaError::UndefinedVariable(name.clone())),
-        Expr::Neg(operand) => Ok(Value::Num(-as_num(eval_expr(operand, env)?)?)),
-        Expr::BinOp(left, op, right) => {
+        TExprKind::Neg(operand) => Ok(Value::Num(-as_num(eval_expr(operand, env)?)?)),
+        TExprKind::BinOp(left, op, right) => {
             let l = eval_expr(left, env)?;
             let r = eval_expr(right, env)?;
             eval_binop(l, op, r)
         }
         // if は選ばれた腕だけを評価する（短絡評価）。
-        Expr::If(cond, then_branch, else_branch) => {
+        TExprKind::If(cond, then_branch, else_branch) => {
             if as_bool(eval_expr(cond, env)?)? {
                 eval_expr(then_branch, env)
             } else {
@@ -69,15 +69,15 @@ pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
         }
         // 無名関数を評価すると Closure（関数 + 現在の環境のコピー）になる。
         // env.clone() がキャプチャの実体。呼び出し時にこの env をベースに使う。
-        // 型注釈は実行時には無視し、引数名だけ取り出す。
-        Expr::Lambda(params, _ret, body) => Ok(Value::Func(Rc::new(Closure {
-            params: params.iter().map(|(name, _)| name.clone()).collect(),
+        // 引数名は型付きノードに既に名前だけで入っている。
+        TExprKind::Lambda(params, body) => Ok(Value::Func(Rc::new(Closure {
+            params: params.clone(),
             body: (**body).clone(),
             env: env.clone(),
             name: None, // 束縛時に let 側で名前を付け直す（再帰のため）
         }))),
         // 関数呼び出し。
-        Expr::Call(callee, args) => {
+        TExprKind::Call(callee, args) => {
             // 1. 呼ぶ対象を評価する。構築子なら Data を組み立てて返す。
             let callee_val = eval_expr(callee, env)?;
             let closure = match callee_val {
@@ -129,27 +129,27 @@ pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
         // ブロックは新しいスコープ。親 env をコピーして始め、抜けると破棄する
         // （ブロック内の let は外に漏れない）。値は最後の文が式ならその値、
         // そうでなければ（空 or 末尾が let）Unit。
-        Expr::Block(stmts) => {
+        TExprKind::Block(stmts) => {
             let mut block_env = env.clone();
             let mut value = Value::Unit;
             for stmt in stmts {
                 value = match stmt {
-                    Stmt::Let(name, _, e) => {
+                    TStmt::Let(name, e) => {
                         let v = bind_name(eval_expr(e, &block_env)?, name);
                         block_env.insert(name.clone(), v);
                         Value::Unit // let 文はブロック値に寄与しない
                     }
-                    Stmt::Type(def) => {
+                    TStmt::Type(def) => {
                         register_ctors(def, &mut block_env);
                         Value::Unit // 型宣言もブロック値に寄与しない
                     }
-                    Stmt::Expr(e) => eval_expr(e, &block_env)?,
+                    TStmt::Expr(e) => eval_expr(e, &block_env)?,
                 };
             }
             Ok(value)
         }
         // パターンマッチ。主語を評価し、腕を上から試して最初に当たったものを評価する。
-        Expr::Case(subject, arms) => {
+        TExprKind::Case(subject, arms) => {
             let value = eval_expr(subject, env)?;
             for (pattern, body) in arms {
                 if let Some(bindings) = match_pattern(pattern, &value) {
@@ -254,18 +254,18 @@ fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
 
 // プログラム（文の並び）を順に評価し、各文の値を順に返す。
 // env は呼び出し側が所有して渡す（REPL は行をまたいで使い回す）。
-pub fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
+pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
     let mut results = Vec::new();
     for stmt in stmts {
         match stmt {
-            Stmt::Let(name, _, expr) => {
+            TStmt::Let(name, expr) => {
                 let value = bind_name(eval_expr(expr, env)?, name);
                 env.insert(name.clone(), value.clone());
                 results.push(value);
             }
-            Stmt::Expr(expr) => results.push(eval_expr(expr, env)?),
+            TStmt::Expr(expr) => results.push(eval_expr(expr, env)?),
             // 型宣言は構築子を登録するだけ。結果行は出さない。
-            Stmt::Type(def) => register_ctors(def, env),
+            TStmt::Type(def) => register_ctors(def, env),
         };
     }
     Ok(results)

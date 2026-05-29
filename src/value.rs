@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ast::Expr;
+use crate::ast::TExpr;
 
 // ===== 値（実行時の値）=====
 // 関数を第一級の値にしたので、もう Copy ではない（Func が本体と環境を抱える）。
@@ -30,7 +30,7 @@ pub enum Value {
 #[derive(Debug)]
 pub struct Closure {
     pub params: Vec<String>,
-    pub body: Expr,
+    pub body: TExpr,
     pub env: Env,
     // この関数が let で束縛されたときの名前。再帰のために使う。
     // 無名関数（束縛されずに即使われる等）は None。

@@ -1,4 +1,5 @@
 use crate::token::Token;
+use crate::types::Type;
 
 // ===== AST =====
 // Clone を derive する理由: 関数を値にすると、Closure が本体 Expr を
@@ -53,6 +54,38 @@ pub struct TypeDef {
     pub name: String,            // "Option"
     pub params: Vec<String>,     // ["a"]（型パラメータ名）
     pub variants: Vec<Variant>,
+}
+
+// ===== 型付き AST（型検査の出力 = elaboration の結果）=====
+// パーサが作る untyped な Expr/Stmt に対し、型推論が各ノードに解決済みの型を載せた
+// もの。eval はこちらを実行する（型は実行時には使わないが、将来のコード生成や
+// 表示の土台になる。「全ての式に型がついている」を構造で保証する）。
+#[derive(Debug, Clone)]
+pub struct TExpr {
+    pub ty: Type,
+    pub kind: TExprKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum TExprKind {
+    Num(f64),
+    Bool(bool),
+    Var(String),
+    Neg(Box<TExpr>),
+    BinOp(Box<TExpr>, Token, Box<TExpr>),
+    If(Box<TExpr>, Box<TExpr>, Box<TExpr>),
+    // 引数名のみ持つ（各引数の型は自身の ty=Fun(...) に入っている）。
+    Lambda(Vec<String>, Box<TExpr>),
+    Call(Box<TExpr>, Vec<TExpr>),
+    Block(Vec<TStmt>),
+    Case(Box<TExpr>, Vec<(Pattern, TExpr)>),
+}
+
+#[derive(Debug, Clone)]
+pub enum TStmt {
+    Let(String, TExpr),
+    Expr(TExpr),
+    Type(TypeDef), // 型宣言は値を持たない（評価では構築子登録のみ）
 }
 
 // 1 つの構築子（variant）。fields が空ならヌル構築子（None など）。
