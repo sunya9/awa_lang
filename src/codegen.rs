@@ -49,6 +49,8 @@ fn llvm_ty(ty: &Type) -> Result<String> {
         // Future はランタイム所有のイベントループ内のハンドル（i64 id）。
         Type::Con(name, _) if name == "Future" => Ok("i64".into()),
         Type::Con(..) => Ok("ptr".into()),
+        // Unit は値を持たないが、I/O 等の戻り値として流れるのでダミーの i8 で表す。
+        Type::Unit => Ok("i8".into()),
         other => unsupported(format!("型 {}", other)),
     }
 }
@@ -69,6 +71,11 @@ fn is_builtin(name: &str) -> bool {
 // 非同期の組込（イベントループランタイムへ委譲する）。
 fn is_async_builtin(name: &str) -> bool {
     matches!(name, "pure" | "delay" | "run" | "Future#flatMap" | "Future#map")
+}
+
+// OS 連携の同期 I/O 組込（C ランタイムへ委譲する）。
+fn is_io_builtin(name: &str) -> bool {
+    matches!(name, "print" | "read_line" | "read_file" | "write_file" | "now")
 }
 
 // 呼び出し対象の戻り型（callee.ty = Fun(params, ret) の ret）。
@@ -446,10 +453,10 @@ impl Gen {
         self.line(&format!("store ptr null, ptr {}", dp));
         // 生存数 ++（リーク検出）。
         let lv = format!("%t{}", self.fresh());
-        self.line(&format!("{} = load i64, ptr @.live", lv));
+        self.line(&format!("{} = load i64, ptr @awa_live", lv));
         let lv1 = format!("%t{}", self.fresh());
         self.line(&format!("{} = add i64 {}, 1", lv1, lv));
-        self.line(&format!("store i64 {}, ptr @.live", lv1));
+        self.line(&format!("store i64 {}, ptr @awa_live", lv1));
         Ok(())
     }
 
@@ -1016,6 +1023,44 @@ impl Gen {
         Ok(p)
     }
 
+    // OS 連携の同期 I/O 組込（C ランタイム呼び出し）。String 引数は consume（呼び出し後に release）。
+    fn io_call(&mut self, name: &str, args: &[TExpr], m: &mut Module) -> Result<String> {
+        match name {
+            "print" => {
+                let v = self.expr(&args[0], m)?;
+                self.line(&format!("call void @awa_print(ptr {})", v));
+                self.release(&v, &args[0].ty);
+                Ok("0".to_string()) // Unit
+            }
+            "read_line" => {
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call ptr @awa_read_line()", r));
+                Ok(r)
+            }
+            "read_file" => {
+                let v = self.expr(&args[0], m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call ptr @awa_read_file(ptr {})", r, v));
+                self.release(&v, &args[0].ty);
+                Ok(r)
+            }
+            "write_file" => {
+                let p = self.expr(&args[0], m)?;
+                let c = self.expr(&args[1], m)?;
+                self.line(&format!("call void @awa_write_file(ptr {}, ptr {})", p, c));
+                self.release(&p, &args[0].ty);
+                self.release(&c, &args[1].ty);
+                Ok("0".to_string()) // Unit
+            }
+            "now" => {
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i64 @awa_now()", r));
+                Ok(r)
+            }
+            _ => unsupported(format!("I/O 組込 {}", name)),
+        }
+    }
+
     fn call(&mut self, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
         // 引数の型と値。
         let mut arg_parts = Vec::with_capacity(args.len());
@@ -1023,6 +1068,9 @@ impl Gen {
         if let TExprKind::Var(name) = &callee.kind {
             if is_async_builtin(name) {
                 return self.async_call(name, callee, args, m);
+            }
+            if is_io_builtin(name) {
+                return self.io_call(name, args, m);
             }
         }
         // callee が組込変換関数なら専用 IR（すべて単項）。
@@ -1168,6 +1216,7 @@ impl Gen {
                 || m.ctors.contains_key(name)
                 || is_builtin(name)
                 || is_async_builtin(name)
+                || is_io_builtin(name)
             {
                 continue;
             }
@@ -1530,8 +1579,14 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i64 @awa_future_flatmap(i64, ptr, ptr)\n");
     module.push_str("declare i64 @awa_future_map(i64, ptr, ptr)\n");
     module.push_str("declare i64 @awa_future_run(i64)\n");
-    // 生存ヒープオブジェクト数（リーク検出用）。init_header で ++、awa_release の解放で --。
-    module.push_str("@.live = internal global i64 0\n");
+    // OS 連携: 同期 I/O（async_runtime.c が定義）。
+    module.push_str("declare void @awa_print(ptr)\n");
+    module.push_str("declare ptr @awa_read_line()\n");
+    module.push_str("declare ptr @awa_read_file(ptr)\n");
+    module.push_str("declare void @awa_write_file(ptr, ptr)\n");
+    module.push_str("declare i64 @awa_now()\n");
+    // 生存ヒープオブジェクト数（リーク検出用）。init_header と awa_make_str で ++、awa_release で --。
+    module.push_str("@awa_live = global i64 0\n");
     // 書式・定数文字列。
     module.push_str("@.di = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n");
     module.push_str("@.df = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"\n");
@@ -1567,7 +1622,7 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
          \x20 ret void\n\
          }\n\n",
     );
-    // release: rc--。0 になったら drop_fn（あれば子を release）を呼び、@.live を減らして free。
+    // release: rc--。0 になったら drop_fn（あれば子を release）を呼び、@awa_live を減らして free。
     module.push_str(
         "\ndefine void @awa_release(ptr %o) {\n\
          entry:\n\
@@ -1583,9 +1638,9 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
          \x20 %dead = icmp eq i64 %rc1, 0\n\
          \x20 br i1 %dead, label %dofree, label %done\n\
          dofree:\n\
-         \x20 %lv = load i64, ptr @.live\n\
+         \x20 %lv = load i64, ptr @awa_live\n\
          \x20 %lv1 = sub i64 %lv, 1\n\
-         \x20 store i64 %lv1, ptr @.live\n\
+         \x20 store i64 %lv1, ptr @awa_live\n\
          \x20 %dp = getelementptr i8, ptr %o, i64 8\n\
          \x20 %drop = load ptr, ptr %dp\n\
          \x20 %dn = icmp eq ptr %drop, null\n\
@@ -1615,9 +1670,9 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
          \x20 store i64 1, ptr %obj\n\
          \x20 %dp = getelementptr i8, ptr %obj, i64 8\n\
          \x20 store ptr null, ptr %dp\n\
-         \x20 %lv = load i64, ptr @.live\n\
+         \x20 %lv = load i64, ptr @awa_live\n\
          \x20 %lv1 = add i64 %lv, 1\n\
-         \x20 store i64 %lv1, ptr @.live\n\
+         \x20 store i64 %lv1, ptr @awa_live\n\
          \x20 %buf = getelementptr i8, ptr %obj, i64 16\n\
          \x20 %c1 = call ptr @memcpy(ptr %buf, ptr %ab, i64 %la)\n\
          \x20 %tail = getelementptr i8, ptr %buf, i64 %la\n\
@@ -1650,7 +1705,7 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
         }
     }
     // プログラム終了前に、トップレベル値（グローバル変数が保持する +1）を release。
-    // これで RC が正しければ生存数 @.live は 0 になる。
+    // これで RC が正しければ生存数 @awa_live は 0 になる。
     let mut vg: Vec<(String, Type)> = m
         .value_globals
         .iter()
@@ -1666,7 +1721,7 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
     }
     // 終了コード = 残存ヒープ数（リーク検出: 正常時 0）。
     let lc = format!("%t{}", g.fresh());
-    g.line(&format!("{} = load i64, ptr @.live", lc));
+    g.line(&format!("{} = load i64, ptr @awa_live", lc));
     let ec = format!("%t{}", g.fresh());
     g.line(&format!("{} = trunc i64 {} to i32", ec, lc));
     g.line(&format!("ret i32 {}", ec));
@@ -1680,9 +1735,47 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
 // インタプリタ版（eval.rs）と同じ意味モデルを C で実装したもの。
 pub const ASYNC_RUNTIME_C: &str = r#"
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <time.h>
 static long now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
 static void sleep_ms(long ms) { if (ms <= 0) return; struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (ms%1000)*1000000; nanosleep(&ts, 0); }
+
+/* ===== OS 連携: 同期 I/O（awa の String オブジェクトを生成/消費）===== */
+/* awa の String レイアウト: [i64 rc][ptr drop][bytes...]、本体は obj+16。 */
+extern long long awa_live; /* 生存ヒープ数。codegen の @awa_live と共有（RC 整合） */
+static void* awa_make_str(const char* s, long n) {
+  char* o = (char*)malloc(16 + n + 1);
+  *(long long*)o = 1;            /* rc = 1 */
+  *(void**)(o + 8) = 0;          /* drop = null（子なし） */
+  memcpy(o + 16, s, n); o[16 + n] = 0;
+  awa_live++;                    /* RC: 生成で +1（awa_release が解放時に -1） */
+  return o;
+}
+void awa_print(void* strobj) { printf("%s\n", (char*)strobj + 16); }
+void* awa_read_line(void) {
+  char buf[8192];
+  if (!fgets(buf, sizeof buf, stdin)) buf[0] = 0;
+  long n = strlen(buf);
+  while (n && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = 0;
+  return awa_make_str(buf, n);
+}
+void* awa_read_file(void* pathobj) {
+  FILE* f = fopen((char*)pathobj + 16, "rb");
+  if (!f) { fprintf(stderr, "io error: cannot read %s\n", (char*)pathobj + 16); exit(74); }
+  fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+  char* b = (char*)malloc(n > 0 ? n : 1);
+  long got = (long)fread(b, 1, n, f); fclose(f);
+  void* o = awa_make_str(b, got); free(b); return o;
+}
+void awa_write_file(void* pathobj, void* contentobj) {
+  FILE* f = fopen((char*)pathobj + 16, "wb");
+  if (!f) { fprintf(stderr, "io error: cannot write %s\n", (char*)pathobj + 16); exit(74); }
+  const char* c = (char*)contentobj + 16;
+  fwrite(c, 1, strlen(c), f); fclose(f);
+}
+long long awa_now(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
+
 typedef long long Word;
 typedef Word (*ContFn)(void* state, Word x);
 typedef struct Waiter { int kind; long g; ContFn fn; void* state; struct Waiter* next; } Waiter;
@@ -1777,6 +1870,8 @@ fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
                 r, body
             ));
         }
+        // Unit（Nil）は表示しない（print/write_file 等の副作用文の値）。
+        Type::Unit => {}
         other => return unsupported(format!("出力できない型 {}", other)),
     }
     Ok(())

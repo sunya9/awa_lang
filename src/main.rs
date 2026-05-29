@@ -1729,6 +1729,20 @@ mod tests {
     }
 
     #[test]
+    fn codegen_io_がネイティブ実行される() {
+        // write_file→read_file→print が native で動き、RC が釣り合って終了コード 0。
+        let id = std::process::id();
+        let path = std::env::temp_dir().join(format!("awa_native_io_{}.txt", id));
+        let p = path.to_string_lossy().replace('\\', "/");
+        let (out, code) = compile_run_status(&format!(
+            "let _ = write_file(\"{p}\", \"data via awa\")\nprint(read_file(\"{p}\"))"
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(out, "data via awa\n");
+        assert_eq!(code, 0, "リークしている（残存 {}）", code);
+    }
+
+    #[test]
     fn codegen_async_がネイティブ実行される() {
         // do/Future が C ランタイムのイベントループ上で native 実行される（インタプリタと一致）。
         // 終了コードは継続クロージャの env リークで非0になりうるので stdout のみ確認。
