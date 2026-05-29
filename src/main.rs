@@ -524,6 +524,15 @@ mod tests {
     }
 
     #[test]
+    fn 一般的すぎる注釈は弾く() {
+        // 恒等関数の実際の型は fn(a) -> a。fn(a) -> b と注釈するのは過度に一般的。
+        assert!(matches!(
+            eval("let f: fn(a) -> b = fn(x) { x }"),
+            Err(AwaError::AnnotationTooGeneral { .. })
+        ));
+    }
+
+    #[test]
     fn 未定義の型を注釈に書くとエラー() {
         assert_eq!(
             eval("let x: Ghost = 1"),

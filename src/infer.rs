@@ -4,7 +4,7 @@ use crate::ast::{Expr, Pattern, Stmt, TypeDef, TypeExpr};
 use crate::error::AwaError;
 use crate::match_check::{Sigs, check_matches};
 use crate::token::Token;
-use crate::types::{Scheme, Subst, Type, VarGen, apply, ftv, instantiate, unify};
+use crate::types::{Scheme, Subst, Type, VarGen, apply, ftv, instantiate, render_type, unify};
 
 // 型名 → 型パラメータの個数（arity）。型式の解決時に「Option(a) の引数個数が
 // 宣言と合うか」を検査するのに使う。3b の網羅性チェックで variant 一覧へ拡張予定。
@@ -205,6 +205,41 @@ fn resolve_annotation(
     }
 }
 
+// 注釈を「rigid な skolem」付きで解決する。型変数を、ユーザーが書けない名前の
+// nominal 構築子（#skN）に変える。別々の skolem は互いに unify できないので、
+// 「注釈が推論型より一般的すぎる」を unify の失敗として検出できる（subsumption 検査）。
+fn resolve_skolem(
+    texpr: &TypeExpr,
+    sk: &mut HashMap<String, Type>,
+    vargen: &mut VarGen,
+    arities: &Arities,
+) -> Result<Type, AwaError> {
+    match texpr {
+        TypeExpr::Var(name) => Ok(sk
+            .entry(name.clone())
+            .or_insert_with(|| match vargen.fresh() {
+                Type::Var(id) => Type::Con(format!("#sk{}", id), Vec::new()),
+                _ => unreachable!(),
+            })
+            .clone()),
+        TypeExpr::Con(name, args) => {
+            let resolved = args
+                .iter()
+                .map(|a| resolve_skolem(a, sk, vargen, arities))
+                .collect::<Result<_, _>>()?;
+            resolve_con(name, resolved, arities)
+        }
+        TypeExpr::Fun(params, ret) => {
+            let params = params
+                .iter()
+                .map(|p| resolve_skolem(p, sk, vargen, arities))
+                .collect::<Result<_, _>>()?;
+            let ret = resolve_skolem(ret, sk, vargen, arities)?;
+            Ok(Type::Fun(params, Box::new(ret)))
+        }
+    }
+}
+
 // 型環境全体の自由型変数。各スキームの自由変数は ftv(ty) から量化変数を除いたもの
 // （量化済みの変数は「環境に縛られている」とは見なさない）。
 fn ftv_env(env: &TypeEnv, subst: &Subst) -> HashSet<u32> {
@@ -253,15 +288,30 @@ fn infer_let(
     env.insert(name.to_string(), Scheme::mono(placeholder.clone()));
     let t = infer_expr(expr, env, subst, vargen, arities)?;
     unify(subst, &placeholder, &t)?;
-    // 型注釈があれば、推論した型と突き合わせる（制約として unify）。
-    if let Some(ann) = annotation {
-        let mut vars = HashMap::new();
-        let ann_ty = resolve_annotation(ann, &mut vars, vargen, arities)?;
-        unify(subst, &placeholder, &ann_ty)?;
-    }
     // 自分自身の単相 placeholder を環境から外してから一般化する。
     // 外さないと placeholder が型変数を環境に縛り、何も量化されなくなる。
     env.remove(name);
+    // 型注釈があれば突き合わせる。
+    if let Some(ann) = annotation {
+        // (1) 制約: 注釈型と推論型を unify。噛み合わない型（Num と Bool 等）はここで CannotUnify。
+        let mut vars = HashMap::new();
+        let ann_ty = resolve_annotation(ann, &mut vars, vargen, arities)?;
+        unify(subst, &placeholder, &ann_ty)?;
+        // (2) subsumption: 注釈が推論された principal 型より一般的すぎないか。
+        // principal を instantiate し、注釈を skolem 化して別 subst 上で unify する。
+        // 失敗＝注釈が実際には持っていない一般性を主張している。
+        let principal = generalize(env, subst, &placeholder);
+        let inst = instantiate(&principal, vargen);
+        let mut sk = HashMap::new();
+        let ann_skolem = resolve_skolem(ann, &mut sk, vargen, arities)?;
+        let mut scratch = subst.clone();
+        if unify(&mut scratch, &inst, &ann_skolem).is_err() {
+            return Err(AwaError::AnnotationTooGeneral {
+                inferred: render_type(&principal.ty),
+                annotation: render_type(&ann_ty),
+            });
+        }
+    }
     let scheme = generalize(env, subst, &placeholder);
     env.insert(name.to_string(), scheme.clone());
     Ok(scheme.ty)

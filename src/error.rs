@@ -41,6 +41,8 @@ pub enum AwaError {
     UnreachablePattern(String),             // 上の腕に覆われて決して当たらない腕
     // or パターンの選択肢が束縛する変数の集合が食い違う
     OrPatternBindings,
+    // 型注釈が推論された型より一般的すぎる（実際に持っていない型を主張している）
+    AnnotationTooGeneral { inferred: String, annotation: String },
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -84,6 +86,14 @@ impl fmt::Display for AwaError {
             AwaError::OrPatternBindings => {
                 write!(f, "or パターンの各選択肢は同じ変数を束縛する必要があります")
             }
+            AwaError::AnnotationTooGeneral {
+                inferred,
+                annotation,
+            } => write!(
+                f,
+                "型注釈が一般的すぎます: {} と注釈されていますが、実際の型は {} です",
+                annotation, inferred
+            ),
         }
     }
 }
