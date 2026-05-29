@@ -16,6 +16,10 @@ use crate::types::Type;
 
 type Result<T> = std::result::Result<T, AwaError>;
 const CLOSURE_TY: &str = "{ ptr, ptr }";
+// 全ヒープオブジェクト共通の先頭ヘッダ: { i64 rc, ptr drop_fn }（16 バイト）。
+// rc = 参照カウント（負値はリテラル等の「不滅」）、drop_fn = 解放前に子を release する関数。
+// 物理レイアウトは rc=offset 0、drop=offset 8。文字列本体やフィールドはこの後ろに続く。
+const HDR_SIZE: i64 = 16;
 
 fn unsupported<T>(what: impl Into<String>) -> Result<T> {
     Err(AwaError::Unsupported(what.into()))
@@ -134,9 +138,10 @@ fn cartesian(lists: &[Vec<Pattern>]) -> Vec<Vec<Pattern>> {
     acc
 }
 
-// 構築子ブロックの LLVM 型: { i32 tag, field0, ... }。
+// 構築子ブロックの LLVM 型: { i64 rc, ptr drop, i32 tag, field0, ... }。
+// 先頭 2 要素は RC ヘッダ。tag は index 2、フィールドは index 3+i に並ぶ。
 fn block_ty(field_tys: &[Type]) -> Result<String> {
-    let mut parts = vec!["i32".to_string()];
+    let mut parts = vec!["i64".to_string(), "ptr".to_string(), "i32".to_string()];
     for t in field_tys {
         parts.push(llvm_ty(t)?);
     }
@@ -147,10 +152,14 @@ fn is_float(ty: &Type) -> bool {
     matches!(ty, Type::Float)
 }
 
-// env 構造体の LLVM 型文字列（キャプチャ型の並び）。
+// env 構造体の LLVM 型文字列（RC ヘッダ＋キャプチャ型の並び）。
+// 先頭 2 要素は RC ヘッダ。キャプチャは index 2+i に並ぶ。
 fn env_struct_ty(caps: &[(String, Type)]) -> Result<String> {
-    let tys: Vec<String> = caps.iter().map(|(_, t)| llvm_ty(t)).collect::<Result<_>>()?;
-    Ok(format!("{{ {} }}", tys.join(", ")))
+    let mut parts = vec!["i64".to_string(), "ptr".to_string()];
+    for (_, t) in caps {
+        parts.push(llvm_ty(t)?);
+    }
+    Ok(format!("{{ {} }}", parts.join(", ")))
 }
 
 // ===== モジュール全体の状態 =====
@@ -318,12 +327,17 @@ impl Module {
         format!("fn{}", n)
     }
     // 文字列リテラルをグローバル定数として登録し、その ptr（@.strN）を返す。
+    // RC ヘッダ込みのレイアウト { i64 rc, ptr drop, [N x i8] bytes }。リテラルは不滅なので
+    // rc=-1（awa_release は負値を解放しない）、drop=null。本体は obj+16（str_body で取る）。
     fn intern_string(&mut self, s: &str) -> String {
         let label = format!("@.str{}", self.str_ctr);
         self.str_ctr += 1;
-        let (constant, _) = llvm_string_constant(s);
-        self.strings
-            .push_str(&format!("{} = private unnamed_addr constant {}\n", label, constant));
+        let (arr, n) = llvm_string_constant(s);
+        let arr_ty = format!("[{} x i8]", n);
+        self.strings.push_str(&format!(
+            "{} = private unnamed_addr constant {{ i64, ptr, {} }} {{ i64 -1, ptr null, {} }}\n",
+            label, arr_ty, arr
+        ));
         label
     }
 }
@@ -357,6 +371,24 @@ impl Gen {
         self.out.push_str(l);
         self.out.push_str(":\n");
     }
+    // ヒープオブジェクトの RC ヘッダを初期化: rc=1（offset 0）、drop_fn=null（offset 8）。
+    // drop_fn の中身は M2（回収有効化）で型ごとに埋める。物理オフセットで書くので型不問。
+    fn init_header(&mut self, obj: &str) -> Result<()> {
+        self.line(&format!("store i64 1, ptr {}", obj));
+        let dp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = getelementptr i8, ptr {}, i64 8", dp, obj));
+        self.line(&format!("store ptr null, ptr {}", dp));
+        Ok(())
+    }
+
+    // 文字列オブジェクトの本体（null 終端バイト列）への ptr = obj + ヘッダ長。
+    // C 関数（strcmp/printf/strlen/memcpy）にはこの本体 ptr を渡す。
+    fn str_body(&mut self, obj: &str) -> String {
+        let r = format!("%t{}", self.fresh());
+        self.line(&format!("{} = getelementptr i8, ptr {}, i64 {}", r, obj, HDR_SIZE));
+        r
+    }
+
     fn bind_local(&mut self, name: &str, operand: &str, ty: &Type) -> Result<()> {
         let llty = llvm_ty(ty)?;
         let slot = format!("%v{}", self.fresh());
@@ -454,11 +486,13 @@ impl Gen {
                 self.eq_or_fail("i64", value, &v, fail);
                 Ok(())
             }
-            // 文字列パターンは strcmp で中身比較。
+            // 文字列パターンは strcmp で中身比較（本体 ptr 同士）。
             Pattern::Str(s) => {
                 let lit = m.intern_string(s);
+                let vb = self.str_body(value);
+                let lb = self.str_body(&lit);
                 let c = format!("%t{}", self.fresh());
-                self.line(&format!("{} = call i32 @strcmp(ptr {}, ptr {})", c, value, lit));
+                self.line(&format!("{} = call i32 @strcmp(ptr {}, ptr {})", c, vb, lb));
                 let eq = format!("%t{}", self.fresh());
                 self.line(&format!("{} = icmp eq i32 {}, 0", eq, c));
                 let cont = format!("cont{}", self.fresh());
@@ -474,9 +508,11 @@ impl Gen {
                     .get(name)
                     .cloned()
                     .ok_or_else(|| AwaError::Unsupported(format!("未知の構築子 {}", name)))?;
-                // tag は先頭の i32。
+                // tag は RC ヘッダの後（block_ty の index 2）。
+                let tagp = format!("%t{}", self.fresh());
+                self.line(&format!("{} = getelementptr i8, ptr {}, i64 {}", tagp, value, HDR_SIZE));
                 let tag = format!("%t{}", self.fresh());
-                self.line(&format!("{} = load i32, ptr {}", tag, value));
+                self.line(&format!("{} = load i32, ptr {}", tag, tagp));
                 self.eq_or_fail("i32", &tag, &ci.tag.to_string(), fail);
                 if subs.is_empty() {
                     return Ok(());
@@ -504,7 +540,7 @@ impl Gen {
                         fp,
                         bty,
                         value,
-                        i + 1
+                        i + 3
                     ));
                     let fv = format!("%t{}", self.fresh());
                     self.line(&format!("{} = load {}, ptr {}", fv, llvm_ty(fty)?, fp));
@@ -630,8 +666,10 @@ impl Gen {
                 Ok(r)
             }
             Token::EqEq | Token::NotEq => {
+                let lb = self.str_body(lv);
+                let rb = self.str_body(rv);
                 let c = format!("%t{}", self.fresh());
-                self.line(&format!("{} = call i32 @strcmp(ptr {}, ptr {})", c, lv, rv));
+                self.line(&format!("{} = call i32 @strcmp(ptr {}, ptr {})", c, lb, rb));
                 let pred = if matches!(op, Token::EqEq) { "eq" } else { "ne" };
                 self.line(&format!("{} = icmp {} i32 {}, 0", r, pred, c));
                 Ok(r)
@@ -660,12 +698,15 @@ impl Gen {
                 } else {
                     ("@.fi", "i64")
                 };
+                // ヘッダ込みで確保し、本体（obj+16）に最大 32 バイト書き込む。
                 let buf = format!("%t{}", self.fresh());
-                self.line(&format!("{} = call ptr @malloc(i64 32)", buf));
+                self.line(&format!("{} = call ptr @malloc(i64 {})", buf, HDR_SIZE + 32));
+                self.init_header(&buf)?;
+                let body = self.str_body(&buf);
                 let n = format!("%t{}", self.fresh());
                 self.line(&format!(
                     "{} = call i32 (ptr, i64, ptr, ...) @snprintf(ptr {}, i64 32, ptr {}, {} {})",
-                    n, buf, fmt, llty, arg
+                    n, body, fmt, llty, arg
                 ));
                 Ok(buf)
             }
@@ -705,9 +746,11 @@ impl Gen {
         self.line(&format!("{} = ptrtoint ptr {} to i64", sz, szp));
         let p = format!("%t{}", self.fresh());
         self.line(&format!("{} = call ptr @malloc(i64 {})", p, sz));
+        // RC ヘッダを初期化（rc=1、drop_fn は M2 で実装するので当面 null）。
+        self.init_header(&p)?;
         let tp = format!("%t{}", self.fresh());
         self.line(&format!(
-            "{} = getelementptr {}, ptr {}, i32 0, i32 0",
+            "{} = getelementptr {}, ptr {}, i32 0, i32 2",
             tp, bty, p
         ));
         self.line(&format!("store i32 {}, ptr {}", ci.tag, tp));
@@ -718,7 +761,7 @@ impl Gen {
                 fp,
                 bty,
                 p,
-                i + 1
+                i + 3
             ));
             self.line(&format!("store {} {}, ptr {}", llvm_ty(ty)?, op, fp));
         }
@@ -869,13 +912,14 @@ impl Gen {
             self.line(&format!("{} = ptrtoint ptr {} to i64", sz, szp));
             let env = format!("%t{}", self.fresh());
             self.line(&format!("{} = call ptr @malloc(i64 {})", env, sz));
-            // 各キャプチャを格納（現スコープから load → env に store）。
+            self.init_header(&env)?;
+            // 各キャプチャを格納（現スコープから load → env に store）。index 2+i（ヘッダの後）。
             for (i, (cname, cty)) in caps.iter().enumerate() {
                 let cv = self.var(cname, cty, m)?;
                 let fp = format!("%t{}", self.fresh());
                 self.line(&format!(
                     "{} = getelementptr {}, ptr {}, i32 0, i32 {}",
-                    fp, env_ty, env, i
+                    fp, env_ty, env, i + 2
                 ));
                 self.line(&format!("store {} {}, ptr {}", llvm_ty(cty)?, cv, fp));
             }
@@ -920,7 +964,7 @@ fn gen_function(
             let fp = format!("%t{}", g.fresh());
             g.line(&format!(
                 "{} = getelementptr {}, ptr %env, i32 0, i32 {}",
-                fp, env_ty, i
+                fp, env_ty, i + 2
             ));
             let v = format!("%t{}", g.fresh());
             g.line(&format!("{} = load {}, ptr {}", v, llvm_ty(cty)?, fp));
@@ -1135,19 +1179,27 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     for (name, ty) in vg {
         module.push_str(&format!("@{} = global {} zeroinitializer\n", name, llvm_ty(ty)?));
     }
-    // 文字列連結ランタイム。
+    // 文字列連結ランタイム。引数は文字列オブジェクト ptr、本体は obj+16。
+    // 結果もヘッダ込みで確保し rc=1/drop=null を設定して返す。
     module.push_str(
         "\ndefine ptr @awa_concat(ptr %a, ptr %b) {\n\
-         \x20 %la = call i64 @strlen(ptr %a)\n\
-         \x20 %lb = call i64 @strlen(ptr %b)\n\
+         \x20 %ab = getelementptr i8, ptr %a, i64 16\n\
+         \x20 %bb = getelementptr i8, ptr %b, i64 16\n\
+         \x20 %la = call i64 @strlen(ptr %ab)\n\
+         \x20 %lb = call i64 @strlen(ptr %bb)\n\
          \x20 %lab = add i64 %la, %lb\n\
-         \x20 %sz = add i64 %lab, 1\n\
-         \x20 %buf = call ptr @malloc(i64 %sz)\n\
-         \x20 %c1 = call ptr @memcpy(ptr %buf, ptr %a, i64 %la)\n\
+         \x20 %body = add i64 %lab, 1\n\
+         \x20 %sz = add i64 %body, 16\n\
+         \x20 %obj = call ptr @malloc(i64 %sz)\n\
+         \x20 store i64 1, ptr %obj\n\
+         \x20 %dp = getelementptr i8, ptr %obj, i64 8\n\
+         \x20 store ptr null, ptr %dp\n\
+         \x20 %buf = getelementptr i8, ptr %obj, i64 16\n\
+         \x20 %c1 = call ptr @memcpy(ptr %buf, ptr %ab, i64 %la)\n\
          \x20 %tail = getelementptr i8, ptr %buf, i64 %la\n\
          \x20 %lb1 = add i64 %lb, 1\n\
-         \x20 %c2 = call ptr @memcpy(ptr %tail, ptr %b, i64 %lb1)\n\
-         \x20 ret ptr %buf\n\
+         \x20 %c2 = call ptr @memcpy(ptr %tail, ptr %bb, i64 %lb1)\n\
+         \x20 ret ptr %obj\n\
          }\n\n",
     );
     module.push_str(&m.funcs);
@@ -1202,10 +1254,11 @@ fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
             ));
         }
         Type::Str => {
+            let body = g.str_body(operand);
             let r = g.fresh();
             g.line(&format!(
                 "%p{} = call i32 (ptr, ...) @printf(ptr @.ds, ptr {})",
-                r, operand
+                r, body
             ));
         }
         other => return unsupported(format!("出力できない型 {}", other)),
