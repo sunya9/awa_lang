@@ -79,6 +79,13 @@ long long awa_now(void) {
 }
 // 文字列 → 整数（非数値は 0）。
 long long awa_string_to_int(void* strobj) { return atoll((char*)strobj + 16); }
+// 文字数（UTF-8 コードポイント数。継続バイト 10xxxxxx を除いて数える＝インタプリタの chars() と一致）。
+long long awa_string_length(void* strobj) {
+  const unsigned char* p = (const unsigned char*)strobj + 16;
+  long long n = 0;
+  while (*p) { if ((*p & 0xC0) != 0x80) n++; p++; }
+  return n;
+}
 
 // ===== 非同期イベントループ =====
 typedef long long Word;

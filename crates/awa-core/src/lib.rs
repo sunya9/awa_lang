@@ -1765,6 +1765,22 @@ mod tests {
     }
 
     #[test]
+    fn std_string_float() {
+        // string.length（UTF-8 文字数）・float.abs/max・string.to_int を native で。
+        let out = std_build_run(
+            "import std/string\n\
+             import std/float\n\
+             import std/int\n\
+             import std/io\n\
+             io.println(int.to_string(string.length(\"héllo\")))\n\
+             io.println(float.to_string(float.abs(0.0 - 2.5)))\n\
+             io.println(int.to_string(string.to_int(\"42\")))\n",
+        );
+        // "héllo" は 5 文字（é は 1 コードポイント）、abs(-2.5)=2.5、to_int("42")=42。
+        assert_eq!(out, "5\n2.5\n42\n");
+    }
+
+    #[test]
     fn std_list_int() {
         // list の map/filter/fold/length/reverse と int.to_string を native で。
         let out = std_build_run(

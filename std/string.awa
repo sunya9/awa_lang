@@ -1,0 +1,9 @@
+// 標準ライブラリ: 文字列ユーティリティ。
+// length は組込 string_length（UTF-8 文字数）のラッパ、to_int は string_to_int のラッパ（別名）。
+// 連結は言語の `<>` 演算子、等価は `==` を使う。
+
+pub let length = fn(s: String) -> Int { string_length(s) }
+
+pub let is_empty = fn(s: String) -> Bool { string_length(s) == 0 }
+
+pub let to_int = fn(s: String) -> Int { string_to_int(s) }

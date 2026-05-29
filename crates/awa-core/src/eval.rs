@@ -621,6 +621,12 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
                 .unwrap_or(0);
             return Ok(Value::Int(ms));
         }
+        "string_length" => {
+            if let Some(Value::Str(s)) = args.into_iter().next() {
+                return Ok(Value::Int(s.chars().count() as i64));
+            }
+            unreachable!("string_length の引数は String");
+        }
         "string_to_int" => {
             if let Some(Value::Str(s)) = args.into_iter().next() {
                 // 非数値は 0（C の atoll と揃える）。先頭の数値部だけを読む。
@@ -691,6 +697,7 @@ pub fn builtins_env() -> Env {
         "write_file",
         "now",
         "string_to_int",
+        "string_length",
         // OS 連携（ソケット非同期）。native ビルド専用（インタプリタは明示エラー）。
         "tcp_listen",
         "sock_port",
