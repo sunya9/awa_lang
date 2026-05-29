@@ -9,7 +9,10 @@ use crate::error::AwaError;
 // 推論が進むにつれ unify によって具体型へ埋まっていく。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
-    Num,
+    Int,
+    Long,
+    Float,
+    Str,
     Bool,
     Unit,
     // 関数型。多引数なので引数型のリストと戻り値型を持つ。例: (Num, Num) -> Bool
@@ -24,7 +27,10 @@ pub enum Type {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Type::Num => write!(f, "Num"),
+            Type::Int => write!(f, "Int"),
+            Type::Long => write!(f, "Long"),
+            Type::Float => write!(f, "Float"),
+            Type::Str => write!(f, "String"),
             Type::Bool => write!(f, "Bool"),
             Type::Unit => write!(f, "Nil"),
             Type::Fun(params, ret) => {
@@ -71,7 +77,10 @@ impl fmt::Display for Type {
 pub fn render_type(ty: &Type) -> String {
     fn go(ty: &Type, names: &mut HashMap<u32, char>, next: &mut u8, out: &mut String) {
         match ty {
-            Type::Num => out.push_str("Num"),
+            Type::Int => out.push_str("Int"),
+            Type::Long => out.push_str("Long"),
+            Type::Float => out.push_str("Float"),
+            Type::Str => out.push_str("String"),
             Type::Bool => out.push_str("Bool"),
             Type::Unit => out.push_str("Nil"),
             Type::Fun(params, ret) => {
@@ -138,7 +147,7 @@ impl VarGen {
 // 型変数のチェーン（Var(0) -> Var(1) -> Num）も再帰的に辿って解決する。
 pub fn apply(subst: &Subst, ty: &Type) -> Type {
     match ty {
-        Type::Num | Type::Bool | Type::Unit => ty.clone(),
+        Type::Int | Type::Long | Type::Float | Type::Str | Type::Bool | Type::Unit => ty.clone(),
         Type::Fun(params, ret) => {
             let params = params.iter().map(|p| apply(subst, p)).collect();
             let ret = Box::new(apply(subst, ret));
@@ -197,7 +206,7 @@ pub fn ftv(subst: &Subst, ty: &Type) -> HashSet<u32> {
             }
             s
         }
-        Type::Num | Type::Bool | Type::Unit => HashSet::new(),
+        Type::Int | Type::Long | Type::Float | Type::Str | Type::Bool | Type::Unit => HashSet::new(),
     }
 }
 
@@ -219,7 +228,7 @@ fn occurs(subst: &Subst, id: u32, ty: &Type) -> bool {
             params.iter().any(|p| occurs(subst, id, p)) || occurs(subst, id, &ret)
         }
         Type::Con(_, args) => args.iter().any(|a| occurs(subst, id, a)),
-        Type::Num | Type::Bool | Type::Unit => false,
+        Type::Int | Type::Long | Type::Float | Type::Str | Type::Bool | Type::Unit => false,
     }
 }
 
@@ -265,7 +274,12 @@ pub fn unify(subst: &mut Subst, t1: &Type, t2: &Type) -> Result<(), AwaError> {
     let a = apply(subst, t1);
     let b = apply(subst, t2);
     match (a, b) {
-        (Type::Num, Type::Num) | (Type::Bool, Type::Bool) | (Type::Unit, Type::Unit) => Ok(()),
+        (Type::Int, Type::Int)
+        | (Type::Long, Type::Long)
+        | (Type::Float, Type::Float)
+        | (Type::Str, Type::Str)
+        | (Type::Bool, Type::Bool)
+        | (Type::Unit, Type::Unit) => Ok(()),
         (Type::Var(id), ty) | (ty, Type::Var(id)) => bind(subst, id, &ty),
         (Type::Fun(ps1, r1), Type::Fun(ps2, r2)) => {
             if ps1.len() != ps2.len() {
@@ -310,22 +324,22 @@ mod tests {
     #[test]
     fn 具体型同士の単一化() {
         let mut s = Subst::new();
-        assert_eq!(unify(&mut s, &Type::Num, &Type::Num), Ok(()));
+        assert_eq!(unify(&mut s, &Type::Int, &Type::Int), Ok(()));
         assert_eq!(unify(&mut s, &Type::Bool, &Type::Bool), Ok(()));
     }
 
     #[test]
     fn 噛み合わない具体型はエラー() {
         let mut s = Subst::new();
-        assert!(unify(&mut s, &Type::Num, &Type::Bool).is_err());
+        assert!(unify(&mut s, &Type::Int, &Type::Bool).is_err());
     }
 
     #[test]
     fn 型変数は相手の型に束縛される() {
         let mut s = Subst::new();
         // a と Num を unify すると a -> Num が記録される。
-        unify(&mut s, &Type::Var(0), &Type::Num).unwrap();
-        assert_eq!(apply(&s, &Type::Var(0)), Type::Num);
+        unify(&mut s, &Type::Var(0), &Type::Int).unwrap();
+        assert_eq!(apply(&s, &Type::Var(0)), Type::Int);
     }
 
     #[test]
@@ -341,18 +355,18 @@ mod tests {
     fn 関数型の単一化() {
         let mut s = Subst::new();
         // fn(a) -> Num  と  fn(Bool) -> b  を unify ⇒ a=Bool, b=Num
-        let f1 = Type::Fun(vec![Type::Var(0)], Box::new(Type::Num));
+        let f1 = Type::Fun(vec![Type::Var(0)], Box::new(Type::Int));
         let f2 = Type::Fun(vec![Type::Bool], Box::new(Type::Var(1)));
         unify(&mut s, &f1, &f2).unwrap();
         assert_eq!(apply(&s, &Type::Var(0)), Type::Bool);
-        assert_eq!(apply(&s, &Type::Var(1)), Type::Num);
+        assert_eq!(apply(&s, &Type::Var(1)), Type::Int);
     }
 
     #[test]
     fn 引数の個数が違う関数型はエラー() {
         let mut s = Subst::new();
-        let f1 = Type::Fun(vec![Type::Num], Box::new(Type::Num));
-        let f2 = Type::Fun(vec![Type::Num, Type::Num], Box::new(Type::Num));
+        let f1 = Type::Fun(vec![Type::Int], Box::new(Type::Int));
+        let f2 = Type::Fun(vec![Type::Int, Type::Int], Box::new(Type::Int));
         assert!(unify(&mut s, &f1, &f2).is_err());
     }
 

@@ -452,7 +452,8 @@ impl Parser {
     // リテラル Num/Bool。構築子は入れ子の部分パターンを持てる（Some(Cons(x, _)) など）。
     fn parse_pattern_primary(&mut self) -> Result<Pattern, LocatedError> {
         match self.next() {
-            Some(Token::Num(n)) => Ok(Pattern::Num(n)),
+            Some(Token::Int(n)) => Ok(Pattern::Int(n)),
+            Some(Token::Str(s)) => Ok(Pattern::Str(s)),
             Some(Token::Bool(b)) => Ok(Pattern::Bool(b)),
             Some(Token::Ident(name)) => {
                 if name == "_" {
@@ -530,10 +531,10 @@ impl Parser {
         Ok(left)
     }
 
-    // < / > / <= / >= 。== より強く、+ - より弱い。左結合。
+    // < / > / <= / >= と文字列連結 <>。== より強く、+ - より弱い。左結合。
     fn parse_comparison(&mut self) -> Result<Expr, LocatedError> {
         let mut left = self.parse_additive()?;
-        while let Some(Token::Lt | Token::Gt | Token::Le | Token::Ge) = self.peek() {
+        while let Some(Token::Lt | Token::Gt | Token::Le | Token::Ge | Token::Concat) = self.peek() {
             let op = self.next().unwrap();
             let right = self.parse_additive()?;
             let span = Span::merge(left.span, right.span);
@@ -655,7 +656,10 @@ impl Parser {
     fn parse_factor(&mut self) -> Result<Expr, LocatedError> {
         let start = self.span_here().start;
         match self.next() {
-            Some(Token::Num(n)) => Ok(self.finish(start, ExprKind::Num(n))),
+            Some(Token::Int(n)) => Ok(self.finish(start, ExprKind::Int(n))),
+            Some(Token::Long(n)) => Ok(self.finish(start, ExprKind::Long(n))),
+            Some(Token::Float(n)) => Ok(self.finish(start, ExprKind::Float(n))),
+            Some(Token::Str(s)) => Ok(self.finish(start, ExprKind::Str(s))),
             Some(Token::Bool(b)) => Ok(self.finish(start, ExprKind::Bool(b))),
             Some(Token::Ident(name)) => Ok(self.finish(start, ExprKind::Var(name))),
             // 無名関数 fn(引数: 型?, ...) -> 戻り型? { 本体ブロック }。

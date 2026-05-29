@@ -44,14 +44,16 @@ impl Sigs {
 enum Head {
     Ctor(String),
     Bool(bool),
-    Num(f64),
+    Int(i64),
+    Str(String),
 }
 
 fn head_of(p: &Pattern) -> Option<Head> {
     match p {
         Pattern::Wildcard | Pattern::Var(_) => None,
         Pattern::Bool(b) => Some(Head::Bool(*b)),
-        Pattern::Num(n) => Some(Head::Num(*n)),
+        Pattern::Int(n) => Some(Head::Int(*n)),
+        Pattern::Str(s) => Some(Head::Str(s.clone())),
         Pattern::Ctor(name, _) => Some(Head::Ctor(name.clone())),
         // 行列・クエリは expand で or を除いてから組むので、ここに Or は来ない。
         Pattern::Or(_) => unreachable!("or パターンは expand 済みのはず"),
@@ -103,7 +105,8 @@ fn head_to_pattern(h: &Head, subs: Vec<Pattern>) -> Pattern {
     match h {
         Head::Ctor(name) => Pattern::Ctor(name.clone(), subs),
         Head::Bool(b) => Pattern::Bool(*b),
-        Head::Num(n) => Pattern::Num(*n),
+        Head::Int(n) => Pattern::Int(*n),
+        Head::Str(s) => Pattern::Str(s.clone()),
     }
 }
 
@@ -125,7 +128,8 @@ fn column_heads(matrix: &[Vec<Pattern>]) -> Vec<Head> {
 fn complete_signature(present: &[Head], sigs: &Sigs) -> Option<Vec<(Head, usize)>> {
     let full: Vec<(Head, usize)> = match present.first()? {
         Head::Bool(_) => vec![(Head::Bool(true), 0), (Head::Bool(false), 0)],
-        Head::Num(_) => return None, // Num は無限なので決して完全にならない
+        // Int/String は無限ドメインなので決して完全にならない（catch-all 必須）。
+        Head::Int(_) | Head::Str(_) => return None,
         Head::Ctor(name) => sigs
             .siblings(name)?
             .iter()
@@ -262,7 +266,7 @@ fn missing_head(present: &[Head], sigs: &Sigs) -> Pattern {
             }
             Pattern::Wildcard
         }
-        _ => Pattern::Wildcard, // Num（無限）or 空列
+        _ => Pattern::Wildcard, // Int/String（無限）or 空列
     }
 }
 
@@ -272,7 +276,8 @@ fn render_pattern(p: &Pattern) -> String {
         Pattern::Wildcard => "_".to_string(),
         Pattern::Var(name) => name.clone(),
         Pattern::Bool(b) => b.to_string(),
-        Pattern::Num(n) => n.to_string(),
+        Pattern::Int(n) => n.to_string(),
+        Pattern::Str(s) => format!("{:?}", s),
         Pattern::Ctor(name, subs) => {
             if subs.is_empty() {
                 name.clone()
@@ -347,7 +352,12 @@ fn check_stmts(stmts: &[Stmt], sigs: &mut Sigs) -> Result<(), LocatedError> {
 
 fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
     match &expr.kind {
-        ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Var(_) => Ok(()),
+        ExprKind::Int(_)
+        | ExprKind::Long(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Var(_) => Ok(()),
         ExprKind::Neg(x) => check_expr(x, sigs),
         ExprKind::BinOp(l, _, r) => {
             check_expr(l, sigs)?;

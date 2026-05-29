@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{Write, stdout};
 
 mod ast;
@@ -58,7 +57,7 @@ fn run_file(path: &str) {
             std::process::exit(1);
         }
     };
-    let mut env: Env = HashMap::new();
+    let mut env = eval::builtins_env();
     let mut checker = Checker::new();
     match run(&source, &mut env, &mut checker) {
         Ok(rows) => {
@@ -79,7 +78,7 @@ fn run_file(path: &str) {
 // 表示して次の入力へ進む（ファイル実行とは逆の方針）。
 fn repl() -> std::io::Result<()> {
     println!("awa REPL — Ctrl-D で終了");
-    let mut env: Env = HashMap::new();
+    let mut env = eval::builtins_env();
     let mut checker = Checker::new();
     let stdin = std::io::stdin();
     loop {
@@ -124,7 +123,7 @@ mod tests {
 
     // テストは従来どおり AwaError（種類）と比較したいので、位置（span）は捨てて射影する。
     fn eval(src: &str) -> Result<Value, AwaError> {
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         run(src, &mut env, &mut checker)
             .map(|rows| rows.last().map(|(v, _)| v.clone()).unwrap_or(Value::Unit))
@@ -143,7 +142,7 @@ mod tests {
     }
 
     fn num(n: f64) -> Value {
-        Value::Num(n)
+        Value::Int(n as i64)
     }
 
     #[test]
@@ -190,7 +189,7 @@ mod tests {
     fn 型エラー_boolに算術() {
         assert_eq!(
             eval("true + 1"),
-            Err(AwaError::CannotUnify { left: "Bool".to_string(), right: "Num".to_string() })
+            Err(AwaError::CannotUnify { left: "Bool".to_string(), right: "Int".to_string() })
         );
     }
 
@@ -198,7 +197,7 @@ mod tests {
     fn 型エラー_ifの条件が数値() {
         assert_eq!(
             eval("if 1 { 2 } else { 3 }"),
-            Err(AwaError::CannotUnify { left: "Num".to_string(), right: "Bool".to_string() })
+            Err(AwaError::CannotUnify { left: "Int".to_string(), right: "Bool".to_string() })
         );
     }
 
@@ -206,17 +205,17 @@ mod tests {
     fn 型エラー_numとboolの比較() {
         assert_eq!(
             eval("1 == true"),
-            Err(AwaError::CannotUnify { left: "Num".to_string(), right: "Bool".to_string() })
+            Err(AwaError::CannotUnify { left: "Int".to_string(), right: "Bool".to_string() })
         );
     }
 
     #[test]
     fn repl_env持ち越し() {
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         // 型環境も checker に持ち越されるので、2 行目の x も型検査を通る。
-        assert_eq!(run_values("let x = 10", &mut env, &mut checker), Ok(vec![Value::Num(10.0)]));
-        assert_eq!(run_values("x + 5", &mut env, &mut checker), Ok(vec![Value::Num(15.0)]));
+        assert_eq!(run_values("let x = 10", &mut env, &mut checker), Ok(vec![Value::Int(10)]));
+        assert_eq!(run_values("x + 5", &mut env, &mut checker), Ok(vec![Value::Int(15)]));
     }
 
     #[test]
@@ -227,13 +226,13 @@ mod tests {
 
     #[test]
     fn 基本的な関数呼び出し() {
-        assert_eq!(eval("let add = fn(a, b) { a + b }; add(1, 2)"), Ok(num(3.0)));
+        assert_eq!(eval("let add = fn(a: Int, b: Int) { a + b }; add(1, 2)"), Ok(num(3.0)));
     }
 
     #[test]
     fn クロージャは定義時の変数を捕捉する() {
         assert_eq!(
-            eval("let make_adder = fn(n) { fn(x) { x + n } }; let add5 = make_adder(5); add5(10)"),
+            eval("let make_adder = fn(n: Int) { fn(x) { x + n } }; let add5 = make_adder(5); add5(10)"),
             Ok(num(15.0))
         );
     }
@@ -265,7 +264,7 @@ mod tests {
     #[test]
     fn 引数の個数が合わないとエラー() {
         assert_eq!(
-            eval("let add = fn(a, b) { a + b }; add(1)"),
+            eval("let add = fn(a: Int, b: Int) { a + b }; add(1)"),
             Err(AwaError::ArityMismatch { expected: 2, found: 1 })
         );
     }
@@ -285,11 +284,11 @@ mod tests {
 
     #[test]
     fn 改行が文の区切りになる() {
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         assert_eq!(
             run_values("let x = 5\nx + 1", &mut env, &mut checker),
-            Ok(vec![Value::Num(5.0), Value::Num(6.0)])
+            Ok(vec![Value::Int(5), Value::Int(6)])
         );
     }
 
@@ -300,7 +299,7 @@ mod tests {
 
     #[test]
     fn 区切り無しで式が連続するとエラー() {
-        assert_eq!(eval("1 2"), Err(AwaError::UnexpectedToken("Num(2.0)".to_string())));
+        assert_eq!(eval("1 2"), Err(AwaError::UnexpectedToken("Int(2)".to_string())));
     }
 
     #[test]
@@ -348,7 +347,7 @@ mod tests {
 
     #[test]
     fn 括弧内は改行を無視して複数行に書ける() {
-        assert_eq!(eval("let add = fn(a, b) { a + b }; add(\n1,\n2\n)"), Ok(num(3.0)));
+        assert_eq!(eval("let add = fn(a: Int, b: Int) { a + b }; add(\n1,\n2\n)"), Ok(num(3.0)));
     }
 
     // ===== examples/ をテストとして実行する =====
@@ -358,7 +357,7 @@ mod tests {
     #[test]
     fn example_polymorphism() {
         let src = include_str!("../examples/polymorphism.awa");
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
         // 末尾は fact(6) = 720 : Num。
@@ -368,7 +367,7 @@ mod tests {
     #[test]
     fn example_adt() {
         let src = include_str!("../examples/adt.awa");
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
         // 末尾は sum(Cons(1, Cons(2, Cons(3, Nil)))) = 6。
@@ -493,7 +492,7 @@ mod tests {
     #[test]
     fn example_annotations() {
         let src = include_str!("../examples/annotations.awa");
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
         // 末尾は first(None, 0) = 0。
@@ -502,13 +501,13 @@ mod tests {
 
     #[test]
     fn let注釈が一致すれば通る() {
-        assert_eq!(eval("let x: Num = 5; x"), Ok(num(5.0)));
+        assert_eq!(eval("let x: Int = 5; x"), Ok(num(5.0)));
     }
 
     #[test]
     fn let注釈の食い違いは型エラー() {
         assert!(matches!(
-            eval("let x: Num = true"),
+            eval("let x: Int = true"),
             Err(AwaError::CannotUnify { .. })
         ));
     }
@@ -517,7 +516,7 @@ mod tests {
     fn 引数注釈が呼び出しを制約する() {
         // n: Num と注釈したので Bool を渡すと型エラー。
         assert!(matches!(
-            eval("let f = fn(n: Num) { n }; f(true)"),
+            eval("let f = fn(n: Int) { n }; f(true)"),
             Err(AwaError::CannotUnify { .. })
         ));
     }
@@ -525,7 +524,7 @@ mod tests {
     #[test]
     fn 戻り型注釈の食い違いは型エラー() {
         assert!(matches!(
-            eval("let f = fn(n: Num) -> Bool { n + 1 }"),
+            eval("let f = fn(n: Int) -> Bool { n + 1 }"),
             Err(AwaError::CannotUnify { .. })
         ));
     }
@@ -592,7 +591,7 @@ mod tests {
     fn or選択肢が同じ変数を束縛すれば通る() {
         // A(x) も B(x) も x: Num を束縛 → 本体で x を使える。
         assert_eq!(
-            eval("type T { A(Num); B(Num) }; let g = fn(t) { case t { A(x) | B(x) -> x } }; g(B(9))"),
+            eval("type T { A(Int); B(Int) }; let g = fn(t) { case t { A(x) | B(x) -> x } }; g(B(9))"),
             Ok(num(9.0))
         );
     }
@@ -601,7 +600,7 @@ mod tests {
 
     // run を直接呼んで位置つきエラーを得るヘルパ。
     fn run_err(src: &str) -> LocatedError {
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         run(src, &mut env, &mut checker).unwrap_err()
     }
@@ -645,7 +644,7 @@ mod tests {
     #[test]
     fn example_pipe() {
         let src = include_str!("../examples/pipe.awa");
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
         // 末尾は double(add(1, 10)) = 22。
@@ -659,13 +658,13 @@ mod tests {
 
     #[test]
     fn パイプは左辺を第一引数に挿入する() {
-        assert_eq!(eval("let add = fn(a, b) { a + b }; 1 |> add(2)"), Ok(num(3.0)));
+        assert_eq!(eval("let add = fn(a: Int, b: Int) { a + b }; 1 |> add(2)"), Ok(num(3.0)));
     }
 
     #[test]
     fn パイプは左結合で連鎖する() {
         assert_eq!(
-            eval("let inc = fn(n) { n + 1 }; let add = fn(a, b) { a + b }; 1 |> add(2) |> inc"),
+            eval("let inc = fn(n) { n + 1 }; let add = fn(a: Int, b: Int) { a + b }; 1 |> add(2) |> inc"),
             Ok(num(4.0))
         );
     }
@@ -696,7 +695,7 @@ mod tests {
     #[test]
     fn example_methods() {
         let src = include_str!("../examples/methods.awa");
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
         assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(num(7.0)));
@@ -711,7 +710,7 @@ mod tests {
     #[test]
     fn 組込型のメソッド() {
         assert_eq!(
-            eval("impl Num { fn double(self) { self * 2 } }; 5.double()"),
+            eval("impl Int { fn double(self) { self * 2 } }; 5.double()"),
             Ok(num(10.0))
         );
     }
@@ -732,7 +731,7 @@ mod tests {
     fn 未確定レシーバはエラー() {
         // x の型が定まらないのでメソッドを解決できない。
         assert_eq!(
-            eval("impl Num { fn double(self) { self * 2 } }; fn(x) { x.double() }"),
+            eval("impl Int { fn double(self) { self * 2 } }; fn(x) { x.double() }"),
             Err(AwaError::MethodReceiverUnknown)
         );
     }
@@ -740,7 +739,7 @@ mod tests {
     #[test]
     fn 引数注釈でレシーバが定まれば解決する() {
         assert_eq!(
-            eval("impl Num { fn double(self) { self * 2 } }; let f = fn(x: Num) { x.double() }; f(5)"),
+            eval("impl Int { fn double(self) { self * 2 } }; let f = fn(x: Int) { x.double() }; f(5)"),
             Ok(num(10.0))
         );
     }
@@ -762,7 +761,7 @@ mod tests {
     #[test]
     fn example_do() {
         let src = include_str!("../examples/do.awa");
-        let mut env = Env::new();
+        let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
         // 末尾 pair = Some(30)。Data 比較で確認。
@@ -789,6 +788,65 @@ mod tests {
         assert_eq!(
             eval(&format!("{MOPT} do {{ x <- Some(5); y <- None; Some(x + y) }}")),
             eval(&format!("{MOPT} None"))
+        );
+    }
+
+    // ===== 標準型 Int/Long/Float/String（Phase 8）=====
+
+    #[test]
+    fn example_types() {
+        let src = include_str!("../examples/types.awa");
+        let mut env = eval::builtins_env();
+        let mut checker = Checker::new();
+        let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn 整数と浮動小数は別の型() {
+        assert_eq!(eval("1 + 2"), Ok(Value::Int(3)));
+        assert_eq!(eval("1.0 + 2.0"), Ok(Value::Float(3.0)));
+        assert_eq!(eval("1L + 2L"), Ok(Value::Long(3)));
+    }
+
+    #[test]
+    fn 数値型の混用は型エラー() {
+        assert!(matches!(eval("1 + 1.0"), Err(AwaError::CannotUnify { .. })));
+        assert!(matches!(eval("1 + 1L"), Err(AwaError::CannotUnify { .. })));
+    }
+
+    #[test]
+    fn 数値でない算術はnotnumeric() {
+        assert_eq!(eval("true + false"), Err(AwaError::NotNumeric("Bool".to_string())));
+    }
+
+    #[test]
+    fn 注釈なしの算術は曖昧() {
+        assert_eq!(
+            eval("let add = fn(a, b) { a + b }; 0"),
+            Err(AwaError::AmbiguousNumeric)
+        );
+    }
+
+    #[test]
+    fn 文字列リテラルと連結() {
+        assert_eq!(eval(r#""ab" <> "cd""#), Ok(Value::Str("abcd".to_string())));
+        assert_eq!(eval(r#""x" == "x""#), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn 数値変換の組込関数() {
+        assert_eq!(eval("int_to_float(3)"), Ok(Value::Float(3.0)));
+        assert_eq!(eval("int_to_string(5)"), Ok(Value::Str("5".to_string())));
+        // 変換後は同じ型同士で演算できる。
+        assert_eq!(eval("int_to_float(3) + 1.0"), Ok(Value::Float(4.0)));
+    }
+
+    #[test]
+    fn 文字列パターンマッチ() {
+        assert_eq!(
+            eval(r#"case "yes" { "yes" -> 1; _ -> 0 }"#),
+            Ok(Value::Int(1))
         );
     }
 

@@ -1,7 +1,10 @@
 // ===== トークン =====
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    Num(f64),
+    Int(i64),      // 整数リテラル（1）
+    Long(i64),     // Long リテラル（1L）
+    Float(f64),    // 浮動小数リテラル（1.0）
+    Str(String),   // 文字列リテラル（"..."）
     Bool(bool),    // 真偽値リテラル（true / false）
     Ident(String), // 識別子（変数名）
     Let,           // キーワード let
@@ -30,6 +33,7 @@ pub enum Token {
     Minus,
     Star,
     Slash,
+    Concat, // <>（文字列連結）
     LParen,
     RParen,
     LBrace, // {
@@ -44,6 +48,13 @@ pub enum Token {
 pub fn ends_expr(t: &Token) -> bool {
     matches!(
         t,
-        Token::Num(_) | Token::Bool(_) | Token::Ident(_) | Token::RParen | Token::RBrace
+        Token::Int(_)
+            | Token::Long(_)
+            | Token::Float(_)
+            | Token::Str(_)
+            | Token::Bool(_)
+            | Token::Ident(_)
+            | Token::RParen
+            | Token::RBrace
     )
 }

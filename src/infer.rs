@@ -20,7 +20,10 @@ type MethodEnv = HashMap<(String, String), Scheme>;
 fn type_head(ty: &Type) -> Option<String> {
     match ty {
         Type::Con(name, _) => Some(name.clone()),
-        Type::Num => Some("Num".to_string()),
+        Type::Int => Some("Int".to_string()),
+        Type::Long => Some("Long".to_string()),
+        Type::Float => Some("Float".to_string()),
+        Type::Str => Some("String".to_string()),
         Type::Bool => Some("Bool".to_string()),
         Type::Unit => Some("Nil".to_string()),
         Type::Fun(..) | Type::Var(_) => None,
@@ -64,7 +67,21 @@ pub struct Checker {
 
 impl Checker {
     pub fn new() -> Self {
-        Checker::default()
+        let mut c = Checker::default();
+        // 組込関数（変換）の型スキームを seed する。eval::builtins_env と名前を一致させること。
+        let mono = |params: Vec<Type>, ret: Type| Scheme::mono(Type::Fun(params, Box::new(ret)));
+        let builtins: [(&str, Type, Type); 6] = [
+            ("int_to_float", Type::Int, Type::Float),
+            ("float_to_int", Type::Float, Type::Int),
+            ("int_to_long", Type::Int, Type::Long),
+            ("long_to_int", Type::Long, Type::Int),
+            ("int_to_string", Type::Int, Type::Str),
+            ("float_to_string", Type::Float, Type::Str),
+        ];
+        for (name, arg, ret) in builtins {
+            c.env.insert(name.to_string(), mono(vec![arg], ret));
+        }
+        c
     }
 
     // プログラム（トップレベルの文の並び）を型検査し、型付き AST（elaboration の結果）を返す。
@@ -129,6 +146,10 @@ impl Checker {
         for ts in &mut typed {
             resolve_tstmt(ts, &self.subst);
         }
+        // 解決後に数値性を確認する（算術/比較のオペランドが Int/Long/Float か。遅延チェック）。
+        for ts in &typed {
+            check_numeric_stmt(ts)?;
+        }
         Ok(typed)
     }
 }
@@ -137,7 +158,12 @@ impl Checker {
 fn resolve_texpr(te: &mut TExpr, subst: &Subst) {
     te.ty = apply(subst, &te.ty);
     match &mut te.kind {
-        TExprKind::Num(_) | TExprKind::Bool(_) | TExprKind::Var(_) => {}
+        TExprKind::Int(_)
+        | TExprKind::Long(_)
+        | TExprKind::Float(_)
+        | TExprKind::Str(_)
+        | TExprKind::Bool(_)
+        | TExprKind::Var(_) => {}
         TExprKind::Neg(x) => resolve_texpr(x, subst),
         TExprKind::BinOp(l, _, r) => {
             resolve_texpr(l, subst);
@@ -177,6 +203,66 @@ fn resolve_tstmt(ts: &mut TStmt, subst: &Subst) {
             for m in methods {
                 resolve_texpr(&mut m.body, subst);
             }
+        }
+    }
+}
+
+// 数値性の遅延チェック（推論・解決後の型付き AST を走査）。算術 (+,-,*,/) と単項マイナス、
+// 比較 (<,>,<=,>=) のオペランド型が Int/Long/Float であることを確認する。未確定なら
+// AmbiguousNumeric（注釈を要求）、数値でない具体型なら NotNumeric。即時でなく後段で見るのは、
+// do の束縛変数のように「後から型が決まる」場合の誤判定を避けるため。
+fn check_numeric_stmt(ts: &TStmt) -> Result<(), LocatedError> {
+    match ts {
+        TStmt::Let(_, te) | TStmt::Expr(te) => check_numeric(te),
+        TStmt::Type(_) => Ok(()),
+        TStmt::Impl(methods) => methods.iter().try_for_each(|m| check_numeric(&m.body)),
+    }
+}
+
+fn check_numeric(te: &TExpr) -> Result<(), LocatedError> {
+    match &te.kind {
+        TExprKind::Int(_)
+        | TExprKind::Long(_)
+        | TExprKind::Float(_)
+        | TExprKind::Str(_)
+        | TExprKind::Bool(_)
+        | TExprKind::Var(_) => Ok(()),
+        TExprKind::Neg(x) => {
+            at(require_numeric(&x.ty), x.span)?;
+            check_numeric(x)
+        }
+        TExprKind::BinOp(l, op, r) => {
+            // 算術・比較はオペランドが数値であること。連結 <> と等価 == は対象外。
+            if matches!(
+                op,
+                Token::Plus
+                    | Token::Minus
+                    | Token::Star
+                    | Token::Slash
+                    | Token::Lt
+                    | Token::Gt
+                    | Token::Le
+                    | Token::Ge
+            ) {
+                at(require_numeric(&l.ty), l.span)?;
+            }
+            check_numeric(l)?;
+            check_numeric(r)
+        }
+        TExprKind::If(c, t, e) => {
+            check_numeric(c)?;
+            check_numeric(t)?;
+            check_numeric(e)
+        }
+        TExprKind::Lambda(_, body) => check_numeric(body),
+        TExprKind::Call(callee, args) => {
+            check_numeric(callee)?;
+            args.iter().try_for_each(check_numeric)
+        }
+        TExprKind::Block(stmts) => stmts.iter().try_for_each(check_numeric_stmt),
+        TExprKind::Case(subject, arms) => {
+            check_numeric(subject)?;
+            arms.iter().try_for_each(|(_, b)| check_numeric(b))
         }
     }
 }
@@ -299,7 +385,10 @@ fn register_impl(
 // 宣言済みの型名（arity 検査つき）を扱う。型定義・注釈の両方から使う共通部分。
 fn resolve_con(name: &str, args: Vec<Type>, arities: &Arities) -> Result<Type, AwaError> {
     match name {
-        "Num" if args.is_empty() => Ok(Type::Num),
+        "Int" if args.is_empty() => Ok(Type::Int),
+        "Long" if args.is_empty() => Ok(Type::Long),
+        "Float" if args.is_empty() => Ok(Type::Float),
+        "String" if args.is_empty() => Ok(Type::Str),
         "Bool" if args.is_empty() => Ok(Type::Bool),
         "Nil" if args.is_empty() => Ok(Type::Unit),
         _ => match arities.get(name) {
@@ -500,7 +589,10 @@ fn infer_expr(
 ) -> Result<TExpr, LocatedError> {
     let span = expr.span;
     let (kind, ty) = match &expr.kind {
-        ExprKind::Num(n) => (TExprKind::Num(*n), Type::Num),
+        ExprKind::Int(n) => (TExprKind::Int(*n), Type::Int),
+        ExprKind::Long(n) => (TExprKind::Long(*n), Type::Long),
+        ExprKind::Float(n) => (TExprKind::Float(*n), Type::Float),
+        ExprKind::Str(s) => (TExprKind::Str(s.clone()), Type::Str),
         ExprKind::Bool(b) => (TExprKind::Bool(*b), Type::Bool),
         // 変数は型環境を引き、スキームを instantiate して fresh な型に具体化する。
         // 多相な束縛（構築子 Some 等も含む）はここで使用箇所ごとに独立した型変数を得る。
@@ -514,11 +606,11 @@ fn infer_expr(
                 })?;
             (TExprKind::Var(name.clone()), ty)
         }
-        // 単項マイナスはオペランドが Num、結果も Num。
+        // 単項マイナスは結果も同じ数値型（数値性は check_numeric で後から確認）。
         ExprKind::Neg(operand) => {
             let t = infer_expr(operand, env, subst, vargen, arities, methods)?;
-            at(unify(subst, &t.ty, &Type::Num), span)?;
-            (TExprKind::Neg(Box::new(t)), Type::Num)
+            let ty = apply(subst, &t.ty);
+            (TExprKind::Neg(Box::new(t)), ty)
         }
         ExprKind::BinOp(left, op, right) => {
             let lt = infer_expr(left, env, subst, vargen, arities, methods)?;
@@ -672,7 +764,8 @@ fn infer_pattern(
             Ok((t.clone(), vec![(name.clone(), t)]))
         }
         Pattern::Bool(_) => Ok((Type::Bool, Vec::new())),
-        Pattern::Num(_) => Ok((Type::Num, Vec::new())),
+        Pattern::Int(_) => Ok((Type::Int, Vec::new())),
+        Pattern::Str(_) => Ok((Type::Str, Vec::new())),
         Pattern::Ctor(name, subs) => {
             let scheme = env
                 .get(name)
@@ -771,22 +864,27 @@ fn infer_stmts(
     Ok((tstmts, apply(subst, &last)))
 }
 
-// 二項演算の型付け規則。3 つに分かれる:
-//   算術 (+ - * /)        : 両辺 Num、結果 Num
-//   比較 (< > <= >=)      : 両辺 Num、結果 Bool
-//   等価 (== !=)          : 両辺は同じ型同士、結果 Bool
+// 二項演算の型付け規則。「数値か」の判定は即時に行わず check_numeric（推論後の走査）に
+// 委ねる＝do の束縛変数など「後で型が決まる」場合の誤判定を避ける（遅延チェック）。
+//   算術 (+ - * /)   : 両辺 unify（同型必須）→ その型（数値性は後段で確認）
+//   比較 (< > <= >=) : 両辺 unify → 結果 Bool（数値性は後段で確認）
+//   連結 (<>)        : 両辺 String → String
+//   等価 (== !=)     : 両辺 unify（任意の同型）→ Bool（構造比較）
 // eval_binop の実行時規則と対応している。
 fn infer_binop(lt: &Type, op: &Token, rt: &Type, subst: &mut Subst) -> Result<Type, AwaError> {
     match op {
         Token::Plus | Token::Minus | Token::Star | Token::Slash => {
-            unify(subst, lt, &Type::Num)?;
-            unify(subst, rt, &Type::Num)?;
-            Ok(Type::Num)
+            unify(subst, lt, rt)?; // 同型必須（1 + 1.0 はここで CannotUnify）
+            Ok(apply(subst, lt))
         }
         Token::Lt | Token::Gt | Token::Le | Token::Ge => {
-            unify(subst, lt, &Type::Num)?;
-            unify(subst, rt, &Type::Num)?;
+            unify(subst, lt, rt)?;
             Ok(Type::Bool)
+        }
+        Token::Concat => {
+            unify(subst, lt, &Type::Str)?;
+            unify(subst, rt, &Type::Str)?;
+            Ok(Type::Str)
         }
         Token::EqEq | Token::NotEq => {
             unify(subst, lt, rt)?;
@@ -794,6 +892,16 @@ fn infer_binop(lt: &Type, op: &Token, rt: &Type, subst: &mut Subst) -> Result<Ty
         }
         // パーサが BinOp に入れるのは上記の演算子トークンのみ。
         other => unreachable!("二項演算子でないトークン: {:?}", other),
+    }
+}
+
+// 数値型（Int/Long/Float）か判定。後段の check_numeric が解決済みの型に対して使う。
+// 未確定（型変数）なら AmbiguousNumeric、数値でない具体型なら NotNumeric。
+fn require_numeric(ty: &Type) -> Result<(), AwaError> {
+    match ty {
+        Type::Int | Type::Long | Type::Float => Ok(()),
+        Type::Var(_) => Err(AwaError::AmbiguousNumeric),
+        other => Err(AwaError::NotNumeric(other.to_string())),
     }
 }
 
@@ -824,7 +932,7 @@ mod tests {
 
     #[test]
     fn 算術はnum() {
-        assert_eq!(infer("1 + 2 * 3"), Ok(Type::Num));
+        assert_eq!(infer("1 + 2 * 3"), Ok(Type::Int));
     }
 
     #[test]
@@ -838,13 +946,13 @@ mod tests {
             panic!("let のはず");
         };
         // f 自体は fn(Num) -> Num。
-        assert_eq!(te.ty, Type::Fun(vec![Type::Num], Box::new(Type::Num)));
+        assert_eq!(te.ty, Type::Fun(vec![Type::Int], Box::new(Type::Int)));
         let TExprKind::Lambda(params, body) = &te.kind else {
             panic!("lambda のはず");
         };
         assert_eq!(params, &vec!["x".to_string()]);
         // 本体はブロック { x + 1 }。ブロックの値型は Num。
-        assert_eq!(body.ty, Type::Num);
+        assert_eq!(body.ty, Type::Int);
         let TExprKind::Block(stmts) = &body.kind else {
             panic!("block のはず");
         };
@@ -852,11 +960,11 @@ mod tests {
             panic!("式文のはず");
         };
         // x + 1 も、その左辺 x も Num に解決されている。
-        assert_eq!(binop.ty, Type::Num);
+        assert_eq!(binop.ty, Type::Int);
         let TExprKind::BinOp(left, _, _) = &binop.kind else {
             panic!("binop のはず");
         };
-        assert_eq!(left.ty, Type::Num);
+        assert_eq!(left.ty, Type::Int);
     }
 
     #[test]
@@ -887,22 +995,30 @@ mod tests {
 
     #[test]
     fn ifの両腕は同じ型() {
-        assert_eq!(infer("if true { 1 } else { 2 }"), Ok(Type::Num));
+        assert_eq!(infer("if true { 1 } else { 2 }"), Ok(Type::Int));
         assert!(infer("if true { 1 } else { false }").is_err());
     }
 
     #[test]
     fn 関数の型を推論する() {
-        // fn(a, b) { a + b } は両引数 Num、結果 Num。
+        // 引数の数値型は注釈で固定（注釈なしの a + b は AmbiguousNumeric）。
         assert_eq!(
-            infer("fn(a, b) { a + b }"),
-            Ok(Type::Fun(vec![Type::Num, Type::Num], Box::new(Type::Num)))
+            infer("fn(a: Int, b: Int) { a + b }"),
+            Ok(Type::Fun(vec![Type::Int, Type::Int], Box::new(Type::Int)))
         );
     }
 
     #[test]
     fn 関数呼び出しの結果型() {
-        assert_eq!(infer("let add = fn(a, b) { a + b }; add(1, 2)"), Ok(Type::Num));
+        assert_eq!(
+            infer("let add = fn(a: Int, b: Int) { a + b }; add(1, 2)"),
+            Ok(Type::Int)
+        );
+    }
+
+    #[test]
+    fn 注釈なしの算術は曖昧でエラー() {
+        assert_eq!(infer("fn(a, b) { a + b }"), Err(AwaError::AmbiguousNumeric));
     }
 
     #[test]
@@ -914,7 +1030,7 @@ mod tests {
     fn 再帰関数の型推論() {
         assert_eq!(
             infer("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)"),
-            Ok(Type::Num)
+            Ok(Type::Int)
         );
     }
 
@@ -922,13 +1038,13 @@ mod tests {
     fn 高階関数の型推論() {
         assert_eq!(
             infer("let inc = fn(x) { x + 1 }; let twice = fn(f, x) { f(f(x)) }; twice(inc, 0)"),
-            Ok(Type::Num)
+            Ok(Type::Int)
         );
     }
 
     #[test]
     fn ブロックの型は末尾の式() {
-        assert_eq!(infer("{ let a = 2; a * 3 }"), Ok(Type::Num));
+        assert_eq!(infer("{ let a = 2; a * 3 }"), Ok(Type::Int));
     }
 
     #[test]
@@ -956,7 +1072,7 @@ mod tests {
     fn 恒等関数を一度numに使っても他方で再利用できる() {
         assert_eq!(
             infer("let id = fn(x) { x }; let a = id(1); let b = id(false); a"),
-            Ok(Type::Num)
+            Ok(Type::Int)
         );
     }
 
@@ -987,7 +1103,7 @@ mod tests {
     fn 構築子で値を作ると型はその型() {
         assert_eq!(
             infer("type Opt(a) { Some(a); None }; Some(1)"),
-            Ok(con("Opt", vec![Type::Num]))
+            Ok(con("Opt", vec![Type::Int]))
         );
     }
 
@@ -995,7 +1111,7 @@ mod tests {
     fn caseの結果は腕の本体型() {
         assert_eq!(
             infer("type Opt(a) { Some(a); None }; case Some(1) { Some(n) -> n + 1; None -> 0 }"),
-            Ok(Type::Num)
+            Ok(Type::Int)
         );
     }
 
@@ -1020,7 +1136,7 @@ mod tests {
                  let len = fn(xs) { case xs { Nil -> 0; Cons(h, t) -> 1 + len(t) } }; \
                  len(Cons(1, Cons(2, Nil)))"
             ),
-            Ok(Type::Num)
+            Ok(Type::Int)
         );
     }
 
@@ -1031,7 +1147,7 @@ mod tests {
                 "type List(a) { Cons(a, List(a)); Nil }; \
                  case Cons(1, Nil) { Cons(h, _) -> h; Nil -> 0 }"
             ),
-            Ok(Type::Num)
+            Ok(Type::Int)
         );
     }
 

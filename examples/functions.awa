@@ -1,9 +1,10 @@
 // 第一級関数・クロージャ・再帰のデモ（Scala 風: セミコロン不要）
-let add = fn(a, b) { a + b }
+// 注釈なしの a + b は数値型が定まらず曖昧なので、引数に型注釈を付ける。
+let add = fn(a: Int, b: Int) { a + b }
 add(1, 2)
 
-// クロージャ: 返された関数が n を覚えている
-let make_adder = fn(n) { fn(x) { x + n } }
+// クロージャ: 返された関数が n を覚えている（n の数値型を注釈で固定）
+let make_adder = fn(n: Int) { fn(x) { x + n } }
 let add5 = make_adder(5)
 add5(10)
 

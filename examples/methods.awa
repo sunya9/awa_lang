@@ -45,7 +45,7 @@ impl Tree(a) {
 Branch(Leaf(1), Leaf(2)).map(inc)   // Branch(Leaf(2), Leaf(3))
 
 // 組込型にもメソッドを生やせる。
-impl Num {
+impl Int {
   fn double(self) { self * 2 }
 }
 5.double()                          // 10

@@ -10,9 +10,14 @@ use crate::ast::TExpr;
 // （本体や環境を毎回ディープコピーせず、参照カウントを増やすだけ）。
 #[derive(Debug, Clone)]
 pub enum Value {
-    Num(f64),
+    Int(i64),
+    Long(i64),
+    Float(f64),
+    Str(String),
     Bool(bool),
     Func(Rc<Closure>),
+    // 組込関数（変換など）。名前で識別し、Call 時に eval が native_call へ振り分ける。
+    Native(String),
     // 空の値（Gleam の Nil 相当）。末尾が式でないブロックや空ブロックの値。
     Unit,
     // n 引数の構築子そのもの（まだ適用されていない）。呼び出すと Data になる。
@@ -42,7 +47,10 @@ pub struct Closure {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Num(a), Value::Num(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Long(a), Value::Long(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Unit, Value::Unit) => true,
             // ADT 値は構築子名と引数で構造比較（Cons(1, Nil) 同士など）。
@@ -58,9 +66,20 @@ impl PartialEq for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Value::Num(n) => write!(f, "{}", n),
+            Value::Int(n) => write!(f, "{}", n),
+            Value::Long(n) => write!(f, "{}", n),
+            // Float は整数値でも小数点つきで表示（3 でなく 3.0）して Int と区別する。
+            Value::Float(n) => {
+                if n.fract() == 0.0 && n.is_finite() {
+                    write!(f, "{:.1}", n)
+                } else {
+                    write!(f, "{}", n)
+                }
+            }
+            Value::Str(s) => write!(f, "{}", s),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Func(c) => write!(f, "<fn/{}>", c.params.len()),
+            Value::Native(name) => write!(f, "<native {}>", name),
             Value::Unit => write!(f, "Nil"),
             Value::Ctor { name, arity } => write!(f, "<ctor {}/{}>", name, arity),
             // 構築済み値は Some(3) / None / Cons(1, Nil) のように表示。
@@ -85,9 +104,12 @@ impl fmt::Display for Value {
 // 値の種類名（型エラーメッセージ用）。
 pub fn type_name(v: &Value) -> &'static str {
     match v {
-        Value::Num(_) => "Num",
+        Value::Int(_) => "Int",
+        Value::Long(_) => "Long",
+        Value::Float(_) => "Float",
+        Value::Str(_) => "String",
         Value::Bool(_) => "Bool",
-        Value::Func(_) | Value::Ctor { .. } => "Func",
+        Value::Func(_) | Value::Ctor { .. } | Value::Native(_) => "Func",
         Value::Unit => "Nil",
         Value::Data { .. } => "Data",
     }

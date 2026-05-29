@@ -95,6 +95,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     // <- は do の束縛。比較の `<` に負数を続けるときは空白を空ける（x < -3）。
                     tokens.push(Spanned::new(Token::LArrow, Span::new(start, start + 2)));
                     i += 2;
+                } else if chars.get(i + 1) == Some(&'>') {
+                    // <> は文字列連結。
+                    tokens.push(Spanned::new(Token::Concat, Span::new(start, start + 2)));
+                    i += 2;
                 } else {
                     tokens.push(Spanned::new(Token::Lt, Span::new(start, start + 1)));
                     i += 1;
@@ -163,24 +167,84 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     i += 1;
                 }
             }
-            // 数値。整数部の数字を読み、`.` の直後が数字の時だけ小数部を読む
-            // （`5.method` は Num(5)・Dot・method に分かれる＝メソッド呼び出しと両立）。
+            // 数値。整数部の数字を読み、`.`+数字なら Float、続く `L` なら Long、それ以外 Int。
+            // （`5.method` は Int(5)・Dot・method に分かれる＝メソッド呼び出しと両立。）
             '0'..='9' => {
                 while i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
                 }
-                if chars.get(i) == Some(&'.') && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
-                {
+                let is_float = chars.get(i) == Some(&'.')
+                    && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+                if is_float {
                     i += 1; // '.'
                     while i < chars.len() && chars[i].is_ascii_digit() {
                         i += 1;
                     }
                 }
                 let s: String = chars[start..i].iter().collect();
-                let n: f64 = s.parse().map_err(|_| {
-                    LocatedError::at(AwaError::InvalidNumber(s.clone()), Span::new(start, i))
-                })?;
-                tokens.push(Spanned::new(Token::Num(n), Span::new(start, i)));
+                if is_float {
+                    let n: f64 = s.parse().map_err(|_| {
+                        LocatedError::at(AwaError::InvalidNumber(s.clone()), Span::new(start, i))
+                    })?;
+                    tokens.push(Spanned::new(Token::Float(n), Span::new(start, i)));
+                } else if chars.get(i) == Some(&'L') {
+                    let n: i64 = s.parse().map_err(|_| {
+                        LocatedError::at(AwaError::InvalidNumber(s.clone()), Span::new(start, i))
+                    })?;
+                    i += 1; // 'L'
+                    tokens.push(Spanned::new(Token::Long(n), Span::new(start, i)));
+                } else {
+                    let n: i64 = s.parse().map_err(|_| {
+                        LocatedError::at(AwaError::InvalidNumber(s.clone()), Span::new(start, i))
+                    })?;
+                    tokens.push(Spanned::new(Token::Int(n), Span::new(start, i)));
+                }
+            }
+            // 文字列リテラル "..."。最小のエスケープ \n \t \\ \" に対応。
+            '"' => {
+                i += 1; // 開き "
+                let mut s = String::new();
+                loop {
+                    match chars.get(i) {
+                        None => {
+                            return Err(LocatedError::at(
+                                AwaError::UnterminatedString,
+                                Span::new(start, i),
+                            ));
+                        }
+                        Some('"') => {
+                            i += 1; // 閉じ "
+                            break;
+                        }
+                        Some('\\') => match chars.get(i + 1) {
+                            Some('n') => {
+                                s.push('\n');
+                                i += 2;
+                            }
+                            Some('t') => {
+                                s.push('\t');
+                                i += 2;
+                            }
+                            Some('\\') => {
+                                s.push('\\');
+                                i += 2;
+                            }
+                            Some('"') => {
+                                s.push('"');
+                                i += 2;
+                            }
+                            _ => {
+                                s.push('\\');
+                                i += 1;
+                            }
+                        },
+                        Some(&c) => {
+                            s.push(c);
+                            i += 1;
+                        }
+                    }
+                }
+                tokens.push(Spanned::new(Token::Str(s), Span::new(start, i)));
             }
             // 単独の '.' はメソッド呼び出しのドット（小数点は数値アームで処理済み）。
             '.' => {

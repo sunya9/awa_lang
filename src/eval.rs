@@ -14,17 +14,6 @@ fn at<T>(r: Result<T, AwaError>, span: Span) -> Result<T, LocatedError> {
     r.map_err(|e| LocatedError::at(e, span))
 }
 
-// 値から f64 を取り出す。数値でなければ型エラー（算術・比較は数値専用）。
-fn as_num(v: Value) -> Result<f64, AwaError> {
-    match v {
-        Value::Num(n) => Ok(n),
-        other => Err(AwaError::TypeError {
-            expected: "Num",
-            found: type_name(&other),
-        }),
-    }
-}
-
 // 値から bool を取り出す。真偽値でなければ型エラー（if の条件は Bool 専用）。
 fn as_bool(v: Value) -> Result<bool, AwaError> {
     match v {
@@ -53,18 +42,23 @@ fn bind_name(value: Value, name: &str) -> Value {
 pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
     let span = expr.span;
     match &expr.kind {
-        TExprKind::Num(n) => Ok(Value::Num(*n)),
+        TExprKind::Int(n) => Ok(Value::Int(*n)),
+        TExprKind::Long(n) => Ok(Value::Long(*n)),
+        TExprKind::Float(n) => Ok(Value::Float(*n)),
+        TExprKind::Str(s) => Ok(Value::Str(s.clone())),
         TExprKind::Bool(b) => Ok(Value::Bool(*b)),
         // 値はもう Copy ではないので .cloned() で複製する。
-        // Num/Bool は安価、Func は Rc のカウント増加で済む。
         TExprKind::Var(name) => env
             .get(name)
             .cloned()
             .ok_or_else(|| LocatedError::at(AwaError::UndefinedVariable(name.clone()), span)),
-        TExprKind::Neg(operand) => {
-            let v = eval_expr(operand, env)?;
-            Ok(Value::Num(-at(as_num(v), span)?))
-        }
+        // 単項マイナス。型検査済みなので数値のはず。
+        TExprKind::Neg(operand) => match eval_expr(operand, env)? {
+            Value::Int(n) => Ok(Value::Int(n.wrapping_neg())),
+            Value::Long(n) => Ok(Value::Long(n.wrapping_neg())),
+            Value::Float(n) => Ok(Value::Float(-n)),
+            _ => unreachable!("Neg のオペランドは数値（型検査済み）"),
+        },
         TExprKind::BinOp(left, op, right) => {
             let l = eval_expr(left, env)?;
             let r = eval_expr(right, env)?;
@@ -113,6 +107,14 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
                         ctor: name,
                         args: arg_values,
                     });
+                }
+                // 組込関数（変換など）。引数を評価して native_call へ。
+                Value::Native(name) => {
+                    let mut arg_values = Vec::with_capacity(args.len());
+                    for arg in args {
+                        arg_values.push(eval_expr(arg, env)?);
+                    }
+                    return native_call(&name, arg_values);
                 }
                 other => {
                     return Err(LocatedError::at(
@@ -205,8 +207,12 @@ fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)
             Value::Bool(v) if v == b => Some(Vec::new()),
             _ => None,
         },
-        Pattern::Num(n) => match value {
-            Value::Num(v) if v == n => Some(Vec::new()),
+        Pattern::Int(n) => match value {
+            Value::Int(v) if v == n => Some(Vec::new()),
+            _ => None,
+        },
+        Pattern::Str(s) => match value {
+            Value::Str(v) if v == s => Some(Vec::new()),
             _ => None,
         },
         Pattern::Ctor(name, subs) => match value {
@@ -259,40 +265,105 @@ fn register_ctors(def: &TypeDef, env: &mut Env) {
     }
 }
 
-// 二項演算の評価。算術は Num→Num、比較は Num→Bool、等価は同じ型同士→Bool。
+// 二項演算の評価。型検査済みなので両辺は同じ型（算術/比較は数値同型、連結は String）。
+// 整数はラップ、Float は IEEE。整数の 0 除算のみ DivisionByZero。
 fn eval_binop(l: Value, op: &Token, r: Value) -> Result<Value, AwaError> {
     match op {
-        Token::Plus => Ok(Value::Num(as_num(l)? + as_num(r)?)),
-        Token::Minus => Ok(Value::Num(as_num(l)? - as_num(r)?)),
-        Token::Star => Ok(Value::Num(as_num(l)? * as_num(r)?)),
-        Token::Slash => {
-            let (a, b) = (as_num(l)?, as_num(r)?);
-            if b == 0.0 {
-                Err(AwaError::DivisionByZero)
-            } else {
-                Ok(Value::Num(a / b))
+        Token::Plus => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_add(b))),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a.wrapping_add(b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+            _ => unreachable!("算術は数値同型（型検査済み）"),
+        },
+        Token::Minus => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_sub(b))),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a.wrapping_sub(b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
+            _ => unreachable!(),
+        },
+        Token::Star => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_mul(b))),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a.wrapping_mul(b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
+            _ => unreachable!(),
+        },
+        Token::Slash => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => {
+                if b == 0 {
+                    Err(AwaError::DivisionByZero)
+                } else {
+                    Ok(Value::Int(a.wrapping_div(b)))
+                }
             }
-        }
-        Token::Lt => Ok(Value::Bool(as_num(l)? < as_num(r)?)),
-        Token::Gt => Ok(Value::Bool(as_num(l)? > as_num(r)?)),
-        Token::Le => Ok(Value::Bool(as_num(l)? <= as_num(r)?)),
-        Token::Ge => Ok(Value::Bool(as_num(l)? >= as_num(r)?)),
-        Token::EqEq => Ok(Value::Bool(values_equal(l, r)?)),
-        Token::NotEq => Ok(Value::Bool(!values_equal(l, r)?)),
+            (Value::Long(a), Value::Long(b)) => {
+                if b == 0 {
+                    Err(AwaError::DivisionByZero)
+                } else {
+                    Ok(Value::Long(a.wrapping_div(b)))
+                }
+            }
+            // Float の 0.0 除算は IEEE（inf/NaN）。エラーにしない。
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
+            _ => unreachable!(),
+        },
+        // 文字列連結。
+        Token::Concat => match (l, r) {
+            (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
+            _ => unreachable!("<> は String 同士（型検査済み）"),
+        },
+        // 比較は数値同型。
+        Token::Lt => Ok(Value::Bool(num_cmp(&l, &r).is_lt())),
+        Token::Gt => Ok(Value::Bool(num_cmp(&l, &r).is_gt())),
+        Token::Le => Ok(Value::Bool(num_cmp(&l, &r).is_le())),
+        Token::Ge => Ok(Value::Bool(num_cmp(&l, &r).is_ge())),
+        Token::EqEq => Ok(Value::Bool(l == r)),
+        Token::NotEq => Ok(Value::Bool(l != r)),
         _ => unreachable!(),
     }
 }
 
-fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
+// 数値同型の大小比較（型検査済みなので Int/Long/Float のいずれか同士）。
+fn num_cmp(l: &Value, r: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
     match (l, r) {
-        (Value::Num(a), Value::Num(b)) => Ok(a == b),
-        (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
-        (Value::Unit, Value::Unit) => Ok(true),
-        (l, r) => Err(AwaError::TypeError {
-            expected: type_name(&l),
-            found: type_name(&r),
-        }),
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Long(a), Value::Long(b)) => a.cmp(b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        _ => unreachable!("比較は数値同型（型検査済み）"),
     }
+}
+
+// ===== 組込関数（最小限の型変換）=====
+// 名前で識別される native 関数。型検査済みなので引数の型は保証されている。
+fn native_call(name: &str, args: Vec<Value>) -> Result<Value, LocatedError> {
+    let arg = args.into_iter().next();
+    let v = match (name, arg) {
+        ("int_to_float", Some(Value::Int(n))) => Value::Float(n as f64),
+        ("float_to_int", Some(Value::Float(n))) => Value::Int(n as i64),
+        ("int_to_long", Some(Value::Int(n))) => Value::Long(n),
+        ("long_to_int", Some(Value::Long(n))) => Value::Int(n),
+        ("int_to_string", Some(Value::Int(n))) => Value::Str(n.to_string()),
+        ("float_to_string", Some(Value::Float(n))) => Value::Str(n.to_string()),
+        _ => unreachable!("組込関数の引数は型検査済み: {}", name),
+    };
+    Ok(v)
+}
+
+// 組込関数を仕込んだ初期環境。run/REPL の値環境はこれから始める。
+// （型側のスキームは Checker::new が seed する。名前は両者で一致させること。）
+pub fn builtins_env() -> Env {
+    let mut env = Env::new();
+    for name in [
+        "int_to_float",
+        "float_to_int",
+        "int_to_long",
+        "long_to_int",
+        "int_to_string",
+        "float_to_string",
+    ] {
+        env.insert(name.to_string(), Value::Native(name.to_string()));
+    }
+    env
 }
 
 // プログラム（文の並び）を順に評価し、各文の値を順に返す。

@@ -15,7 +15,10 @@ pub struct Expr {
 
 #[derive(Debug, Clone)]
 pub enum ExprKind {
-    Num(f64),
+    Int(i64),       // 整数リテラル
+    Long(i64),      // Long リテラル
+    Float(f64),     // 浮動小数リテラル
+    Str(String),    // 文字列リテラル
     Bool(bool),     // 真偽値リテラル
     Var(String),    // 変数参照
     Neg(Box<Expr>), // 単項マイナス（例: -3, -(x + 1)）
@@ -44,7 +47,8 @@ pub enum Pattern {
     Wildcard,                    // _ : 何にでも当たるが束縛しない
     Var(String),                 // 小文字名 : 何にでも当たり、その名前で束縛する
     Bool(bool),                  // リテラル true / false
-    Num(f64),                    // リテラル数値
+    Int(i64),                    // 整数リテラルパターン
+    Str(String),                 // 文字列リテラルパターン
     Ctor(String, Vec<Pattern>),  // 構築子 Some(x), Cons(h, t), None（部分パターンは入れ子）
     // or パターン A | B | ...。どれかに当たれば成立。各選択肢は同じ変数を束縛する必要がある。
     Or(Vec<Pattern>),
@@ -81,7 +85,10 @@ pub struct TExpr {
 
 #[derive(Debug, Clone)]
 pub enum TExprKind {
-    Num(f64),
+    Int(i64),
+    Long(i64),
+    Float(f64),
+    Str(String),
     Bool(bool),
     Var(String),
     Neg(Box<TExpr>),

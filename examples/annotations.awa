@@ -3,28 +3,28 @@
 // unify で突き合わされる。食い違えば実行前に型エラー。
 
 // let 束縛の注釈。
-let count: Num = 3
-count                          // 3 : Num
+let count: Int = 3
+count                          // 3 : Int
 
-// 引数と戻り値の注釈。fn(n: Num) -> Num { ... }。
-let inc = fn(n: Num) -> Num { n + 1 }
-inc(count)                     // 4 : Num
+// 引数と戻り値の注釈。fn(n: Int) -> Int { ... }。
+let inc = fn(n: Int) -> Int { n + 1 }
+inc(count)                     // 4 : Int
 
 // 注釈中の小文字 a は「任意の型」を表す型変数。fn(a) -> a は多相のまま保たれる。
 let id: fn(a) -> a = fn(x) { x }
 id(true)                       // true : Bool
-id(42)                         // 42 : Num
+id(42)                         // 42 : Int
 
 // ADT も注釈に書ける。注釈が推論をその型に固定する。
 type Option(a) {
   Some(a)
   None
 }
-let first: fn(Option(Num), Num) -> Num = fn(o, d) {
+let first: fn(Option(Int), Int) -> Int = fn(o, d) {
   case o {
     Some(n) -> n
     None -> d
   }
 }
-first(Some(7), 0)              // 7 : Num
-first(None, 0)                 // 0 : Num（末尾。統合テストで 0 を検査）
+first(Some(7), 0)              // 7 : Int
+first(None, 0)                 // 0 : Int（末尾。統合テストで 0 を検査）

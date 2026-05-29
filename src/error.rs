@@ -12,6 +12,7 @@ pub enum AwaError {
     UnexpectedChar(char),      // 字句解析: 知らない文字
     InvalidNumber(String),     // 字句解析: 数値として parse できない
     UnterminatedComment,       // 字句解析: /* が閉じられていない
+    UnterminatedString,        // 字句解析: " が閉じられていない
     UnexpectedToken(String),   // 構文解析: 想定外のトークン
     UnexpectedEof,             // 構文解析: 入力が途中で終わった
     DivisionByZero,            // 評価: 0 除算
@@ -48,6 +49,9 @@ pub enum AwaError {
     // ----- メソッド（Phase 6） -----
     UnknownMethod { ty: String, method: String }, // その型に該当メソッドが無い
     MethodReceiverUnknown,                         // レシーバの型が未確定で解決できない
+    // ----- 標準型（Phase 8） -----
+    AmbiguousNumeric,    // 算術の数値型が定まらない（型注釈が必要）
+    NotNumeric(String),  // 算術/比較の対象が数値型でない
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -58,6 +62,7 @@ impl fmt::Display for AwaError {
             AwaError::UnexpectedChar(c) => write!(f, "予期しない文字: {}", c),
             AwaError::InvalidNumber(s) => write!(f, "数値として解釈できません: {}", s),
             AwaError::UnterminatedComment => write!(f, "コメント /* が閉じられていません"),
+            AwaError::UnterminatedString => write!(f, "文字列 \" が閉じられていません"),
             AwaError::UnexpectedToken(t) => write!(f, "予期しないトークン: {}", t),
             AwaError::UnexpectedEof => write!(f, "入力が途中で終わっています"),
             AwaError::DivisionByZero => write!(f, "0 で割ることはできません"),
@@ -106,6 +111,12 @@ impl fmt::Display for AwaError {
                 f,
                 "レシーバの型が定まらずメソッドを解決できません（型注釈を付けてください）"
             ),
+            AwaError::AmbiguousNumeric => {
+                write!(f, "数値型が定まりません。型注釈を付けてください")
+            }
+            AwaError::NotNumeric(ty) => {
+                write!(f, "型 {} は数値ではありません（算術/比較は Int/Long/Float のみ）", ty)
+            }
         }
     }
 }
