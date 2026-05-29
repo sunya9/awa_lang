@@ -20,6 +20,23 @@ pub let floor = fn(x: Float) -> Float { math_floor(x) }
 pub let ceil = fn(x: Float) -> Float { math_ceil(x) }
 pub let round = fn(x: Float) -> Float { math_round(x) }
 
+pub let cbrt = fn(x: Float) -> Float { math_cbrt(x) }
+pub let trunc = fn(x: Float) -> Float { math_trunc(x) }
+pub let log2 = fn(x: Float) -> Float { math_log2(x) }
+pub let sinh = fn(x: Float) -> Float { math_sinh(x) }
+pub let cosh = fn(x: Float) -> Float { math_cosh(x) }
+pub let tanh = fn(x: Float) -> Float { math_tanh(x) }
+
 // base の exp 乗。
 pub let pow = fn(base: Float, exp: Float) -> Float { math_pow(base, exp) }
 pub let atan2 = fn(y: Float, x: Float) -> Float { math_atan2(y, x) }
+
+// 直角三角形の斜辺 sqrt(x^2 + y^2)（オーバーフローに強い）。
+pub let hypot = fn(x: Float, y: Float) -> Float { math_hypot(x, y) }
+
+// 任意の底の対数。
+pub let log = fn(base: Float, x: Float) -> Float { math_ln(x) / math_ln(base) }
+
+// 度 ↔ ラジアン変換。
+pub let radians = fn(deg: Float) -> Float { deg * pi / 180.0 }
+pub let degrees = fn(rad: Float) -> Float { rad * 180.0 / pi }

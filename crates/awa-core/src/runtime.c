@@ -90,9 +90,18 @@ long long awa_string_length(void* strobj) {
 long long awa_string_byte_length(void* strobj) { return (long long)strlen((char*)strobj + 16); }
 // 文字列 → 浮動小数（非数値は 0.0）。
 double awa_string_to_float(void* strobj) { return atof((char*)strobj + 16); }
-// double → 最短往復表現の String（Rust の to_string と一致させるため精度を 1..17 で探す）。
+// double → 最短往復表現の String（Rust の to_string に一致させる）。
+// 通常の大きさは十進（%f）で最短桁を探す＝Rust と同じ見た目（180 / 0.1 / 1.4142135623730951）。
+// 極端に大小の値だけ指数表記（%g）にフォールバック（桁あふれ回避）。
 void* awa_float_str(double x) {
-  char buf[32];
+  char buf[64];
+  double a = x < 0 ? -x : x;
+  if (x == 0.0 || (a >= 1e-4 && a < 1e16)) {
+    for (int q = 0; q <= 17; q++) {
+      snprintf(buf, sizeof buf, "%.*f", q, x);
+      if (strtod(buf, 0) == x) return awa_make_str(buf, (long)strlen(buf));
+    }
+  }
   for (int p = 1; p <= 17; p++) {
     snprintf(buf, sizeof buf, "%.*g", p, x);
     if (strtod(buf, 0) == x) break;

@@ -61,3 +61,31 @@ pub let sign: fn(Int) -> Int = fn(n) {
 }
 
 pub let to_float = fn(n: Int) -> Float { int_to_float(n) }
+
+// 最大公約数（ユークリッドの互除法。負も abs で扱う）。
+let gcd_pos = fn(a, b) {
+  case b == 0 {
+    true -> a
+    false -> gcd_pos(b, a - a / b * b)
+  }
+}
+pub let gcd = fn(a: Int, b: Int) -> Int { gcd_pos(abs(a), abs(b)) }
+
+// 最小公倍数（0 を含むと 0）。
+pub let lcm = fn(a: Int, b: Int) -> Int {
+  case a == 0 {
+    true -> 0
+    false -> case b == 0 {
+      true -> 0
+      false -> abs(a / gcd(a, b) * b)
+    }
+  }
+}
+
+// 階乗（n < 0 は 1）。
+pub let factorial = fn(n: Int) -> Int {
+  case n <= 1 {
+    true -> 1
+    false -> n * factorial(n - 1)
+  }
+}

@@ -2245,6 +2245,22 @@ mod tests {
     }
 
     #[test]
+    fn std_math_拡張関数() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/math\n\
+             import std/float\n\
+             import std/int\n\
+             io.println(float.to_string(math.cbrt(27.0)))\n\
+             io.println(float.to_string(math.hypot(3.0, 4.0)))\n\
+             io.println(float.to_string(math.log2(8.0)))\n\
+             io.println(float.to_string(math.round(math.degrees(math.pi))))\n\
+             io.println(\"${int.gcd(12, 18)} ${int.lcm(4, 6)} ${int.factorial(5)}\")\n",
+        );
+        assert_eq!(out, "3\n5\n3\n180\n6 12 120\n");
+    }
+
+    #[test]
     fn codegen_floatは最短往復表現で表示される() {
         // native の float 表示が interpreter（Rust）と一致する。
         let (out, code) = compile_run_status(

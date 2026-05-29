@@ -124,8 +124,15 @@ fn math_cname(name: &str) -> &'static str {
         "math_floor" => "floor",
         "math_ceil" => "ceil",
         "math_round" => "round",
+        "math_cbrt" => "cbrt",
+        "math_trunc" => "trunc",
+        "math_log2" => "log2",
+        "math_sinh" => "sinh",
+        "math_cosh" => "cosh",
+        "math_tanh" => "tanh",
         "math_pow" => "pow",
         "math_atan2" => "atan2",
+        "math_hypot" => "hypot",
         _ => unreachable!("unknown math builtin"),
     }
 }
@@ -1795,12 +1802,13 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     // 数学関数（libm。macOS では libSystem に含まれ -lm 不要）。
     for f in [
         "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log", "log10", "floor",
-        "ceil", "round",
+        "ceil", "round", "cbrt", "trunc", "log2", "sinh", "cosh", "tanh",
     ] {
         module.push_str(&format!("declare double @{}(double)\n", f));
     }
     module.push_str("declare double @pow(double, double)\n");
     module.push_str("declare double @atan2(double, double)\n");
+    module.push_str("declare double @hypot(double, double)\n");
     module.push_str("declare i64 @awa_string_char_at(ptr, i64)\n");
     module.push_str("declare ptr @awa_char_to_string(i64)\n");
     module.push_str("declare double @awa_string_to_float(ptr)\n");

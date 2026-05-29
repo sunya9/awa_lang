@@ -778,7 +778,8 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
         // 数学関数（libm 相当）。単項 Float -> Float。
         "math_sqrt" | "math_sin" | "math_cos" | "math_tan" | "math_asin" | "math_acos"
         | "math_atan" | "math_exp" | "math_ln" | "math_log10" | "math_floor" | "math_ceil"
-        | "math_round" => {
+        | "math_round" | "math_cbrt" | "math_trunc" | "math_log2" | "math_sinh" | "math_cosh"
+        | "math_tanh" => {
             let f: fn(f64) -> f64 = match name {
                 "math_sqrt" => |x| x.sqrt(),
                 "math_sin" => |x| x.sin(),
@@ -792,6 +793,12 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
                 "math_log10" => |x| x.log10(),
                 "math_floor" => |x| x.floor(),
                 "math_ceil" => |x| x.ceil(),
+                "math_cbrt" => |x| x.cbrt(),
+                "math_trunc" => |x| x.trunc(),
+                "math_log2" => |x| x.log2(),
+                "math_sinh" => |x| x.sinh(),
+                "math_cosh" => |x| x.cosh(),
+                "math_tanh" => |x| x.tanh(),
                 _ => |x| x.round(),
             };
             if let Some(Value::Float(x)) = args.into_iter().next() {
@@ -799,10 +806,14 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
             }
             unreachable!("math 単項の引数は Float");
         }
-        "math_pow" | "math_atan2" => {
+        "math_pow" | "math_atan2" | "math_hypot" => {
             let mut it = args.into_iter();
             if let (Some(Value::Float(a)), Some(Value::Float(b))) = (it.next(), it.next()) {
-                let r = if name == "math_pow" { a.powf(b) } else { a.atan2(b) };
+                let r = match name {
+                    "math_pow" => a.powf(b),
+                    "math_atan2" => a.atan2(b),
+                    _ => a.hypot(b),
+                };
                 return Ok(Value::Float(r));
             }
             unreachable!("math 二項の引数は Float");
@@ -933,6 +944,13 @@ pub fn builtins_env() -> Env {
         "math_round",
         "math_pow",
         "math_atan2",
+        "math_hypot",
+        "math_cbrt",
+        "math_trunc",
+        "math_log2",
+        "math_sinh",
+        "math_cosh",
+        "math_tanh",
         // OS 連携（ソケット非同期）。native ビルド専用（インタプリタは明示エラー）。
         "tcp_listen",
         "sock_port",
