@@ -621,6 +621,16 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
                 .unwrap_or(0);
             return Ok(Value::Int(ms));
         }
+        // ファイル擬似非同期: インタプリタでは同期読み込みして即解決 Future を返す
+        //（native はスレッドプールで本当に非同期）。
+        "read_file_async" => {
+            if let Some(Value::Str(path)) = args.into_iter().next() {
+                let s = std::fs::read_to_string(&path)
+                    .map_err(|e| LocatedError::at(AwaError::Io(format!("{}: {}", path, e)), span))?;
+                return Ok(Value::Future(fut_pure(Value::Str(s))));
+            }
+            unreachable!("read_file_async の引数は String");
+        }
         // ソケットはネイティブの kqueue ランタイム専用。インタプリタでは未対応。
         "tcp_listen" | "sock_port" | "accept" | "sock_read" | "sock_write" | "sock_close"
         | "tcp_connect" => {
@@ -676,6 +686,7 @@ pub fn builtins_env() -> Env {
         "sock_write",
         "sock_close",
         "tcp_connect",
+        "read_file_async",
     ] {
         env.insert(name.to_string(), Value::Native(name.to_string()));
     }

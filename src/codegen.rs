@@ -78,11 +78,12 @@ fn is_io_builtin(name: &str) -> bool {
     matches!(name, "print" | "read_line" | "read_file" | "write_file" | "now")
 }
 
-// OS 連携のソケット組込（kqueue イベントループへ委譲する）。
+// OS 連携の非同期 I/O 組込（kqueue ループ／スレッドプールへ委譲する）。
 fn is_socket_builtin(name: &str) -> bool {
     matches!(
         name,
-        "tcp_listen" | "sock_port" | "accept" | "sock_read" | "sock_write" | "sock_close" | "tcp_connect"
+        "tcp_listen" | "sock_port" | "accept" | "sock_read" | "sock_write" | "sock_close"
+            | "tcp_connect" | "read_file_async"
     )
 }
 
@@ -1122,7 +1123,13 @@ impl Gen {
                 self.release(&host, &args[0].ty); // String 引数を consume
                 Ok(r)
             }
-            _ => unsupported(format!("ソケット組込 {}", name)),
+            "read_file_async" => {
+                let path = self.expr(&args[0], m)?;
+                self.line(&format!("{} = call i64 @awa_read_file_async(ptr {})", r, path));
+                self.release(&path, &args[0].ty); // String 引数を consume
+                Ok(r)
+            }
+            _ => unsupported(format!("非同期 I/O 組込 {}", name)),
         }
     }
 
@@ -1667,6 +1674,8 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i64 @awa_sock_write(i64, ptr)\n");
     module.push_str("declare void @awa_sock_close(i64)\n");
     module.push_str("declare i64 @awa_tcp_connect(ptr, i64)\n");
+    // OS 連携: ファイル擬似非同期（スレッドプール）。
+    module.push_str("declare i64 @awa_read_file_async(ptr)\n");
     // 生存ヒープオブジェクト数（リーク検出用）。init_header と awa_make_str で ++、awa_release で --。
     module.push_str("@awa_live = global i64 0\n");
     // 書式・定数文字列。

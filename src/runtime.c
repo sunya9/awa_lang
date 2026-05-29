@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>     // ファイル擬似非同期のスレッドプール
 
 static long now_ms(void) {
   struct timespec ts;
@@ -217,6 +218,95 @@ static void perform_fdw(long idx) {
   }
 }
 
+// ===== OS 連携: ファイル擬似非同期（スレッドプール）=====
+// 通常ファイルは kqueue で非同期化できない（常に ready）ので、Node/libuv 同様
+// ワーカースレッドでブロッキング read し、完了を EVFILT_USER でメインループへ通知する。
+// awa 言語からはスレッドは見えない（ワーカーは生バイトを返すだけ。awa String 生成と
+// Future の解決はメインスレッドのみ＝awa_live の競合や継続の並行実行を避ける）。
+#define USER_IDENT 1 // EVFILT_USER の識別子（メインループを起こす）
+
+typedef struct Job {
+  long future;
+  char* path;        // 複製したパス（ワーカーが読む）
+  char* data;        // ワーカーが読んだ生バイト（メインが String 化）
+  long len;
+  struct Job* next;
+} Job;
+
+// 投入キュー（メイン→ワーカー）と完了キュー（ワーカー→メイン）。
+static Job* job_head = 0; static Job* job_tail = 0;
+static pthread_mutex_t job_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t job_cv = PTHREAD_COND_INITIALIZER;
+static Job* done_head = 0; static Job* done_tail = 0;
+static pthread_mutex_t done_mu = PTHREAD_MUTEX_INITIALIZER;
+static int pool_started = 0;
+static long pending_jobs = 0; // 未完了ジョブ数（メインスレッドのみが触る）
+
+static void* worker_main(void* arg) {
+  (void)arg;
+  for (;;) {
+    pthread_mutex_lock(&job_mu);
+    while (!job_head) pthread_cond_wait(&job_cv, &job_mu);
+    Job* j = job_head; job_head = j->next; if (!job_head) job_tail = 0;
+    pthread_mutex_unlock(&job_mu);
+    // ブロッキングなファイル読み込み（ワーカースレッド上）。生バイトだけ持ち帰る。
+    FILE* f = fopen(j->path, "rb");
+    if (!f) { j->data = (char*)malloc(1); j->len = 0; }
+    else {
+      fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+      char* b = (char*)malloc(n > 0 ? n : 1);
+      j->len = (long)fread(b, 1, n, f); j->data = b; fclose(f);
+    }
+    free(j->path); j->path = 0;
+    // 完了キューへ積み、メインループを EVFILT_USER で起こす。
+    pthread_mutex_lock(&done_mu);
+    j->next = 0; if (done_tail) done_tail->next = j; else done_head = j; done_tail = j;
+    pthread_mutex_unlock(&done_mu);
+    struct kevent ch; EV_SET(&ch, USER_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, 0);
+    kevent(kq, &ch, 1, NULL, 0, NULL);
+  }
+  return 0;
+}
+
+static void ensure_pool(void) {
+  if (pool_started) return;
+  pool_started = 1;
+  ensure_kq();
+  struct kevent ch; EV_SET(&ch, USER_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, 0);
+  kevent(kq, &ch, 1, NULL, 0, NULL);
+  for (int i = 0; i < 4; i++) { pthread_t t; pthread_create(&t, 0, worker_main, 0); pthread_detach(t); }
+}
+
+long awa_read_file_async(void* pathobj) {
+  ensure_pool();
+  long g = new_future(0, 0);
+  Job* j = (Job*)malloc(sizeof(Job));
+  j->future = g; j->path = strdup((char*)pathobj + 16); j->data = 0; j->len = 0; j->next = 0;
+  pending_jobs++;
+  pthread_mutex_lock(&job_mu);
+  if (job_tail) job_tail->next = j; else job_head = j; job_tail = j;
+  pthread_cond_signal(&job_cv);
+  pthread_mutex_unlock(&job_mu);
+  return g;
+}
+
+// 完了したファイルジョブを取り出し String 化して Future を解決（メインスレッドのみ）。
+static void drain_done(void) {
+  for (;;) {
+    pthread_mutex_lock(&done_mu);
+    Job* j = done_head;
+    if (j) { done_head = j->next; if (!done_head) done_tail = 0; }
+    pthread_mutex_unlock(&done_mu);
+    if (!j) break;
+    void* o = awa_make_str(j->data, j->len);
+    free(j->data);
+    pending_jobs--;
+    long fut = j->future;
+    free(j);
+    resolve(fut, (Word)o);
+  }
+}
+
 Word awa_future_run(long f) {
   ensure_kq();
   while (!futs[f].resolved) {
@@ -228,8 +318,8 @@ Word awa_future_run(long f) {
         if (timers[i].tick < timers[mi].tick || (timers[i].tick == timers[mi].tick && timers[i].seq < timers[mi].seq)) mi = i;
     int have_fd = 0;
     for (long i = 0; i < fdws_len; i++) if (fdws[i].active) { have_fd = 1; break; }
-    if (!have_timer && !have_fd) exit(70); // deadlock
-    // kqueue で「タイマー締切まで」または「fd が ready になるまで」待つ。
+    if (!have_timer && !have_fd && pending_jobs == 0) exit(70); // deadlock
+    // kqueue で「タイマー締切まで」または「fd が ready / ファイルジョブ完了」まで待つ。
     struct timespec ts, *tsp = NULL;
     if (have_timer) {
       long wait = timers[mi].tick - now_ms();
@@ -239,9 +329,13 @@ Word awa_future_run(long f) {
     struct kevent ev;
     int n = kevent(kq, NULL, 0, &ev, 1, tsp);
     if (n > 0) {
-      int fd = (int)ev.ident;
-      for (long i = 0; i < fdws_len; i++)
-        if (fdws[i].active && fdws[i].fd == fd) { perform_fdw(i); break; }
+      if (ev.filter == EVFILT_USER) { // ワーカーがファイル読み込みを完了
+        drain_done();
+      } else {
+        int fd = (int)ev.ident;
+        for (long i = 0; i < fdws_len; i++)
+          if (fdws[i].active && fdws[i].fd == fd) { perform_fdw(i); break; }
+      }
     } else if (have_timer) { // タイムアウト → 締切のタイマーを発火
       Timer t = timers[mi];
       timers[mi] = timers[timers_len - 1];

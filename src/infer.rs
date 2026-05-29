@@ -153,6 +153,8 @@ impl Checker {
         self.env.insert("sock_write".to_string(), mono(vec![socket.clone(), Type::Str], fut(Type::Unit)));
         self.env.insert("sock_close".to_string(), mono(vec![socket.clone()], Type::Unit));
         self.env.insert("tcp_connect".to_string(), mono(vec![Type::Str, Type::Int], fut(socket)));
+        // ファイル擬似非同期（native はスレッドプール、インタプリタは同期読み→即解決 Future）。
+        self.env.insert("read_file_async".to_string(), mono(vec![Type::Str], fut(Type::Str)));
     }
 
     // プログラム（トップレベルの文の並び）を型検査し、型付き AST（elaboration の結果）を返す。

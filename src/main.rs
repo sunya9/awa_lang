@@ -1729,6 +1729,21 @@ mod tests {
     }
 
     #[test]
+    fn file_async_がネイティブのスレッドプールで動く() {
+        // read_file_async はワーカースレッドでブロッキング read し、完了を kqueue 経由で
+        // メインループへ通知して Future を解決する。
+        let id = std::process::id();
+        let path = std::env::temp_dir().join(format!("awa_fa_{}.txt", id));
+        let p = path.to_string_lossy().replace('\\', "/");
+        std::fs::write(&path, "async file via thread pool").unwrap();
+        let out = compile_and_run(&format!(
+            "print(run(do {{ s <- read_file_async(\"{p}\"); pure(s) }}))"
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(out, "async file via thread pool\n");
+    }
+
+    #[test]
     fn socket_echoサーバがネイティブで接続を処理する() {
         use std::io::{Read, Write};
         use std::net::TcpStream;
