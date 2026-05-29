@@ -1,1 +1,5 @@
 /target
+
+# codegen artifacts
+examples/*.ll
+examples/native
