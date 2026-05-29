@@ -1187,6 +1187,50 @@ mod tests {
     }
 
     #[test]
+    fn 文字列プリミティブ() {
+        // string_char_at: i 番目のコードポイント（範囲外 -1）。UTF-8 をコードポイント単位で。
+        assert_eq!(
+            eval(r#"char_to_string(string_char_at("héllo", 1))"#),
+            Ok(Value::Str("é".to_string()))
+        );
+        assert_eq!(eval(r#"string_char_at("ab", 5)"#), Ok(Value::Int(-1)));
+        assert_eq!(eval(r#"string_char_at("héllo", 4)"#), Ok(Value::Int(111))); // 'o'
+        // char_to_string: コードポイント → 1 文字（BMP 外も）。
+        assert_eq!(eval("char_to_string(128512)"), Ok(Value::Str("😀".to_string())));
+        // string_to_float: 先頭の数値部を読む。
+        assert_eq!(eval(r#"string_to_float("3.5")"#), Ok(Value::Float(3.5)));
+        assert_eq!(eval(r#"string_to_float("nope")"#), Ok(Value::Float(0.0)));
+    }
+
+    #[test]
+    fn codegen_文字列プリミティブがネイティブ実行される() {
+        // 同じ式が native でもインタプリタと一致する（UTF-8 往復・float パース）。
+        let (out, code) = compile_run_status(
+            "print(char_to_string(string_char_at(\"héllo\", 1)))\n\
+             print(int_to_string(string_char_at(\"ab\", 5)))\n\
+             print(float_to_string(string_to_float(\"3.5\")))\n\
+             print(char_to_string(128512))",
+        );
+        assert_eq!(out, "é\n-1\n3.5\n😀\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn std_string_slice_split() {
+        // std/string の slice/index_of/starts_with/split を native で。
+        let out = std_build_run(
+            "import std/io\n\
+             import std/string\n\
+             import std/list\n\
+             io.println(string.slice(\"hello world\", 0, 5))\n\
+             io.println(\"${string.index_of(\"a,b,c\", 44)}\")\n\
+             io.println(\"${string.starts_with(\"hello\", \"he\")}\")\n\
+             io.println(\"${list.length(string.split(\"a,b,c\", 44))}\")\n",
+        );
+        assert_eq!(out, "hello\n1\ntrue\n3\n");
+    }
+
+    #[test]
     fn 三連引用符でも補間できる() {
         assert_eq!(
             eval("let n = 7;\n\"\"\"val=${n}\nend\"\"\""),

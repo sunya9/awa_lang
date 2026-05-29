@@ -86,6 +86,54 @@ long long awa_string_length(void* strobj) {
   while (*p) { if ((*p & 0xC0) != 0x80) n++; p++; }
   return n;
 }
+// 文字列 → 浮動小数（非数値は 0.0）。
+double awa_string_to_float(void* strobj) { return atof((char*)strobj + 16); }
+// i 番目（0 始まり）のコードポイントを返す。範囲外は -1。
+long long awa_string_char_at(void* strobj, long long idx) {
+  if (idx < 0) return -1;
+  const unsigned char* p = (const unsigned char*)strobj + 16;
+  long long i = 0;
+  while (*p) {
+    // このバイトが文字の先頭か（継続バイトでない）。
+    unsigned char c = *p;
+    long long cp;
+    int len;
+    if (c < 0x80) { cp = c; len = 1; }
+    else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+    else { p++; continue; } // 不正な先頭バイトは飛ばす
+    for (int k = 1; k < len; k++) {
+      if ((p[k] & 0xC0) != 0x80) { len = k; break; } // 途切れ
+      cp = (cp << 6) | (p[k] & 0x3F);
+    }
+    if (i == idx) return cp;
+    i++;
+    p += len;
+  }
+  return -1;
+}
+// コードポイント c を UTF-8 にエンコードした 1 文字の String。
+void* awa_char_to_string(long long c) {
+  unsigned char buf[4];
+  long n = 0;
+  if (c < 0) c = 0;
+  if (c < 0x80) { buf[n++] = (unsigned char)c; }
+  else if (c < 0x800) {
+    buf[n++] = 0xC0 | (c >> 6);
+    buf[n++] = 0x80 | (c & 0x3F);
+  } else if (c < 0x10000) {
+    buf[n++] = 0xE0 | (c >> 12);
+    buf[n++] = 0x80 | ((c >> 6) & 0x3F);
+    buf[n++] = 0x80 | (c & 0x3F);
+  } else {
+    buf[n++] = 0xF0 | (c >> 18);
+    buf[n++] = 0x80 | ((c >> 12) & 0x3F);
+    buf[n++] = 0x80 | ((c >> 6) & 0x3F);
+    buf[n++] = 0x80 | (c & 0x3F);
+  }
+  return awa_make_str((const char*)buf, n);
+}
 
 // ===== 非同期イベントループ =====
 typedef long long Word;

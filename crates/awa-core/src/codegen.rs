@@ -87,7 +87,19 @@ fn is_async_builtin(name: &str) -> bool {
 
 // OS 連携の同期 I/O 組込（C ランタイムへ委譲する）。
 fn is_io_builtin(name: &str) -> bool {
-    matches!(name, "print" | "read_line" | "read_file" | "write_file" | "now" | "string_to_int" | "string_length")
+    matches!(
+        name,
+        "print"
+            | "read_line"
+            | "read_file"
+            | "write_file"
+            | "now"
+            | "string_to_int"
+            | "string_length"
+            | "string_char_at"
+            | "char_to_string"
+            | "string_to_float"
+    )
 }
 
 // OS 連携の非同期 I/O 組込（kqueue ループ／スレッドプールへ委譲する）。
@@ -1102,6 +1114,28 @@ impl Gen {
                 self.release(&v, &args[0].ty); // String 引数を consume
                 Ok(r)
             }
+            "string_char_at" => {
+                let s = self.expr(&args[0], m)?;
+                let i = self.expr(&args[1], m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i64 @awa_string_char_at(ptr {}, i64 {})", r, s, i));
+                self.release(&s, &args[0].ty); // String 引数を consume
+                Ok(r)
+            }
+            "char_to_string" => {
+                let c = self.expr(&args[0], m)?;
+                let r = format!("%t{}", self.fresh());
+                // 結果は新しいヒープ String（awa_make_str で +1）＝retain 不要。
+                self.line(&format!("{} = call ptr @awa_char_to_string(i64 {})", r, c));
+                Ok(r)
+            }
+            "string_to_float" => {
+                let v = self.expr(&args[0], m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call double @awa_string_to_float(ptr {})", r, v));
+                self.release(&v, &args[0].ty); // String 引数を consume
+                Ok(r)
+            }
             _ => unsupported(format!("I/O 組込 {}", name)),
         }
     }
@@ -1694,6 +1728,9 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i64 @awa_now()\n");
     module.push_str("declare i64 @awa_string_to_int(ptr)\n");
     module.push_str("declare i64 @awa_string_length(ptr)\n");
+    module.push_str("declare i64 @awa_string_char_at(ptr, i64)\n");
+    module.push_str("declare ptr @awa_char_to_string(i64)\n");
+    module.push_str("declare double @awa_string_to_float(ptr)\n");
     // OS 連携: ソケット非同期（async_runtime.c が定義）。
     module.push_str("declare i64 @awa_tcp_listen(i64)\n");
     module.push_str("declare i64 @awa_sock_port(i64)\n");

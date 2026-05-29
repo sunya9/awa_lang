@@ -639,6 +639,31 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
             }
             unreachable!("string_to_int の引数は String");
         }
+        // i 番目のコードポイント（範囲外は -1）。native の awa_string_char_at と揃える。
+        "string_char_at" => {
+            let mut it = args.into_iter();
+            if let (Some(Value::Str(s)), Some(Value::Int(i))) = (it.next(), it.next()) {
+                let c = if i < 0 {
+                    -1
+                } else {
+                    s.chars().nth(i as usize).map(|c| c as i64).unwrap_or(-1)
+                };
+                return Ok(Value::Int(c));
+            }
+            unreachable!("string_char_at の引数は (String, Int)");
+        }
+        // コードポイント → 1 文字の String（不正値は空文字）。
+        "char_to_string" => {
+            if let Some(Value::Int(c)) = args.into_iter().next() {
+                let s = u32::try_from(c)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(String::from)
+                    .unwrap_or_default();
+                return Ok(Value::Str(s));
+            }
+            unreachable!("char_to_string の引数は Int");
+        }
         // ファイル擬似非同期: インタプリタでは同期読み込みして即解決 Future を返す
         //（native はスレッドプールで本当に非同期）。
         "read_file_async" => {
@@ -668,6 +693,17 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
         ("long_to_int", Some(Value::Long(n))) => Value::Int(n),
         ("int_to_string", Some(Value::Int(n))) => Value::Str(n.to_string()),
         ("float_to_string", Some(Value::Float(n))) => Value::Str(n.to_string()),
+        // 文字列 → 浮動小数（非数値は 0.0。先頭の数値部を読む＝C の atof に揃える）。
+        ("string_to_float", Some(Value::Str(s))) => {
+            let t = s.trim();
+            let f = t.parse::<f64>().unwrap_or_else(|_| {
+                let end = t
+                    .find(|c: char| !c.is_ascii_digit() && !matches!(c, '-' | '+' | '.' | 'e' | 'E'))
+                    .unwrap_or(t.len());
+                t[..end].parse::<f64>().unwrap_or(0.0)
+            });
+            Value::Float(f)
+        }
         _ => unreachable!("組込関数の引数は型検査済み: {}", name),
     };
     Ok(v)
@@ -698,6 +734,9 @@ pub fn builtins_env() -> Env {
         "now",
         "string_to_int",
         "string_length",
+        "string_char_at",
+        "char_to_string",
+        "string_to_float",
         // OS 連携（ソケット非同期）。native ビルド専用（インタプリタは明示エラー）。
         "tcp_listen",
         "sock_port",

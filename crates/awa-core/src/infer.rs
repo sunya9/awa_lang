@@ -143,6 +143,11 @@ impl Checker {
         self.env.insert("now".to_string(), mono(vec![], Type::Int));
         self.env.insert("string_to_int".to_string(), mono(vec![Type::Str], Type::Int));
         self.env.insert("string_length".to_string(), mono(vec![Type::Str], Type::Int));
+        // 文字単位の操作（JSON/HTTP パーサを awa で書くための土台）。
+        // string_char_at: i 番目のコードポイント（範囲外は -1）。char_to_string: 1 文字 String。
+        self.env.insert("string_char_at".to_string(), mono(vec![Type::Str, Type::Int], Type::Int));
+        self.env.insert("char_to_string".to_string(), mono(vec![Type::Int], Type::Str));
+        self.env.insert("string_to_float".to_string(), mono(vec![Type::Str], Type::Float));
 
         // OS 連携（ソケット非同期）。Socket は組込型（fd ハンドル、arity 0）。native ビルド専用。
         self.arities.insert("Socket".to_string(), 0);
