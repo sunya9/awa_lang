@@ -2296,7 +2296,7 @@ mod tests {
         );
         // 大文字ヘッダを小文字名で引ける／build_request は Content-Length=4（バイト）。
         assert!(out.contains("201:application/json\n"), "got: {out}");
-        assert!(out.contains("POST /p HTTP/1.0\r\n"), "got: {out:?}");
+        assert!(out.contains("POST /p HTTP/1.1\r\n"), "got: {out:?}");
         assert!(out.contains("X-A: 1\r\n"));
         assert!(out.contains("Content-Length: 4\r\n"));
     }

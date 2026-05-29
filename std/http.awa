@@ -1,9 +1,10 @@
 // 標準ライブラリ: HTTP（client / server）。
 // メッセージの組み立て/解析は純 awa（std/string の上）。実際の通信は socket 組込
 // （tcp_connect/sock_read/sock_write/tcp_listen/accept）の上に載るので native ビルド専用。
-// client: get/post/request（任意メソッド・ヘッダ・ボディ、解析済み Response を返す）。
-// server: serve_once（1 接続）/ serve（accept ループ）。ヘッダ取得は大小無視、
-// Content-Length はバイト長。割り切り: HTTP/1.0・Connection: close 前提、chunked 転送は未対応。
+// client: get/post/request（HTTP/1.1・任意メソッド・ヘッダ・ボディ、解析済み Response）。
+// レスポンスは Content-Length / chunked / close 区切りを見分けて読む。ヘッダ取得は大小無視。
+// server: serve_once（1 接続）/ serve（accept ループ）。Content-Length はバイト長。
+// 割り切り: keep-alive 不使用（Connection: close）、UTF-8 のチャンク途中分割は未対応。
 import std/list
 import std/result
 import std/string
@@ -326,7 +327,7 @@ pub let response_to_string = fn(resp: Response) -> String {
 
 // 任意メソッド・ヘッダ・ボディの生リクエスト（Connection: close）。
 pub let build_request = fn(method: String, host: String, path: String, headers, body: String) -> String {
-  let line = method <> " " <> path <> " HTTP/1.0\r\n"
+  let line = method <> " " <> path <> " HTTP/1.1\r\n"
   let host_h = "Host: " <> host <> "\r\n"
   let clen = "Content-Length: " <> int_to_string(string.byte_length(body)) <> "\r\n"
   line <> host_h <> headers_to_string(headers) <> clen <> "Connection: close\r\n\r\n" <> body
@@ -349,12 +350,81 @@ let read_all = fn(sock, acc) -> Future(String) {
   }
 }
 
-// 生リクエスト文字列を送り、レスポンス全体を読んで返す（低レベル）。
+// ヘッダ境界 \r\n\r\n が現れるまで読む（EOF なら不完全のまま返す）。
+let read_headers = fn(sock, acc) -> Future(String) {
+  case find_sub(acc, "\r\n\r\n") >= 0 {
+    true -> pure(acc)
+
+    false -> do {
+      chunk <- sock_read(sock)
+      case string.is_empty(chunk) {
+        true -> pure(acc)
+        false -> read_headers(sock, acc <> chunk)
+      }
+    }
+  }
+}
+
+// 累計バイト数が need 以上になるまで読む（Content-Length 用）。
+let read_n = fn(sock, acc, need) -> Future(String) {
+  case string.byte_length(acc) >= need {
+    true -> pure(acc)
+
+    false -> do {
+      chunk <- sock_read(sock)
+      case string.is_empty(chunk) {
+        true -> pure(acc)
+        false -> read_n(sock, acc <> chunk, need)
+      }
+    }
+  }
+}
+
+// chunked 終端（0 サイズチャンク 0\r\n\r\n）が現れるまで読む。
+let read_chunked = fn(sock, acc) -> Future(String) {
+  case find_sub(acc, "0\r\n\r\n") >= 0 {
+    true -> pure(acc)
+
+    false -> do {
+      chunk <- sock_read(sock)
+      case string.is_empty(chunk) {
+        true -> pure(acc)
+        false -> read_chunked(sock, acc <> chunk)
+      }
+    }
+  }
+}
+
+// レスポンスをフレーミングに従って読み切る: chunked / Content-Length / close 区切り。
+let read_response = fn(sock) -> Future(String) {
+  do {
+    raw <- read_headers(sock, "")
+    let b = find_sub(raw, "\r\n\r\n")
+    case b == -1 {
+      true -> pure(raw)
+      false -> {
+        let hdrs = case string.split(string.slice(raw, 0, b), 10) {
+          list.Cons(_, rest) -> parse_headers(rest)
+          list.Nil -> list.Nil
+        }
+        case get_header(hdrs, "transfer-encoding") {
+          option.Some(_) -> read_chunked(sock, raw)
+          option.None -> case get_header(hdrs, "content-length") {
+            option.Some(cl) -> read_n(sock, raw, b + 4 + string.to_int(cl))
+            option.None -> read_all(sock, raw)
+          }
+        }
+      }
+    }
+  }
+}
+
+// 生リクエスト文字列を送り、レスポンス全体を読んで返す（フレーミング対応・低レベル）。
 pub let send_raw = fn(host: String, port: Int, raw: String) -> Future(String) {
   do {
     sock <- tcp_connect(host, port)
     sock_write(sock, raw)
-    body <- read_all(sock, "")
+    body <- read_response(sock)
     let _ = sock_close(sock)
     pure(body)
   }
