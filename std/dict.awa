@@ -1,0 +1,96 @@
+// 標準ライブラリ: 辞書（連想リスト実装）。キーは構造等価 == で比較する。
+// 小規模向け＝検索/挿入/削除は線形 O(n)。純 awa（list/pair の上）。
+import std/list
+import std/option
+import std/pair
+
+pub type Dict(k, v) {
+  Dict(list.List(pair.Pair(k, v)))
+}
+
+// 空の辞書。
+pub let new = fn() -> Dict(k, v) { Dict(list.Nil) }
+
+// (key, value) ペアのリストから作る（重複キーは先頭が優先される）。
+pub let from_list = fn(entries) { Dict(entries) }
+
+// 中身を (key, value) ペアのリストとして取り出す。
+pub let to_list = fn(d) {
+  case d {
+    Dict(e) -> e
+  }
+}
+
+let lookup = fn(entries, k) {
+  case entries {
+    list.Nil -> option.None
+    list.Cons(h, t) -> case h {
+      pair.Pair(pk, pv) -> case pk == k {
+        true -> option.Some(pv)
+        false -> lookup(t, k)
+      }
+    }
+  }
+}
+
+// キーに対応する値（無ければ None）。
+pub let get = fn(d, k) {
+  case d {
+    Dict(e) -> lookup(e, k)
+  }
+}
+
+// キーがあるか。
+pub let has_key = fn(d, k) {
+  case get(d, k) {
+    option.Some(_) -> true
+    option.None -> false
+  }
+}
+
+let without = fn(entries, k) {
+  case entries {
+    list.Nil -> list.Nil
+    list.Cons(h, t) -> case h {
+      pair.Pair(pk, _) -> case pk == k {
+        true -> without(t, k)
+        false -> list.Cons(h, without(t, k))
+      }
+    }
+  }
+}
+
+// キーを削除した辞書。
+pub let remove = fn(d, k) {
+  case d {
+    Dict(e) -> Dict(without(e, k))
+  }
+}
+
+// k=v を設定（既存キーは置換）。
+pub let insert = fn(d, k, v) {
+  case d {
+    Dict(e) -> Dict(list.Cons(pair.Pair(k, v), without(e, k)))
+  }
+}
+
+// 要素数。
+pub let size = fn(d) -> Int {
+  case d {
+    Dict(e) -> list.length(e)
+  }
+}
+
+// キー一覧。
+pub let keys = fn(d) {
+  case d {
+    Dict(e) -> list.map(e, fn(p) { pair.fst(p) })
+  }
+}
+
+// 値一覧。
+pub let values = fn(d) {
+  case d {
+    Dict(e) -> list.map(e, fn(p) { pair.snd(p) })
+  }
+}

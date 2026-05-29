@@ -1,6 +1,7 @@
 // 標準ライブラリ: 連結リスト。純粋 awa（再帰）で書ける＝stdlib。
 // 再帰関数なので let に関数型注釈を付ける（戻り型を確定させ、引数型はラムダへ流れる）。
 import std/option
+import std/pair
 
 pub type List(a) {
   Cons(a, List(a))
@@ -105,6 +106,186 @@ pub let drop: fn(List(a), Int) -> List(a) = fn(xs, n) {
     false -> case xs {
       Nil -> Nil
       Cons(_, t) -> drop(t, n - 1)
+    }
+  }
+}
+
+// 空か。
+pub let is_empty = fn(xs) {
+  case xs {
+    Nil -> true
+    _ -> false
+  }
+}
+
+// 先頭要素（無ければ None）。
+pub let head = fn(xs) {
+  case xs {
+    Nil -> option.None
+    Cons(h, _) -> option.Some(h)
+  }
+}
+
+// 末尾要素（無ければ None）。
+pub let last = fn(xs) {
+  case xs {
+    Nil -> option.None
+    Cons(h, Nil) -> option.Some(h)
+    Cons(_, t) -> last(t)
+  }
+}
+
+// i 番目の要素（範囲外は None）。
+pub let at = fn(xs, i) {
+  case i < 0 {
+    true -> option.None
+    false -> case xs {
+      Nil -> option.None
+      Cons(h, t) -> case i == 0 {
+        true -> option.Some(h)
+        false -> at(t, i - 1)
+      }
+    }
+  }
+}
+
+// x を含むか（構造等価 == で比較）。
+pub let contains = fn(xs, x) { any(xs, fn(e) { e == x }) }
+
+// 述語を満たす要素数。
+pub let count = fn(xs, pred) -> Int {
+  fold(
+    xs,
+    0,
+    fn(a, e) {
+      case pred(e) {
+        true -> a + 1
+        false -> a
+      }
+    }
+  )
+}
+
+// Int の合計。
+pub let sum: fn(List(Int)) -> Int = fn(xs) { fold(xs, 0, fn(a, x) { a + x }) }
+
+// [start, end) の整数リスト。
+pub let range: fn(Int, Int) -> List(Int) = fn(start, end) {
+  case start >= end {
+    true -> Nil
+    false -> Cons(start, range(start + 1, end))
+  }
+}
+
+// x を n 個並べたリスト。
+pub let repeat = fn(x, n) {
+  case n <= 0 {
+    true -> Nil
+    false -> Cons(x, repeat(x, n - 1))
+  }
+}
+
+// 2 つのリストをペアに（短い方に合わせる）。
+pub let zip = fn(xs, ys) {
+  case xs {
+    Nil -> Nil
+    Cons(a, ta) -> case ys {
+      Nil -> Nil
+      Cons(b, tb) -> Cons(pair.Pair(a, b), zip(ta, tb))
+    }
+  }
+}
+
+// 2 つのリストを f で合成（短い方に合わせる）。
+pub let zip_with = fn(xs, ys, f) {
+  case xs {
+    Nil -> Nil
+    Cons(a, ta) -> case ys {
+      Nil -> Nil
+      Cons(b, tb) -> Cons(f(a, b), zip_with(ta, tb, f))
+    }
+  }
+}
+
+// 各要素を f でリストに写し、平坦化して連結。
+pub let flat_map = fn(xs, f) {
+  case xs {
+    Nil -> Nil
+    Cons(h, t) -> append(f(h), flat_map(t, f))
+  }
+}
+
+// リストのリストを 1 段平坦化。
+pub let concat = fn(xss) {
+  case xss {
+    Nil -> Nil
+    Cons(h, t) -> append(h, concat(t))
+  }
+}
+
+// 述語が真の間だけ先頭から取る。
+pub let take_while = fn(xs, pred) {
+  case xs {
+    Nil -> Nil
+    Cons(h, t) -> case pred(h) {
+      true -> Cons(h, take_while(t, pred))
+      false -> Nil
+    }
+  }
+}
+
+// 述語が真の間だけ先頭を捨てた残り。
+pub let drop_while = fn(xs, pred) {
+  case xs {
+    Nil -> Nil
+    Cons(h, t) -> case pred(h) {
+      true -> drop_while(t, pred)
+      false -> xs
+    }
+  }
+}
+
+// 各要素に f を適用（副作用目的。戻り値は Unit）。
+pub let each = fn(xs, f) {
+  case xs {
+    Nil -> { let _ = 0 }
+    Cons(h, t) -> {
+      let _ = f(h)
+      each(t, f)
+    }
+  }
+}
+
+// マージソート。less(a, b) が true なら a が前。安定。
+let split = fn(xs) {
+  case xs {
+    Nil -> pair.Pair(Nil, Nil)
+    Cons(a, Nil) -> pair.Pair(Cons(a, Nil), Nil)
+    Cons(a, Cons(b, rest)) -> case split(rest) {
+      pair.Pair(l, r) -> pair.Pair(Cons(a, l), Cons(b, r))
+    }
+  }
+}
+
+let merge = fn(a, b, less) {
+  case a {
+    Nil -> b
+    Cons(ha, ta) -> case b {
+      Nil -> a
+      Cons(hb, tb) -> case less(hb, ha) {
+        true -> Cons(hb, merge(a, tb, less))
+        false -> Cons(ha, merge(ta, b, less))
+      }
+    }
+  }
+}
+
+pub let sort = fn(xs, less) {
+  case xs {
+    Nil -> Nil
+    Cons(_, Nil) -> xs
+    _ -> case split(xs) {
+      pair.Pair(l, r) -> merge(sort(l, less), sort(r, less), less)
     }
   }
 }

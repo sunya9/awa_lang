@@ -2213,6 +2213,41 @@ mod tests {
     }
 
     #[test]
+    fn std_list_コレクション拡充() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/list\n\
+             import std/option\n\
+             let ns = list.range(1, 6)\n\
+             io.println(\"${list.sum(ns)}\")\n\
+             io.println(\"${list.contains(ns, 3)}\")\n\
+             io.println(\"${list.length(list.flat_map(ns, fn(n) { list.range(0, n) }))}\")\n\
+             let s = list.sort(list.Cons(3, list.Cons(1, list.Cons(2, list.Nil))), fn(a, b) { a < b })\n\
+             io.println(\"${option.unwrap_or(list.head(s), 0)}${option.unwrap_or(list.last(s), 0)}\")\n\
+             io.println(\"${list.length(list.take_while(ns, fn(n) { n < 3 }))}\")\n",
+        );
+        // sum=15, contains=true, flat_map 長さ=15, sort 先頭1末尾3→13, take_while=2。
+        assert_eq!(out, "15\ntrue\n15\n13\n2\n");
+    }
+
+    #[test]
+    fn std_dict_辞書() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/dict\n\
+             import std/option\n\
+             let d = dict.insert(dict.insert(dict.new(), \"a\", 1), \"b\", 2)\n\
+             io.println(\"${option.unwrap_or(dict.get(d, \"a\"), 0)}\")\n\
+             io.println(\"${dict.size(d)}\")\n\
+             io.println(\"${dict.has_key(d, \"c\")}\")\n\
+             io.println(\"${dict.size(dict.remove(d, \"a\"))}\")\n\
+             io.println(\"${option.unwrap_or(dict.get(dict.insert(d, \"a\", 9), \"a\"), 0)}\")\n",
+        );
+        // get a=1, size=2, has c=false, remove後=1, 上書き a=9。
+        assert_eq!(out, "1\n2\nfalse\n1\n9\n");
+    }
+
+    #[test]
     fn std_json_parse_stringify_roundtrip() {
         // パース→再シリアライズが入力と一致（数値/配列/入れ子/true/null）。
         let out = std_build_run(
