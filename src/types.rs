@@ -60,10 +60,6 @@ pub struct VarGen {
 }
 
 impl VarGen {
-    pub fn new() -> Self {
-        VarGen { next: 0 }
-    }
-
     // 新しい型変数を 1 つ作る。「まだ分からない型」が必要なときに呼ぶ。
     pub fn fresh(&mut self) -> Type {
         let id = self.next;
@@ -236,7 +232,7 @@ mod tests {
 
     #[test]
     fn fresh_は異なる型変数を作る() {
-        let mut g = VarGen::new();
+        let mut g = VarGen::default();
         let a = g.fresh();
         let b = g.fresh();
         assert_ne!(a, b);

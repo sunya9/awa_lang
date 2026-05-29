@@ -4,6 +4,7 @@ use std::io::{Write, stdout};
 mod ast;
 mod error;
 mod eval;
+mod infer;
 mod lexer;
 mod parser;
 mod token;
@@ -12,17 +13,21 @@ mod value;
 
 use error::AwaError;
 use eval::eval_program;
+use infer::Checker;
 use parser::Parser;
 use value::{Env, Value};
 
 // ===== パイプライン =====
-// tokenize → parse → eval を ? で連結。どこで失敗しても Err が呼び出し側へ伝わる。
-// env を借用で受け取るので、ファイル実行（使い捨て env）も REPL（持ち越す env）も
-// この 1 つの関数で賄える。
-fn run(source: &str, env: &mut Env) -> Result<Vec<Value>, AwaError> {
+// tokenize → parse → type-check → eval を ? で連結。どこで失敗しても Err が伝わる。
+// 型検査（checker.check_program）を eval の前に挟むのが Phase 2 の要。型エラーは
+// 実行前に捕まり、eval には well-typed なプログラムだけが進む。
+// env / checker をともに借用で受け取るので、ファイル実行（使い捨て）も
+// REPL（行をまたいで持ち越す）もこの 1 つの関数で賄える。
+fn run(source: &str, env: &mut Env, checker: &mut Checker) -> Result<Vec<Value>, AwaError> {
     let tokens = lexer::tokenize(source)?;
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
+    checker.check_program(&program)?;
     eval_program(&program, env)
 }
 
@@ -38,7 +43,8 @@ fn run_file(path: &str) {
         }
     };
     let mut env: Env = HashMap::new();
-    match run(&source, &mut env) {
+    let mut checker = Checker::new();
+    match run(&source, &mut env, &mut checker) {
         Ok(values) => {
             for v in values {
                 println!("{}", v);
@@ -58,6 +64,7 @@ fn run_file(path: &str) {
 fn repl() -> std::io::Result<()> {
     println!("awa REPL — Ctrl-D で終了");
     let mut env: Env = HashMap::new();
+    let mut checker = Checker::new();
     let stdin = std::io::stdin();
     loop {
         print!("awa> ");
@@ -67,7 +74,7 @@ fn repl() -> std::io::Result<()> {
         if n? == 0 {
             break; // EOF
         }
-        match run(&line, &mut env) {
+        match run(&line, &mut env, &mut checker) {
             Ok(values) => {
                 for v in values {
                     println!("{}", v);
@@ -100,7 +107,8 @@ mod tests {
 
     fn eval(src: &str) -> Result<Value, AwaError> {
         let mut env = Env::new();
-        run(src, &mut env).map(|values| values.last().cloned().unwrap_or(Value::Unit))
+        let mut checker = Checker::new();
+        run(src, &mut env, &mut checker).map(|values| values.last().cloned().unwrap_or(Value::Unit))
     }
 
     fn num(n: f64) -> Value {
@@ -145,11 +153,13 @@ mod tests {
         assert_eq!(eval("q + 1"), Err(AwaError::UndefinedVariable("q".to_string())));
     }
 
+    // Phase 2 以降、これらは eval ではなく型検査段階で（実行前に）捕まる。
+    // 型推論は unify の失敗として CannotUnify を返す。
     #[test]
     fn 型エラー_boolに算術() {
         assert_eq!(
             eval("true + 1"),
-            Err(AwaError::TypeError { expected: "Num", found: "Bool" })
+            Err(AwaError::CannotUnify { left: "Bool".to_string(), right: "Num".to_string() })
         );
     }
 
@@ -157,7 +167,7 @@ mod tests {
     fn 型エラー_ifの条件が数値() {
         assert_eq!(
             eval("if 1 { 2 } else { 3 }"),
-            Err(AwaError::TypeError { expected: "Bool", found: "Num" })
+            Err(AwaError::CannotUnify { left: "Num".to_string(), right: "Bool".to_string() })
         );
     }
 
@@ -165,15 +175,17 @@ mod tests {
     fn 型エラー_numとboolの比較() {
         assert_eq!(
             eval("1 == true"),
-            Err(AwaError::TypeError { expected: "Num", found: "Bool" })
+            Err(AwaError::CannotUnify { left: "Num".to_string(), right: "Bool".to_string() })
         );
     }
 
     #[test]
     fn repl_env持ち越し() {
         let mut env = Env::new();
-        assert_eq!(run("let x = 10", &mut env), Ok(vec![Value::Num(10.0)]));
-        assert_eq!(run("x + 5", &mut env), Ok(vec![Value::Num(15.0)]));
+        let mut checker = Checker::new();
+        // 型環境も checker に持ち越されるので、2 行目の x も型検査を通る。
+        assert_eq!(run("let x = 10", &mut env, &mut checker), Ok(vec![Value::Num(10.0)]));
+        assert_eq!(run("x + 5", &mut env, &mut checker), Ok(vec![Value::Num(15.0)]));
     }
 
     #[test]
@@ -229,7 +241,8 @@ mod tests {
 
     #[test]
     fn 関数でない値の呼び出しはエラー() {
-        assert_eq!(eval("let x = 5; x(1)"), Err(AwaError::NotCallable("Num")));
+        // 型検査で Num を fn(Num) -> _ と unify しようとして失敗する。
+        assert!(matches!(eval("let x = 5; x(1)"), Err(AwaError::CannotUnify { .. })));
     }
 
     // ===== Scala 風の文法（ASI・ブロック・Unit・コメント）=====
@@ -242,8 +255,9 @@ mod tests {
     #[test]
     fn 改行が文の区切りになる() {
         let mut env = Env::new();
+        let mut checker = Checker::new();
         assert_eq!(
-            run("let x = 5\nx + 1", &mut env),
+            run("let x = 5\nx + 1", &mut env, &mut checker),
             Ok(vec![Value::Num(5.0), Value::Num(6.0)])
         );
     }
