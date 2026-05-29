@@ -2231,6 +2231,24 @@ mod tests {
     }
 
     #[test]
+    fn std_option_result_コンビネータ() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/option\n\
+             import std/result\n\
+             let s = option.Some(5)\n\
+             io.println(\"${option.is_some(s)}\")\n\
+             io.println(\"${option.unwrap_or(option.or(option.None, option.Some(9)), 0)}\")\n\
+             io.println(\"${option.unwrap_or(option.flatten(option.Some(option.Some(7))), 0)}\")\n\
+             io.println(\"${result.unwrap_or(option.to_result(option.None, \"e\"), 0)}\")\n\
+             io.println(\"${result.is_err(result.Err(\"boom\"))}\")\n\
+             io.println(\"${result.unwrap_or_else(result.Err(\"boom\"), fn(m) { string_length(m) })}\")\n",
+        );
+        // is_some=true, or→9, flatten→7, None→Result Err→既定0, is_err=true, unwrap_or_else→len(\"boom\")=4。
+        assert_eq!(out, "true\n9\n7\n0\ntrue\n4\n");
+    }
+
+    #[test]
     fn std_dict_辞書() {
         let out = std_build_run(
             "import std/io\n\

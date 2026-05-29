@@ -46,3 +46,42 @@ pub impl Result(a, e) {
     }
   }
 }
+
+// ----- 追加コンビネータ -----
+pub let is_ok = fn(r: Result(a, e)) -> Bool {
+  case r {
+    Ok(_) -> true
+    Err(_) -> false
+  }
+}
+
+pub let is_err = fn(r: Result(a, e)) -> Bool {
+  case r {
+    Ok(_) -> false
+    Err(_) -> true
+  }
+}
+
+// Err の中身を変換（Ok はそのまま）。
+pub let map_err = fn(r, f) {
+  case r {
+    Ok(x) -> Ok(x)
+    Err(e) -> Err(f(e))
+  }
+}
+
+// Ok ならそれ、Err なら alt。
+pub let or = fn(r, alt) {
+  case r {
+    Ok(_) -> r
+    Err(_) -> alt
+  }
+}
+
+// Err のとき f(e) を既定値に。f : fn(e) -> a。
+pub let unwrap_or_else = fn(r, f) {
+  case r {
+    Ok(x) -> x
+    Err(e) -> f(e)
+  }
+}

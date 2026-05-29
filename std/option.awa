@@ -1,4 +1,8 @@
 // 標準ライブラリ: Option（値があるかもしれない）。純粋に awa で書ける＝組込でなく stdlib。
+// （option → result の一方向 import。result→option の相互参照を避け循環 import を防ぐため、
+// Option↔Result の変換は両方この option 側に置く。）
+import std/result
+
 pub type Option(a) {
   Some(a)
   None
@@ -45,5 +49,79 @@ pub impl Option(a) {
       Some(x) -> x
       None -> default
     }
+  }
+}
+
+// ----- 追加コンビネータ -----
+pub let is_some = fn(o: Option(a)) -> Bool {
+  case o {
+    Some(_) -> true
+    None -> false
+  }
+}
+
+pub let is_none = fn(o: Option(a)) -> Bool {
+  case o {
+    Some(_) -> false
+    None -> true
+  }
+}
+
+// Some ならそれ、None なら alt（先に来た Some）。
+pub let or = fn(o, alt) {
+  case o {
+    Some(_) -> o
+    None -> alt
+  }
+}
+
+// 遅延版: None のときだけ f() を評価。f : fn() -> Option。
+pub let or_else = fn(o, f) {
+  case o {
+    Some(_) -> o
+    None -> f()
+  }
+}
+
+// 述語を満たさなければ None に。
+pub let filter = fn(o, pred) {
+  case o {
+    Some(x) -> case pred(x) {
+      true -> Some(x)
+      false -> None
+    }
+    None -> None
+  }
+}
+
+// Option(Option(a)) -> Option(a)。
+pub let flatten = fn(oo) {
+  case oo {
+    Some(o) -> o
+    None -> None
+  }
+}
+
+// None のとき f() を既定値に（遅延）。f : fn() -> a。
+pub let unwrap_or_else = fn(o, f) {
+  case o {
+    Some(x) -> x
+    None -> f()
+  }
+}
+
+// Result へ。None は Err(err)。
+pub let to_result = fn(o, err) {
+  case o {
+    Some(x) -> result.Ok(x)
+    None -> result.Err(err)
+  }
+}
+
+// Result から。Err は None。
+pub let from_result = fn(r) {
+  case r {
+    result.Ok(x) -> Some(x)
+    result.Err(_) -> None
   }
 }
