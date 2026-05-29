@@ -1230,6 +1230,29 @@ mod tests {
     }
 
     #[test]
+    fn module_越境メソッド呼び出し() {
+        // 別モジュールの型 + impl メソッドを import して recv.method() で呼ぶ。
+        let (out, code) = compile_modules_status(
+            &[
+                (
+                    "shapes.awa",
+                    "pub type Shape { Circle(Int); Square(Int) }\n\
+                     impl Shape { fn area(self) -> Int { case self { Circle(r) -> r * r; Square(w) -> w * w } } }\n",
+                ),
+                (
+                    "main.awa",
+                    "import shapes\n\
+                     shapes.Circle(10).area()\n\
+                     shapes.Square(4).area()\n",
+                ),
+            ],
+            "main",
+        );
+        assert_eq!(out, "100\n16\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn module_循環importはエラー() {
         let id = std::process::id() as u64 * 1_000_000
             + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
@@ -1240,6 +1263,42 @@ mod tests {
         let err = load_program(&dir, "a").unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(err.contains("循環"), "実際のエラー: {}", err);
+    }
+
+    #[test]
+    fn codegen_メソッドがネイティブ実行される() {
+        // impl のメソッドがトップレベル関数として codegen され、recv.method() が呼べる。
+        let out = compile_and_run(
+            "type Box { B(Int) }\n\
+             impl Box { fn get(self) -> Int { case self { B(n) -> n } } }\n\
+             B(7).get()\n\
+             B(3).get()",
+        );
+        assert_eq!(out, "7\n3\n");
+    }
+
+    #[test]
+    fn codegen_ジェネリックメソッドの単相化() {
+        // 多相メソッドが使用具体型ごとに特殊化される。
+        let out = compile_and_run(
+            "type Opt(a) { Some(a); None }\n\
+             impl Opt(a) { fn getOr(self, d: a) -> a { case self { Some(x) -> x; None -> d } } }\n\
+             Some(5).getOr(0)\n\
+             None.getOr(99)",
+        );
+        assert_eq!(out, "5\n99\n");
+    }
+
+    #[test]
+    fn codegen_do記法がネイティブ実行される() {
+        // do は flatMap メソッド呼び出しへ脱糖され、メソッド codegen に乗ってネイティブ実行される。
+        let out = compile_and_run(
+            "type Opt(a) { Some(a); None }\n\
+             impl Opt(a) { fn flatMap(self, f: fn(a) -> Opt(b)) -> Opt(b) { case self { Some(x) -> f(x); None -> None } } }\n\
+             let r = do { x <- Some(2); y <- Some(3); Some(x + y) }\n\
+             case r { Some(n) -> n; None -> 0 }",
+        );
+        assert_eq!(out, "5\n");
     }
 
     #[test]

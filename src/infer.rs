@@ -202,6 +202,10 @@ fn resolve_tstmt(ts: &mut TStmt, subst: &Subst) {
         TStmt::Impl(methods) => {
             for m in methods {
                 resolve_texpr(&mut m.body, subst);
+                for t in &mut m.param_tys {
+                    *t = apply(subst, t);
+                }
+                m.ret = apply(subst, &m.ret);
             }
         }
     }
@@ -368,6 +372,8 @@ fn register_impl(
         tmethods.push(TMethod {
             mangled: format!("{}#{}", head, m.name),
             params: param_names,
+            param_tys: param_tys.clone(),
+            ret: ret_ty.clone(),
             body: body_t,
         });
     }

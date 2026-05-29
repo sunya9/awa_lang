@@ -25,6 +25,19 @@ fn unsupported<T>(what: impl Into<String>) -> Result<T> {
     Err(AwaError::Unsupported(what.into()))
 }
 
+// awa のグローバル名を LLVM の `@`-シンボル token にする。`#`（メソッドのマングル "型頭#名"）など
+// 非英数字を含む名前はクォート識別子 @"..." にする（LLVM は受理する）。"." "_" "$" は素のまま可。
+fn sym(name: &str) -> String {
+    if name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'$'))
+    {
+        format!("@{}", name)
+    } else {
+        format!("@\"{}\"", name)
+    }
+}
+
 // awa の型 → LLVM 型。関数型はクロージャ構造体、ADT はヒープブロックへの ptr。
 fn llvm_ty(ty: &Type) -> Result<String> {
     match ty {
@@ -641,8 +654,8 @@ impl Gen {
             let mangled = ensure_instance(m, name, params, ret)?;
             let c0 = format!("%t{}", self.fresh());
             self.line(&format!(
-                "{} = insertvalue {} undef, ptr @{}, 0",
-                c0, CLOSURE_TY, mangled
+                "{} = insertvalue {} undef, ptr {}, 0",
+                c0, CLOSURE_TY, sym(&mangled)
             ));
             let c1 = format!("%t{}", self.fresh());
             self.line(&format!(
@@ -871,10 +884,10 @@ impl Gen {
                 let mut call_args = vec!["ptr null".to_string()];
                 call_args.extend(arg_parts);
                 self.line(&format!(
-                    "{} = call {} @{}({})",
+                    "{} = call {} {}({})",
                     r,
                     ret_ll,
-                    mangled,
+                    sym(&mangled),
                     call_args.join(", ")
                 ));
                 return Ok(r);
@@ -972,8 +985,13 @@ impl Gen {
         let fv = free_vars(params, body);
         let mut caps: Vec<(String, Type)> = Vec::new();
         for name in &fv {
-            if m.globals.contains_key(name) || m.value_globals.contains_key(name) {
-                continue; // トップレベル関数/値は名前参照（捕獲しない）
+            // トップレベル関数・値・構築子・組込はグローバル名で参照する（捕獲しない）。
+            if m.globals.contains_key(name)
+                || m.value_globals.contains_key(name)
+                || m.ctors.contains_key(name)
+                || is_builtin(name)
+            {
+                continue;
             }
             match self.scope.get(name) {
                 Some((_, ty)) => caps.push((name.clone(), ty.clone())),
@@ -1127,9 +1145,9 @@ fn gen_function(
     g.release_scope_since(&HashMap::new())?;
     g.line(&format!("ret {} {}", ret_ll, result));
     m.funcs.push_str(&format!(
-        "define {} @{}({}) {{\n{}}}\n\n",
+        "define {} {}({}) {{\n{}}}\n\n",
         ret_ll,
-        name,
+        sym(name),
         header.join(", "),
         g.out
     ));
@@ -1236,6 +1254,20 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
                         param_tys: params.clone(),
                         ret: (**ret).clone(),
                         body: (**body).clone(),
+                    },
+                );
+            }
+        }
+        // メソッドは self を第一引数に取るトップレベル関数として登録する。
+        if let TStmt::Impl(methods) = s {
+            for meth in methods {
+                globals.insert(
+                    meth.mangled.clone(),
+                    GlobalFn {
+                        param_names: meth.params.clone(),
+                        param_tys: meth.param_tys.clone(),
+                        ret: meth.ret.clone(),
+                        body: meth.body.clone(),
                     },
                 );
             }

@@ -114,10 +114,13 @@ pub enum TStmt {
 }
 
 // 型付きメソッド。mangled は "型頭#メソッド名"（eval の env キー＝ユーザーが書けない名前）。
+// codegen はメソッドを「self を第一引数に取るトップレベル関数」として扱うため、引数型・戻り型も持つ。
 #[derive(Debug, Clone)]
 pub struct TMethod {
     pub mangled: String,
-    pub params: Vec<String>, // 先頭が self
+    pub params: Vec<String>,   // 先頭が self
+    pub param_tys: Vec<Type>,  // 各引数の型（params と同順、先頭が self の型）
+    pub ret: Type,             // 戻り型
     pub body: TExpr,
 }
 
