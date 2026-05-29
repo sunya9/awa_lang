@@ -1727,23 +1727,13 @@ mod tests {
         assert_eq!(code, Some(0), "サーバが正常終了していない");
     }
 
-    #[test]
-    fn std_ライブラリがimportできる() {
-        // import std/io・std/option・std/result。stdlib ルートはリポジトリ（std/ を含む）。
+    // リポジトリの std/ を stdlib ルートに、entry ソースを native ビルドして stdout を返す。
+    fn std_build_run(entry_src: &str) -> String {
         let id = std::process::id() as u64 * 1_000_000
             + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("awa_std_{}", id));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("main.awa"),
-            "import std/io\n\
-             import std/option\n\
-             import std/result\n\
-             io.println(\"from std\")\n\
-             option.unwrap_or(option.Some(42), 0)\n\
-             result.unwrap_or(result.Err(\"e\"), 5)\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("main.awa"), entry_src).unwrap();
         let stdlib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let modules = load_program(&dir, Some(&stdlib), "main").expect("読み込み成功");
         let ir = compile_modules_to_ir(&modules).expect("コンパイル成功");
@@ -1757,8 +1747,38 @@ mod tests {
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行");
         let _ = std::fs::remove_dir_all(&dir);
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn std_io_option_result() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/option\n\
+             import std/result\n\
+             io.println(\"from std\")\n\
+             option.unwrap_or(option.Some(42), 0)\n\
+             result.unwrap_or(result.Err(\"e\"), 5)\n",
+        );
         // io.println→"from std"、option.unwrap_or(Some(42))→42、result.unwrap_or(Err)→5。
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), "from std\n42\n5\n");
+        assert_eq!(out, "from std\n42\n5\n");
+    }
+
+    #[test]
+    fn std_list_int() {
+        // list の map/filter/fold/length/reverse と int.to_string を native で。
+        let out = std_build_run(
+            "import std/list\n\
+             import std/int\n\
+             import std/io\n\
+             let xs = list.Cons(1, list.Cons(2, list.Cons(3, list.Nil)))\n\
+             io.println(int.to_string(list.length(xs)))\n\
+             io.println(int.to_string(list.fold(xs, 0, fn(a, x) { a + x })))\n\
+             io.println(int.to_string(list.length(list.map(xs, fn(n) { n * 2 }))))\n\
+             io.println(int.to_string(int.max(int.abs(-9), 3)))\n",
+        );
+        // length=3、fold(sum)=6、map の長さ=3、max(abs(-9),3)=9。
+        assert_eq!(out, "3\n6\n3\n9\n");
     }
 
     #[test]

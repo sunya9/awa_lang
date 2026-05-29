@@ -1,0 +1,16 @@
+// 標準ライブラリ: 整数ユーティリティ。
+// to_string は組込 int_to_string のラッパ（別名にして自己再帰を回避）。abs/max/min は純粋 awa。
+
+pub let to_string = fn(n: Int) -> String { int_to_string(n) }
+
+pub let abs = fn(n: Int) -> Int {
+  if n < 0 { -n } else { n }
+}
+
+pub let max: fn(Int, Int) -> Int = fn(a, b) {
+  if a > b { a } else { b }
+}
+
+pub let min: fn(Int, Int) -> Int = fn(a, b) {
+  if a < b { a } else { b }
+}
