@@ -1,6 +1,8 @@
 // 標準ライブラリ: Result（成功 Ok か失敗 Err）。純粋 awa＝stdlib。
 pub type Result(a, e) { Ok(a); Err(e) }
 
+// ----- 関数版（qualified `result.map(r, f)` / pipe 向き）-----
+
 // Ok の中身に関数を適用する（Err はそのまま伝播）。
 pub let map: fn(Result(a, e), fn(a) -> b) -> Result(b, e) = fn(r, f) {
   case r {
@@ -14,5 +16,31 @@ pub let unwrap_or: fn(Result(a, e), a) -> a = fn(r, default) {
   case r {
     Ok(x) -> x
     Err(e) -> default
+  }
+}
+
+// ----- メソッド版（receiver.method 形式・do 記法対応）-----
+pub impl Result(a, e) {
+  // do 記法のための束縛。Ok なら f を適用、Err は短絡（Err をそのまま伝播）。
+  // flatMap : fn(Result(a, e), fn(a) -> Result(b, e)) -> Result(b, e)
+  fn flatMap(self, f) {
+    case self {
+      Ok(x) -> f(x)
+      Err(e) -> Err(e)
+    }
+  }
+  // Ok の中身に関数を適用（Err はそのまま伝播）。
+  fn map(self, f) {
+    case self {
+      Ok(x) -> Ok(f(x))
+      Err(e) -> Err(e)
+    }
+  }
+  // Ok の中身、Err なら既定値。
+  fn unwrap_or(self, default) {
+    case self {
+      Ok(x) -> x
+      Err(e) -> default
+    }
   }
 }

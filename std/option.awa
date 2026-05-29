@@ -1,6 +1,8 @@
 // 標準ライブラリ: Option（値があるかもしれない）。純粋に awa で書ける＝組込でなく stdlib。
 pub type Option(a) { Some(a); None }
 
+// ----- 関数版（qualified `option.map(o, f)` / pipe 向き）-----
+
 // 中身に関数を適用する（None はそのまま）。
 pub let map: fn(Option(a), fn(a) -> b) -> Option(b) = fn(o, f) {
   case o {
@@ -14,5 +16,32 @@ pub let unwrap_or: fn(Option(a), a) -> a = fn(o, default) {
   case o {
     Some(x) -> x
     None -> default
+  }
+}
+
+// ----- メソッド版（receiver.method 形式・do 記法対応）-----
+// pub impl で他モジュールへ公開する。method 解決はレシーバの具体型 Option で行われる。
+pub impl Option(a) {
+  // do 記法のための束縛。Some なら f を適用、None は短絡（None のまま）。
+  // flatMap : fn(Option(a), fn(a) -> Option(b)) -> Option(b)
+  fn flatMap(self, f) {
+    case self {
+      Some(x) -> f(x)
+      None -> None
+    }
+  }
+  // 中身に関数を適用（None はそのまま）。
+  fn map(self, f) {
+    case self {
+      Some(x) -> Some(f(x))
+      None -> None
+    }
+  }
+  // 中身、無ければ既定値。
+  fn unwrap_or(self, default) {
+    case self {
+      Some(x) -> x
+      None -> default
+    }
   }
 }

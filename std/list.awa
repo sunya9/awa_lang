@@ -1,5 +1,7 @@
 // 標準ライブラリ: 連結リスト。純粋 awa（再帰）で書ける＝stdlib。
 // 再帰関数なので let に関数型注釈を付ける（戻り型を確定させ、引数型はラムダへ流れる）。
+import std/option
+
 pub type List(a) { Cons(a, List(a)); Nil }
 
 // 要素数。
@@ -45,4 +47,53 @@ pub let append: fn(List(a), List(a)) -> List(a) = fn(xs, ys) {
 // 逆順（fold で積み直す）。
 pub let reverse: fn(List(a)) -> List(a) = fn(xs) {
   fold(xs, Nil, fn(acc, x) { Cons(x, acc) })
+}
+
+// いずれかの要素が述語を満たすか（最初の真で短絡）。
+pub let any: fn(List(a), fn(a) -> Bool) -> Bool = fn(xs, pred) {
+  case xs {
+    Nil -> false
+    Cons(h, t) -> if pred(h) { true } else { any(t, pred) }
+  }
+}
+
+// すべての要素が述語を満たすか（最初の偽で短絡）。
+pub let all: fn(List(a), fn(a) -> Bool) -> Bool = fn(xs, pred) {
+  case xs {
+    Nil -> true
+    Cons(h, t) -> if pred(h) { all(t, pred) } else { false }
+  }
+}
+
+// 述語を満たす最初の要素を返す（無ければ None）。戻り型は推論に委ねる
+// （注釈に他モジュール型 option.Option を書く必要を避けるため）。
+pub let find = fn(xs, pred) {
+  case xs {
+    Nil -> option.None
+    Cons(h, t) -> if pred(h) { option.Some(h) } else { find(t, pred) }
+  }
+}
+
+// 先頭から最大 n 個。
+pub let take: fn(List(a), Int) -> List(a) = fn(xs, n) {
+  if n <= 0 {
+    Nil
+  } else {
+    case xs {
+      Nil -> Nil
+      Cons(h, t) -> Cons(h, take(t, n - 1))
+    }
+  }
+}
+
+// 先頭の n 個を捨てた残り。
+pub let drop: fn(List(a), Int) -> List(a) = fn(xs, n) {
+  if n <= 0 {
+    xs
+  } else {
+    case xs {
+      Nil -> Nil
+      Cons(_, t) -> drop(t, n - 1)
+    }
+  }
 }

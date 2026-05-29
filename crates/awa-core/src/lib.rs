@@ -1953,6 +1953,69 @@ mod tests {
     }
 
     #[test]
+    fn std_option_do記法() {
+        // do は .flatMap 連鎖へ脱糖し、Option の pub impl メソッドで解決される。
+        let out = std_build_run(
+            "import std/io\n\
+             import std/option\n\
+             let added = do {\n\
+               x <- option.Some(10)\n\
+               y <- option.Some(20)\n\
+               option.Some(x + y)\n\
+             }\n\
+             let short = do {\n\
+               x <- option.Some(1)\n\
+               _ <- option.None\n\
+               option.Some(x)\n\
+             }\n\
+             io.println(\"added=${option.unwrap_or(added, 0)}\")\n\
+             io.println(\"short=${option.unwrap_or(short, 99)}\")\n",
+        );
+        // 全 Some なら 10+20=30、途中 None で短絡 → unwrap_or の既定 99。
+        assert_eq!(out, "added=30\nshort=99\n");
+    }
+
+    #[test]
+    fn std_result_do記法() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/result\n\
+             let safe_div = fn(a: Int, b: Int) -> result.Result(Int, String) {\n\
+               if b == 0 { result.Err(\"div0\") } else { result.Ok(a / b) }\n\
+             }\n\
+             let ok = do {\n\
+               x <- safe_div(100, 5)\n\
+               y <- safe_div(x, 2)\n\
+               result.Ok(y)\n\
+             }\n\
+             let bad = do {\n\
+               x <- safe_div(100, 0)\n\
+               result.Ok(x)\n\
+             }\n\
+             io.println(\"ok=${result.unwrap_or(ok, 0 - 1)}\")\n\
+             io.println(\"bad=${result.unwrap_or(bad, 0 - 1)}\")\n",
+        );
+        // 100/5=20, 20/2=10 → ok=10。Err で短絡 → bad は既定 -1。
+        assert_eq!(out, "ok=10\nbad=-1\n");
+    }
+
+    #[test]
+    fn std_list_any_all_find_take_drop() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/option\n\
+             import std/list\n\
+             let xs = list.Cons(1, list.Cons(2, list.Cons(3, list.Nil)))\n\
+             io.println(\"any=${list.any(xs, fn(n) { n > 2 })}\")\n\
+             io.println(\"all=${list.all(xs, fn(n) { n > 0 })}\")\n\
+             io.println(\"find=${option.unwrap_or(list.find(xs, fn(n) { n > 1 }), 0)}\")\n\
+             io.println(\"take=${list.length(list.take(xs, 2))}\")\n\
+             io.println(\"drop=${list.length(list.drop(xs, 2))}\")\n",
+        );
+        assert_eq!(out, "any=true\nall=true\nfind=2\ntake=2\ndrop=1\n");
+    }
+
+    #[test]
     fn 焼き込み標準ライブラリは_stdlibパスなしで解決できる() {
         // stdlib=None でも `import std/...` がバイナリ焼き込みソースから解決される
         // （cwd・環境変数に非依存）。エントリは std/ を持たない一時ディレクトリに置く。
