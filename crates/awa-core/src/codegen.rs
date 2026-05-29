@@ -1523,8 +1523,10 @@ fn gen_function(
     // 関数は引数・キャプチャを consume する → 戻り値を作った後に release（戻り値は別の +1）。
     g.release_scope_since(&HashMap::new())?;
     g.line(&format!("ret {} {}", ret_ll, result));
+    // internal リンケージ: エントリ @main 以外のユーザー/std/メソッド/単相化関数は内部関数とし、
+    // 未使用なら clang -O2 の globaldce が除去する（出力 exe のツリーシェイキング）。
     m.funcs.push_str(&format!(
-        "define {} {}({}) {{\n{}}}\n\n",
+        "define internal {} {}({}) {{\n{}}}\n\n",
         ret_ll,
         sym(name),
         header.join(", "),
@@ -1975,7 +1977,7 @@ mod tests {
     #[test]
     fn 関数と呼び出しと算術を出力する() {
         let out = ir("let f = fn(x: Int) -> Int { x + 1 }; f(2)");
-        assert!(out.contains("define i64 @f(ptr %env, i64 %arg0)"));
+        assert!(out.contains("define internal i64 @f(ptr %env, i64 %arg0)"));
         assert!(out.contains("add i64"));
         assert!(out.contains("call i64 @f(ptr null"));
         assert!(out.contains("define i32 @main()"));
@@ -1984,7 +1986,7 @@ mod tests {
     #[test]
     fn 再帰関数とcaseを出力する() {
         let out = ir("let fact = fn(n: Int) -> Int { case n == 0 { true -> 1; false -> n * fact(n - 1) } }; fact(5)");
-        assert!(out.contains("define i64 @fact"));
+        assert!(out.contains("define internal i64 @fact"));
         assert!(out.contains("icmp eq i64"));
         assert!(out.contains("mul i64"));
     }
