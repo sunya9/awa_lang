@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::error::AwaError;
@@ -86,6 +86,52 @@ pub fn apply(subst: &Subst, ty: &Type) -> Type {
             None => ty.clone(),
         },
     }
+}
+
+// ===== 型スキーム（多相）=====
+// ∀(vars). ty。多相な束縛を表す。vars は「任意の型でよい」と量化された型変数 ID。
+// 例: 恒等関数 id は ∀a. fn(a) -> a ＝ Scheme { vars: [a], ty: fn(a) -> a }。
+// 単相な型（量化なし）は vars が空のスキーム（Scheme::mono）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scheme {
+    pub vars: Vec<u32>,
+    pub ty: Type,
+}
+
+impl Scheme {
+    // 単相スキーム（量化なし）。ラムダ引数や再帰の placeholder に使う。
+    pub fn mono(ty: Type) -> Self {
+        Scheme {
+            vars: Vec::new(),
+            ty,
+        }
+    }
+}
+
+// 型に現れる自由型変数の集合。subst で解決した後の姿で数える
+// （すでに確定した型変数は「自由」ではないので apply 後に見る）。
+pub fn ftv(subst: &Subst, ty: &Type) -> HashSet<u32> {
+    match apply(subst, ty) {
+        Type::Var(id) => HashSet::from([id]),
+        Type::Fun(params, ret) => {
+            let mut s = HashSet::new();
+            for p in &params {
+                s.extend(ftv(subst, p));
+            }
+            s.extend(ftv(subst, &ret));
+            s
+        }
+        Type::Num | Type::Bool | Type::Unit => HashSet::new(),
+    }
+}
+
+// 具体化（instantiate）: スキームの量化変数を fresh な型変数に差し替えて型を取り出す。
+// 変数を「参照」するたびに呼ぶ。これにより同じ多相関数の各使用箇所が独立した
+// 型変数を得て、id(1) と id(true) が互いに干渉しなくなる。
+// 量化されていない型変数（環境に縛られた変数）はそのまま残す。
+pub fn instantiate(scheme: &Scheme, vargen: &mut VarGen) -> Type {
+    let mapping: Subst = scheme.vars.iter().map(|&id| (id, vargen.fresh())).collect();
+    apply(&mapping, &scheme.ty)
 }
 
 // occurs check: 型変数 id が型 ty の中に現れるか。

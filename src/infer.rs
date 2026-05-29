@@ -1,18 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, Stmt};
 use crate::error::AwaError;
 use crate::token::Token;
-use crate::types::{Subst, Type, VarGen, apply, unify};
+use crate::types::{Scheme, Subst, Type, VarGen, apply, ftv, instantiate, unify};
 
-// ===== 型推論（Algorithm W / 単相 Hindley-Milner）=====
+// ===== 型推論（Algorithm W / let 多相つき Hindley-Milner）=====
 // AST をたどって式の型を計算し、矛盾があれば unify が CannotUnify などを返す。
-// 多相（let 多相 = generalize/instantiate）は今は省略。同じ関数を Num と Bool の
-// 両方で使うと型エラーになるが、教科書的な単相 HM として十分動く。
-// 必要になったら generalize/instantiate をここに足す。
+// let 束縛は generalize で多相化（型スキーム化）され、変数参照のたびに
+// instantiate で fresh な型に具体化される。これにより Gleam/ML 同様、
+// `let id = fn(x){x}` が ∀a. fn(a)->a になり Num にも Bool にも使える。
+// awa は可変参照を持たない純粋な言語なので、value restriction なしに
+// 全 let を自由に一般化しても健全。
 
-// 型環境: 変数名 → 型。値の Env（名前→Value）の型版。
-pub type TypeEnv = HashMap<String, Type>;
+// 型環境: 変数名 → 型スキーム。値の Env（名前→Value）の型版。
+// 多相のため Type ではなく Scheme を持つ（単相な束縛は Scheme::mono）。
+pub type TypeEnv = HashMap<String, Scheme>;
 
 // 推論器の状態。3 つまとめて持つことで REPL が行をまたいで持ち越せる:
 //   subst  : 確定した型変数の置換テーブル（推論の本体状態）
@@ -53,10 +56,41 @@ impl Checker {
     }
 }
 
+// 型環境全体の自由型変数。各スキームの自由変数は ftv(ty) から量化変数を除いたもの
+// （量化済みの変数は「環境に縛られている」とは見なさない）。
+fn ftv_env(env: &TypeEnv, subst: &Subst) -> HashSet<u32> {
+    let mut acc = HashSet::new();
+    for scheme in env.values() {
+        let mut vars = ftv(subst, &scheme.ty);
+        for q in &scheme.vars {
+            vars.remove(q);
+        }
+        acc.extend(vars);
+    }
+    acc
+}
+
+// 一般化（generalize）: 型の自由変数のうち、環境に自由出現しないものを量化して
+// スキームにする。「周囲のスコープに縛られていない変数だけ」を多相にするのが肝。
+// 例: トップレベルの id は fn(a)->a の a が環境に出てこないので ∀a. fn(a)->a になる。
+//     一方 fn(y){ let f = fn(x){y}; f } の f は y 由来の変数が環境に縛られているので
+//     その変数は量化されない（過剰一般化を防ぐ）。
+fn generalize(env: &TypeEnv, subst: &Subst, ty: &Type) -> Scheme {
+    let env_vars = ftv_env(env, subst);
+    let ty = apply(subst, ty);
+    let vars: Vec<u32> = ftv(subst, &ty)
+        .into_iter()
+        .filter(|id| !env_vars.contains(id))
+        .collect();
+    Scheme { vars, ty }
+}
+
 // let 束縛の型推論。再帰関数のために、本体を見る前に名前を fresh 型変数で
-// 先に束縛しておく（letrec 的）。これにより `let fact = fn(n){ ... fact(n-1) ... }`
-// の本体内で fact を参照でき、推論後に「先に置いた型変数」と「本体から推論した型」を
-// unify して辻褄を合わせる。eval 側の「名前を刻んで自己注入」と対になる仕組み。
+// 先に束縛しておく（letrec 的・単相 placeholder）。これにより
+// `let fact = fn(n){ ... fact(n-1) ... }` の本体内で fact を参照でき、推論後に
+// 「先に置いた型変数」と「本体から推論した型」を unify して辻褄を合わせる。
+// eval 側の「名前を刻んで自己注入」と対になる仕組み。
+// 最後に、自分自身の束縛を外した環境で generalize して多相スキームを env に積む。
 fn infer_let(
     name: &str,
     expr: &Expr,
@@ -65,13 +99,15 @@ fn infer_let(
     vargen: &mut VarGen,
 ) -> Result<Type, AwaError> {
     let placeholder = vargen.fresh();
-    env.insert(name.to_string(), placeholder.clone());
+    env.insert(name.to_string(), Scheme::mono(placeholder.clone()));
     let t = infer_expr(expr, env, subst, vargen)?;
     unify(subst, &placeholder, &t)?;
-    let resolved = apply(subst, &placeholder);
-    // 推論で確定した型で上書きしておく（後続の文がこの型で参照する）。
-    env.insert(name.to_string(), resolved.clone());
-    Ok(resolved)
+    // 自分自身の単相 placeholder を環境から外してから一般化する。
+    // 外さないと placeholder が型変数を環境に縛り、何も量化されなくなる。
+    env.remove(name);
+    let scheme = generalize(env, subst, &placeholder);
+    env.insert(name.to_string(), scheme.clone());
+    Ok(scheme.ty)
 }
 
 // 式の型を推論する本体。env は読むだけ（スコープの拡張はクローンして行う）。
@@ -85,10 +121,12 @@ fn infer_expr(
     match expr {
         Expr::Num(_) => Ok(Type::Num),
         Expr::Bool(_) => Ok(Type::Bool),
-        // 変数は型環境を引く。無ければ評価時と同じ UndefinedVariable。
+        // 変数は型環境を引き、スキームを instantiate して fresh な型に具体化する。
+        // 多相な束縛はここで使用箇所ごとに独立した型変数を得る。
+        // 無ければ評価時と同じ UndefinedVariable。
         Expr::Var(name) => env
             .get(name)
-            .cloned()
+            .map(|scheme| instantiate(scheme, vargen))
             .ok_or_else(|| AwaError::UndefinedVariable(name.clone())),
         // 単項マイナスはオペランドが Num、結果も Num。
         Expr::Neg(operand) => {
@@ -117,7 +155,8 @@ fn infer_expr(
             let mut param_types = Vec::with_capacity(params.len());
             for p in params {
                 let tv = vargen.fresh();
-                body_env.insert(p.clone(), tv.clone());
+                // ラムダ引数は単相（多相化しない）。HM の多相境界は let だけ。
+                body_env.insert(p.clone(), Scheme::mono(tv.clone()));
                 param_types.push(tv);
             }
             let ret = infer_expr(body, &body_env, subst, vargen)?;
@@ -294,5 +333,41 @@ mod tests {
     #[test]
     fn 未定義変数は型エラー() {
         assert_eq!(infer("q + 1"), Err(AwaError::UndefinedVariable("q".to_string())));
+    }
+
+    // ===== let 多相 =====
+
+    #[test]
+    fn 恒等関数は多相_numとboolの両方に使える() {
+        // 単相 HM ではここで CannotUnify になっていた。let 多相で通るようになる。
+        assert_eq!(
+            infer("let id = fn(x) { x }; id(1); id(true)"),
+            Ok(Type::Bool)
+        );
+    }
+
+    #[test]
+    fn 恒等関数を一度numに使っても他方で再利用できる() {
+        assert_eq!(
+            infer("let id = fn(x) { x }; let a = id(1); let b = id(false); a"),
+            Ok(Type::Num)
+        );
+    }
+
+    #[test]
+    fn ラムダ引数は単相_numとboolの両方には使えない() {
+        // f は引数なので多相化されない（同じ型変数を共有）。f(1) で引数 Num と
+        // 決まった後 f(true) は Bool を要求し CannotUnify。同じ本体でも let 束縛なら
+        // 多相になり通る点が対照的（恒等関数のテスト参照）。
+        assert!(infer("fn(f) { f(1) + f(true) }").is_err());
+    }
+
+    #[test]
+    fn 多相関数を別の多相関数に渡す() {
+        // apply は ∀a b. fn(fn(a)->b, a) -> b。id を Num/Bool 双方に使う。
+        assert_eq!(
+            infer("let id = fn(x) { x }; let ap = fn(f, v) { f(v) }; ap(id, 1); ap(id, true)"),
+            Ok(Type::Bool)
+        );
     }
 }
