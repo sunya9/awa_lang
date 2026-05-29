@@ -43,7 +43,28 @@ let skip_ws = fn(s, i) {
   }
 }
 
-// "..." の中身を 1 文字ずつ読む（エスケープ対応・\uXXXX は未対応）。i は開きクォートの次。
+// 16進 1 桁 → 値（不正は 0）。
+let hex_val = fn(c) {
+  case c >= 48 && c <= 57 {
+    true -> c - 48
+    false -> case c >= 97 && c <= 102 {
+      true -> c - 97 + 10
+      false -> case c >= 65 && c <= 70 {
+        true -> c - 65 + 10
+        false -> 0
+      }
+    }
+  }
+}
+
+// 位置 j からの 4 桁 16進をコードポイントに（\uXXXX 用）。
+let hex4 = fn(s, j) {
+  hex_val(string_char_at(s, j)) * 4096 + hex_val(string_char_at(s, j + 1)) * 256 + hex_val(
+    string_char_at(s, j + 2)
+  ) * 16 + hex_val(string_char_at(s, j + 3))
+}
+
+// "..." の中身を 1 文字ずつ読む（\n \t \r \" \\ と \uXXXX に対応）。i は開きクォートの次。
 let scan_string = fn(s, i, acc) {
   let c = string_char_at(s, i)
   case c == -1 {
@@ -51,25 +72,29 @@ let scan_string = fn(s, i, acc) {
     false -> case c == 34 {
       true -> result.Ok(Parsed(acc, i + 1))
       false -> case c == 92 {
-        true -> {
-          let e = string_char_at(s, i + 1)
-          let ch = case e == 110 {
-            true -> char_to_string(10)
-            false -> case e == 116 {
-              true -> char_to_string(9)
-              false -> case e == 114 {
-                true -> char_to_string(13)
-                false -> case e == 34 {
-                  true -> char_to_string(34)
-                  false -> case e == 92 {
-                    true -> char_to_string(92)
-                    false -> char_to_string(e)
+        true -> case string_char_at(s, i + 1) == 117 {
+          // \uXXXX（BMP のみ。サロゲートペアは未対応）。
+          true -> scan_string(s, i + 6, acc <> char_to_string(hex4(s, i + 2)))
+          false -> {
+            let e = string_char_at(s, i + 1)
+            let ch = case e == 110 {
+              true -> char_to_string(10)
+              false -> case e == 116 {
+                true -> char_to_string(9)
+                false -> case e == 114 {
+                  true -> char_to_string(13)
+                  false -> case e == 34 {
+                    true -> char_to_string(34)
+                    false -> case e == 92 {
+                      true -> char_to_string(92)
+                      false -> char_to_string(e)
+                    }
                   }
                 }
               }
             }
+            scan_string(s, i + 2, acc <> ch)
           }
-          scan_string(s, i + 2, acc <> ch)
         }
         false -> scan_string(s, i + 1, acc <> char_to_string(c))
       }
@@ -130,8 +155,7 @@ let parse_lit = fn(s, i, word, val) {
   }
 }
 
-// 配列要素ループ。pv = 値パーサ（parse_value 自身を受け取る＝相互再帰の回避）。
-// acc は逆順に積む（呼び元が reverse する）。i は要素 or ']' の位置。
+// 配列要素ループ。acc は逆順に積む（呼び元が reverse する）。i は要素 or ']' の位置。
 // parse_value と相互再帰する（awa はトップレベルの相互再帰に対応）。
 let parse_elems = fn(s, i, acc) {
   let j = skip_ws(s, i)

@@ -394,6 +394,11 @@ fn run_cli() {
         }
         Some("fmt") => fmt_file(&args),
         Some("init") => init_project(args.get(2).map(|s| s.as_str())),
+        // `awa run [file]`: 明示の実行サブコマンド（ファイル省略時は awa.toml の entry）。
+        Some("run") => {
+            let t = resolve_target(args.get(2).map(|s| s.as_str()));
+            run_file(&t.entry, &t.deps);
+        }
         Some(path) => {
             // 明示ファイルでも awa.toml があれば依存を使う。
             let deps = load_manifest().as_ref().map(manifest_deps).unwrap_or_default();

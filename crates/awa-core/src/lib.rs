@@ -2204,6 +2204,21 @@ mod tests {
     }
 
     #[test]
+    fn std_json_unicode_エスケープ() {
+        // \uXXXX（BMP）をコードポイントへ。café / あ。
+        let out = std_build_run(
+            "import std/io\n\
+             import std/json\n\
+             import std/result\n\
+             io.println(case json.parse(\"[\\\"caf\\\\u00e9\\\",\\\"\\\\u3042\\\"]\") {\n\
+               result.Ok(j) -> json.stringify(j)\n\
+               result.Err(e) -> e\n\
+             })\n",
+        );
+        assert_eq!(out, "[\"café\",\"あ\"]\n");
+    }
+
+    #[test]
     fn std_json_object_と_エラー() {
         let out = std_build_run(
             "import std/io\n\
