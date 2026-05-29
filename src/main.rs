@@ -8,12 +8,11 @@ use std::rc::Rc;
 // これ自体が ADT（代数的データ型）の練習であり、Phase 3 で本格化する
 // パターンマッチ／網羅性チェックの土台になる。
 // ヴァリアントを増やすと、match で対応漏れがコンパイルエラーになる。
-// PartialEq を derive しておくと、テストで assert_eq!(..., Err(AwaError::DivisionByZero))
-// のようにエラーの種類まで含めて比較できる。
 #[derive(Debug, PartialEq)]
 enum AwaError {
     UnexpectedChar(char),      // 字句解析: 知らない文字
     InvalidNumber(String),     // 字句解析: 数値として parse できない
+    UnterminatedComment,       // 字句解析: /* が閉じられていない
     UnexpectedToken(String),   // 構文解析: 想定外のトークン
     UnexpectedEof,             // 構文解析: 入力が途中で終わった
     DivisionByZero,            // 評価: 0 除算
@@ -38,16 +37,13 @@ impl fmt::Display for AwaError {
         match self {
             AwaError::UnexpectedChar(c) => write!(f, "予期しない文字: {}", c),
             AwaError::InvalidNumber(s) => write!(f, "数値として解釈できません: {}", s),
+            AwaError::UnterminatedComment => write!(f, "コメント /* が閉じられていません"),
             AwaError::UnexpectedToken(t) => write!(f, "予期しないトークン: {}", t),
             AwaError::UnexpectedEof => write!(f, "入力が途中で終わっています"),
             AwaError::DivisionByZero => write!(f, "0 で割ることはできません"),
             AwaError::UndefinedVariable(name) => write!(f, "未定義の変数です: {}", name),
             AwaError::TypeError { expected, found } => {
-                write!(
-                    f,
-                    "型エラー: {} を期待しましたが {} でした",
-                    expected, found
-                )
+                write!(f, "型エラー: {} を期待しましたが {} でした", expected, found)
             }
             AwaError::NotCallable(found) => {
                 write!(f, "{} は関数ではないので呼び出せません", found)
@@ -87,9 +83,20 @@ enum Token {
     Slash,
     LParen,
     RParen,
-    LBrace,  // {
-    RBrace,  // }
-    Semicolon, // ; 文の終端
+    LBrace,    // {
+    RBrace,    // }
+    // 文の終端。明示的な ; と、改行から自動挿入されるものの両方がこれになる
+    // （Scala 風: セミコロンは普段書かず、改行が区切りになる）。
+    Terminator,
+}
+
+// このトークンで「式が完結しうる」か。改行を終端に変換するか判定する材料
+// （Go/Scala の自動セミコロン推論）。値・閉じ括弧の直後の改行だけを区切りにする。
+fn ends_expr(t: &Token) -> bool {
+    matches!(
+        t,
+        Token::Num(_) | Token::Bool(_) | Token::Ident(_) | Token::RParen | Token::RBrace
+    )
 }
 
 // ===== 字句解析（Lexer）=====
@@ -98,17 +105,58 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
+    // 丸括弧のネスト深さ。括弧の中では改行を終端にしない（複数行の関数呼び出し
+    // や式の折り返しを自然に書けるようにするため）。波括弧 {} は数えない:
+    // ブロック内では改行が文の区切りとして必要だから。
+    let mut paren_depth: i32 = 0;
 
     while i < chars.len() {
         let c = chars[i];
         match c {
-            // 改行も含めすべての空白は読み飛ばす。文の区切りは ; で明示するので
-            // 式を自由に複数行へ折り返せる（例: `1 +` 改行 `2;`）。
-            ' ' | '\t' | '\r' | '\n' => i += 1,
-            ';' => {
-                tokens.push(Token::Semicolon);
+            ' ' | '\t' | '\r' => i += 1,
+            // 改行: 括弧の外で、直前のトークンが式を完結しうるなら終端を挿入する。
+            // それ以外（演算子の直後、括弧内など）の改行はただの空白として無視。
+            '\n' => {
+                if paren_depth == 0
+                    && tokens.last().map(ends_expr).unwrap_or(false)
+                {
+                    tokens.push(Token::Terminator);
+                }
                 i += 1;
             }
+            ';' => {
+                // 明示的な ; も終端（任意に書ける。一行に複数文を書くときに便利）。
+                tokens.push(Token::Terminator);
+                i += 1;
+            }
+            // コメント or 除算。/ の次の文字で分岐する。
+            '/' => match chars.get(i + 1) {
+                // 行コメント //: 行末まで読み飛ばす（改行自体は残し、ASI に任せる）。
+                Some('/') => {
+                    i += 2;
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                // ブロックコメント /* ... */: 対応する */ まで読み飛ばす。
+                Some('*') => {
+                    i += 2;
+                    loop {
+                        if i + 1 >= chars.len() {
+                            return Err(AwaError::UnterminatedComment);
+                        }
+                        if chars[i] == '*' && chars[i + 1] == '/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    tokens.push(Token::Slash);
+                    i += 1;
+                }
+            },
             // 2 文字演算子は次の文字を覗いて判定する。
             // chars.get(i + 1) は範囲外でも None を返すので安全に先読みできる。
             '=' => {
@@ -125,7 +173,6 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                     tokens.push(Token::NotEq);
                     i += 2;
                 } else {
-                    // 今は単独の '!' に意味がない（論理否定は未実装）
                     return Err(AwaError::UnexpectedChar('!'));
                 }
             }
@@ -159,16 +206,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                 tokens.push(Token::Star);
                 i += 1;
             }
-            '/' => {
-                tokens.push(Token::Slash);
-                i += 1;
-            }
             '(' => {
                 tokens.push(Token::LParen);
+                paren_depth += 1;
                 i += 1;
             }
             ')' => {
                 tokens.push(Token::RParen);
+                paren_depth = (paren_depth - 1).max(0);
                 i += 1;
             }
             '{' => {
@@ -189,12 +234,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                     i += 1;
                 }
                 let s: String = chars[start..i].iter().collect();
-                // parse は Result を返す。unwrap せず map_err で AwaError に変換し ? で伝播。
                 let n: f64 = s.parse().map_err(|_| AwaError::InvalidNumber(s.clone()))?;
                 tokens.push(Token::Num(n));
             }
             // 識別子: 英字または _ で始まり、英数字または _ が続く。
-            // 予約語 "let" だけは専用トークンに振り分ける（残りは変数名）。
+            // 予約語だけは専用トークンに振り分ける（残りは変数名）。
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -228,18 +272,21 @@ enum Expr {
     Var(String),    // 変数参照
     Neg(Box<Expr>), // 単項マイナス（例: -3, -(x + 1)）
     BinOp(Box<Expr>, Token, Box<Expr>),
-    // if 条件 { 真の腕 } else { 偽の腕 }。三項とも式。
+    // if 条件 { ブロック } else { ブロック }。三項とも式。
     If(Box<Expr>, Box<Expr>, Box<Expr>),
-    // 無名関数 fn(引数,...) { 本体 }。引数名のリストと本体の式。
+    // 無名関数 fn(引数,...) { 本体ブロック }。引数名のリストと本体の式。
     Lambda(Vec<String>, Box<Expr>),
     // 関数呼び出し callee(引数,...)。callee も式（変数とは限らない）。
     Call(Box<Expr>, Vec<Expr>),
+    // ブロック { 文; ...; 式 }。新しいスコープを作り、最後の文が式ならその値、
+    // そうでなければ（空 or 末尾が let なら）Unit を返す式。
+    Block(Vec<Stmt>),
 }
 
-// 文（statement）。プログラムは文の並び。
+// 文（statement）。プログラムやブロックは文の並び。
 //   let x = expr   → 変数束縛（値は返さず env を更新する）
 //   expr           → 式文（評価して結果を表示する）
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Stmt {
     Let(String, Expr),
     Expr(Expr),
@@ -254,6 +301,8 @@ enum Value {
     Num(f64),
     Bool(bool),
     Func(Rc<Closure>),
+    // 空の値（Gleam の Nil 相当）。末尾が式でないブロックや空ブロックの値。
+    Unit,
 }
 
 // クロージャ = 関数 + 定義時の環境。
@@ -271,14 +320,14 @@ struct Closure {
     name: Option<String>,
 }
 
-// Value 同士の等価比較。Num/Bool は中身で比較。関数は等価性を定義しない
-// （同一性比較は混乱のもとなので、常に false とする）。
-// derive せず手書きにしたのは、Closure に PartialEq が無いため。
+// Value 同士の等価比較。Num/Bool/Unit は中身で比較。関数は等価性を定義しない
+// （常に false）。derive せず手書きにしたのは Closure に PartialEq が無いため。
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Num(a), Value::Num(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Unit, Value::Unit) => true,
             _ => false,
         }
     }
@@ -290,6 +339,7 @@ impl fmt::Display for Value {
             Value::Num(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Func(c) => write!(f, "<fn/{}>", c.params.len()),
+            Value::Unit => write!(f, "Nil"),
         }
     }
 }
@@ -300,6 +350,7 @@ fn type_name(v: &Value) -> &'static str {
         Value::Num(_) => "Num",
         Value::Bool(_) => "Bool",
         Value::Func(_) => "Func",
+        Value::Unit => "Nil",
     }
 }
 
@@ -308,6 +359,8 @@ type Env = HashMap<String, Value>;
 
 // ===== 構文解析（Parser）=====
 // 再帰下降パーサ。優先順位を文法の階層で表現する（上ほど緩い＝後で結合）。
+//   program    = (stmt terminator)* stmt?
+//   stmt       = 'let' Ident '=' expr | expr
 //   expr       = equality
 //   equality   = comparison (('==' | '!=') comparison)*
 //   comparison = additive  (('<' | '>' | '<=' | '>=') additive)*
@@ -316,10 +369,12 @@ type Env = HashMap<String, Value>;
 //   unary      = '-' unary | call
 //   call       = factor ('(' args? ')')*
 //   args       = expr (',' expr)*
-//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda
-//   if         = 'if' expr '{' expr '}' 'else' '{' expr '}'
-//   lambda     = 'fn' '(' params? ')' '{' expr '}'
+//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block
+//   if         = 'if' expr block 'else' block
+//   lambda     = 'fn' '(' params? ')' block
+//   block      = '{' (stmt terminator)* stmt? '}'
 //   params     = Ident (',' Ident)*
+// 文の区切り（terminator）は ; または改行（字句解析が自動挿入）。
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -341,7 +396,6 @@ impl Parser {
     }
 
     // 期待するトークンを 1 つ消費する。違っていればエラー。
-    // if の then / else や ( ) の対応チェックに使う。
     fn expect(&mut self, expected: Token) -> Result<(), AwaError> {
         match self.next() {
             Some(t) if t == expected => Ok(()),
@@ -350,15 +404,47 @@ impl Parser {
         }
     }
 
-    // プログラム = 文の並び。各文は ; で終端する。
+    // 連続する終端（; や改行由来）を読み飛ばす。空文・空行を吸収する。
+    fn skip_terminators(&mut self) {
+        while let Some(Token::Terminator) = self.peek() {
+            self.next();
+        }
+    }
+
+    // プログラム = 文の並び。文と文の間には終端が必要、末尾の終端は任意。
     fn parse_program(&mut self) -> Result<Vec<Stmt>, AwaError> {
         let mut stmts = Vec::new();
+        self.skip_terminators();
         while self.peek().is_some() {
             stmts.push(self.parse_stmt()?);
-            // 各文の後に ; を必須とする（終端方式）。
-            self.expect(Token::Semicolon)?;
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                None => break, // 末尾の終端は省略可
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            }
         }
         Ok(stmts)
+    }
+
+    // ブロック { 文; ...; 式 }。'{' は呼び出し側が消費済みとして '}' まで読む。
+    // プログラムと同じ「文 + 終端」の繰り返しだが、終わりが } になる。
+    fn parse_block(&mut self) -> Result<Expr, AwaError> {
+        let mut stmts = Vec::new();
+        self.skip_terminators();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(AwaError::UnexpectedEof);
+            }
+            stmts.push(self.parse_stmt()?);
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                Some(Token::RBrace) => break, // } の直前の終端は省略可
+                None => return Err(AwaError::UnexpectedEof),
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(Expr::Block(stmts))
     }
 
     // 文 = `let ident = expr`（束縛）または `expr`（式文）。
@@ -370,11 +456,7 @@ impl Parser {
                 Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
                 None => return Err(AwaError::UnexpectedEof),
             };
-            match self.next() {
-                Some(Token::Equal) => {}
-                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-                None => return Err(AwaError::UnexpectedEof),
-            }
+            self.expect(Token::Equal)?;
             let value = self.parse_expr()?;
             Ok(Stmt::Let(name, value))
         } else {
@@ -453,8 +535,6 @@ impl Parser {
 
     // 呼び出し層。factor を読んだ後、続く ( ... ) を貪欲に呼び出しとして畳む。
     // f(1)(2) のような連鎖（高階関数の戻り値を即呼び出す）も自然に扱える。
-    //   call = factor ('(' args? ')')*
-    //   args = expr (',' expr)*
     fn parse_call(&mut self) -> Result<Expr, AwaError> {
         let mut expr = self.parse_factor()?;
         while let Some(Token::LParen) = self.peek() {
@@ -483,7 +563,7 @@ impl Parser {
             Some(Token::Num(n)) => Ok(Expr::Num(n)),
             Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
             Some(Token::Ident(name)) => Ok(Expr::Var(name)),
-            // 無名関数 fn(引数, ...) { 本体 }。引数名を読み、本体を波括弧で囲む。
+            // 無名関数 fn(引数, ...) { 本体ブロック }。
             Some(Token::Fn) => {
                 self.expect(Token::LParen)?;
                 let mut params = Vec::new();
@@ -506,35 +586,29 @@ impl Parser {
                 }
                 self.expect(Token::RParen)?;
                 self.expect(Token::LBrace)?;
-                let body = self.parse_expr()?;
-                self.expect(Token::RBrace)?;
+                let body = self.parse_block()?;
                 Ok(Expr::Lambda(params, Box::new(body)))
             }
-            // 'if' は既に消費済み。Rust 風: if 条件 { 真の腕 } else { 偽の腕 }。
-            // 波括弧で腕を囲むので、ML 風の then/else と違い境界が明確。
-            // 今は各腕に式 1 つだけ（将来ここを複数文のブロックに拡張できる）。
+            // if 条件 { ブロック } else { ブロック }。各腕はブロック式。
             Some(Token::If) => {
                 let cond = self.parse_expr()?;
                 self.expect(Token::LBrace)?;
-                let then_branch = self.parse_expr()?;
-                self.expect(Token::RBrace)?;
+                let then_branch = self.parse_block()?;
                 self.expect(Token::Else)?;
                 self.expect(Token::LBrace)?;
-                let else_branch = self.parse_expr()?;
-                self.expect(Token::RBrace)?;
+                let else_branch = self.parse_block()?;
                 Ok(Expr::If(
                     Box::new(cond),
                     Box::new(then_branch),
                     Box::new(else_branch),
                 ))
             }
+            // 単独のブロック式 { ... }。
+            Some(Token::LBrace) => self.parse_block(),
             Some(Token::LParen) => {
                 let e = self.parse_expr()?;
-                match self.next() {
-                    Some(Token::RParen) => Ok(e),
-                    Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-                    None => Err(AwaError::UnexpectedEof),
-                }
+                self.expect(Token::RParen)?;
+                Ok(e)
             }
             Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
             None => Err(AwaError::UnexpectedEof),
@@ -544,7 +618,7 @@ impl Parser {
 
 // ===== 評価（Evaluator）=====
 
-// 値から f64 を取り出す。Bool だったら型エラー（算術・比較は数値専用）。
+// 値から f64 を取り出す。数値でなければ型エラー（算術・比較は数値専用）。
 fn as_num(v: Value) -> Result<f64, AwaError> {
     match v {
         Value::Num(n) => Ok(n),
@@ -555,7 +629,7 @@ fn as_num(v: Value) -> Result<f64, AwaError> {
     }
 }
 
-// 値から bool を取り出す。Num だったら型エラー（if の条件は Bool 専用）。
+// 値から bool を取り出す。真偽値でなければ型エラー（if の条件は Bool 専用）。
 fn as_bool(v: Value) -> Result<bool, AwaError> {
     match v {
         Value::Bool(b) => Ok(b),
@@ -563,6 +637,20 @@ fn as_bool(v: Value) -> Result<bool, AwaError> {
             expected: "Bool",
             found: type_name(&other),
         }),
+    }
+}
+
+// 関数値に名前を刻む（再帰のため）。関数以外はそのまま返す。
+// let で束縛するときに使い、呼び出し時に「名前→自分自身」を注入できるようにする。
+fn bind_name(value: Value, name: &str) -> Value {
+    match value {
+        Value::Func(c) => Value::Func(Rc::new(Closure {
+            params: c.params.clone(),
+            body: c.body.clone(),
+            env: c.env.clone(),
+            name: Some(name.to_string()),
+        })),
+        other => other,
     }
 }
 
@@ -576,7 +664,6 @@ fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
             .get(name)
             .cloned()
             .ok_or_else(|| AwaError::UndefinedVariable(name.clone())),
-        // 単項マイナスは数値専用。Bool に書くと型エラー。
         Expr::Neg(operand) => Ok(Value::Num(-as_num(eval_expr(operand, env)?)?)),
         Expr::BinOp(left, op, right) => {
             let l = eval_expr(left, env)?;
@@ -592,8 +679,7 @@ fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
             }
         }
         // 無名関数を評価すると Closure（関数 + 現在の環境のコピー）になる。
-        // env.clone() がキャプチャの実体。ここで包んだ env を、呼び出し時に
-        // 引数を足したスコープのベースとして使う。
+        // env.clone() がキャプチャの実体。呼び出し時にこの env をベースに使う。
         Expr::Lambda(params, body) => Ok(Value::Func(Rc::new(Closure {
             params: params.clone(),
             body: (**body).clone(),
@@ -624,7 +710,6 @@ fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
             // （レキシカルスコープ）で、呼び出し側 env ではない。
             let mut call_env = closure.env.clone();
             // 再帰のため、名前付き関数なら「名前→自分自身」を call_env に入れる。
-            // これでクロージャ生成時には未束縛だった自分の名前を、本体から呼べる。
             if let Some(name) = &closure.name {
                 call_env.insert(name.clone(), Value::Func(closure.clone()));
             }
@@ -633,6 +718,24 @@ fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
                 call_env.insert(param.clone(), value);
             }
             eval_expr(&closure.body, &call_env)
+        }
+        // ブロックは新しいスコープ。親 env をコピーして始め、抜けると破棄する
+        // （ブロック内の let は外に漏れない）。値は最後の文が式ならその値、
+        // そうでなければ（空 or 末尾が let）Unit。
+        Expr::Block(stmts) => {
+            let mut block_env = env.clone();
+            let mut value = Value::Unit;
+            for stmt in stmts {
+                value = match stmt {
+                    Stmt::Let(name, e) => {
+                        let v = bind_name(eval_expr(e, &block_env)?, name);
+                        block_env.insert(name.clone(), v);
+                        Value::Unit // let 文はブロック値に寄与しない
+                    }
+                    Stmt::Expr(e) => eval_expr(e, &block_env)?,
+                };
+            }
+            Ok(value)
         }
     }
 }
@@ -655,7 +758,6 @@ fn eval_binop(l: Value, op: &Token, r: Value) -> Result<Value, AwaError> {
         Token::Gt => Ok(Value::Bool(as_num(l)? > as_num(r)?)),
         Token::Le => Ok(Value::Bool(as_num(l)? <= as_num(r)?)),
         Token::Ge => Ok(Value::Bool(as_num(l)? >= as_num(r)?)),
-        // == / != は同じ型同士のみ比較できる。Num と Bool の比較は型エラー。
         Token::EqEq => Ok(Value::Bool(values_equal(l, r)?)),
         Token::NotEq => Ok(Value::Bool(!values_equal(l, r)?)),
         _ => unreachable!(),
@@ -666,6 +768,7 @@ fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
     match (l, r) {
         (Value::Num(a), Value::Num(b)) => Ok(a == b),
         (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
+        (Value::Unit, Value::Unit) => Ok(true),
         (l, r) => Err(AwaError::TypeError {
             expected: type_name(&l),
             found: type_name(&r),
@@ -673,31 +776,12 @@ fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
     }
 }
 
-// プログラム（文の並び）を順に評価し、各文の値を順に返す。
-// env は呼び出し側が所有して渡す（REPL は行をまたいで使い回す）。
-//
-// 「計算」だけを行い「表示」はしない純粋関数にしてある。こうすると
-// テストは戻り値の Vec<Value> を assert するだけで済む（I/O と分離）。
-// Let も束縛した値を結果に含める（REPL でその場で確認しやすい）。
 fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
     let mut results = Vec::new();
     for stmt in stmts {
         let value = match stmt {
             Stmt::Let(name, expr) => {
-                let value = eval_expr(expr, env)?;
-                // 関数を let で束縛するときは、その名前をクロージャに刻む。
-                // これで呼び出し時に「名前→自分自身」を注入でき、再帰が成立する。
-                // Rc の中身は不変なので、名前を入れた新しい Closure を作り直す。
-                let value = match value {
-                    Value::Func(c) => Value::Func(Rc::new(Closure {
-                        params: c.params.clone(),
-                        body: c.body.clone(),
-                        env: c.env.clone(),
-                        name: Some(name.clone()),
-                    })),
-                    other => other,
-                };
-                // Value はもう Copy ではないので、env に入れる分を clone する。
+                let value = bind_name(eval_expr(expr, env)?, name);
                 env.insert(name.clone(), value.clone());
                 value
             }
@@ -708,10 +792,6 @@ fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
     Ok(results)
 }
 
-// ===== パイプライン =====
-// tokenize → parse → eval を ? で連結。どこで失敗しても Err が呼び出し側へ伝わる。
-// env を借用で受け取るので、ファイル実行（使い捨て env）も REPL（持ち越す env）も
-// この 1 つの関数で賄える。
 fn run(source: &str, env: &mut Env) -> Result<Vec<Value>, AwaError> {
     let tokens = tokenize(source)?;
     let mut parser = Parser::new(tokens);
@@ -720,8 +800,6 @@ fn run(source: &str, env: &mut Env) -> Result<Vec<Value>, AwaError> {
 }
 
 // ===== ファイル実行 =====
-// .awa ファイルを読んで一括実行する。エラーが出たら表示して終了する
-// （REPL と違い、続行はしない）。
 fn run_file(path: &str) {
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -730,7 +808,6 @@ fn run_file(path: &str) {
             std::process::exit(1);
         }
     };
-    // ファイル実行では env は使い捨て（プログラムの実行中だけ生きる）。
     let mut env: Env = HashMap::new();
     match run(&source, &mut env) {
         Ok(values) => {
@@ -746,26 +823,6 @@ fn run_file(path: &str) {
 }
 
 // ===== REPL（対話実行）=====
-// 1 行読んでは評価する。env はループの外で持つので、let で束縛した変数を
-// 次の行から参照できる（セッション状態）。
-//
-// TODO(あなた): REPL のループ本体を実装してください。
-//
-// 使える道具:
-//   - stdin から 1 行読む:
-//         let mut line = String::new();
-//         let n = stdin.read_line(&mut line)?;   // n == 0 なら EOF（Ctrl-D）
-//   - 評価: run(&line, &mut env) が Result<Vec<Value>, AwaError> を返す。
-//
-// 実装の指針（ここが設計判断）:
-//   1. ループで「プロンプト表示 → 1 行読む → 評価」を繰り返す。
-//   2. read_line が 0（EOF, Ctrl-D）を返したらループを抜ける。
-//   3. ★重要★ run がエラーを返しても REPL は落とさず、エラーを表示して
-//      次の入力へ進む（ファイル実行とは逆の方針）。
-//   4. 空行（改行だけ）は評価をスキップしてよい（お好みで）。
-//
-// 参考: プロンプトは print! の後に stdout().flush() しないと表示されない
-// （println! と違い print! は改行が無く、行バッファのまま出ないことがある）。
 fn repl() -> std::io::Result<()> {
     println!("awa REPL — Ctrl-D で終了");
     let mut env: Env = HashMap::new();
@@ -776,7 +833,7 @@ fn repl() -> std::io::Result<()> {
         let mut line = String::new();
         let n = stdin.read_line(&mut line);
         if n? == 0 {
-            break; // EOF
+            break;
         }
         let result = run(&line, &mut env);
         match result {
@@ -792,8 +849,6 @@ fn repl() -> std::io::Result<()> {
 }
 
 fn main() {
-    // 引数: awa <file> ならファイル実行、引数なしなら REPL。
-    // args().nth(1) は最初の引数（args[0] は実行ファイル名なので飛ばす）。
     match std::env::args().nth(1) {
         Some(path) => run_file(&path),
         None => {
@@ -812,7 +867,7 @@ mod tests {
 
     fn eval(src: &str) -> Result<Value, AwaError> {
         let mut env = Env::new();
-        run(src, &mut env).map(|values| values.last().expect("少なくとも 1 文を期待").clone())
+        run(src, &mut env).map(|values| values.last().cloned().unwrap_or(Value::Unit))
     }
 
     fn num(n: f64) -> Value {
@@ -821,46 +876,46 @@ mod tests {
 
     #[test]
     fn 演算子優先順位() {
-        assert_eq!(eval("1 + 2 * 3;"), Ok(num(7.0)));
-        assert_eq!(eval("(1 + 2) * 3;"), Ok(num(9.0)));
-        assert_eq!(eval("2 * (3 + 4) - 1;"), Ok(num(13.0)));
+        assert_eq!(eval("1 + 2 * 3"), Ok(num(7.0)));
+        assert_eq!(eval("(1 + 2) * 3"), Ok(num(9.0)));
+        assert_eq!(eval("2 * (3 + 4) - 1"), Ok(num(13.0)));
     }
 
     #[test]
     fn 変数束縛は後続の文から参照できる() {
-        assert_eq!(eval("let x = 5; let y = x * 2 + 1; x + y;"), Ok(num(16.0)));
+        assert_eq!(eval("let x = 5; let y = x * 2 + 1; x + y"), Ok(num(16.0)));
     }
 
     #[test]
     fn 単項マイナスは乗算より強く結合する() {
-        assert_eq!(eval("-2 * 5;"), Ok(num(-10.0)));
-        assert_eq!(eval("--3;"), Ok(num(3.0)));
+        assert_eq!(eval("-2 * 5"), Ok(num(-10.0)));
+        assert_eq!(eval("--3"), Ok(num(3.0)));
     }
 
     #[test]
     fn if_は選ばれた腕だけを評価する() {
-        assert_eq!(eval("let x = 0; if x == 0 { 100 } else { 1 / x };"), Ok(num(100.0)));
+        assert_eq!(eval("let x = 0; if x == 0 { 100 } else { 1 / x }"), Ok(num(100.0)));
     }
 
     #[test]
     fn 比較は加減算より弱く結合する() {
-        assert_eq!(eval("1 + 2 == 3;"), Ok(Value::Bool(true)));
+        assert_eq!(eval("1 + 2 == 3"), Ok(Value::Bool(true)));
     }
 
     #[test]
     fn ゼロ除算はエラー() {
-        assert_eq!(eval("1 / 0;"), Err(AwaError::DivisionByZero));
+        assert_eq!(eval("1 / 0"), Err(AwaError::DivisionByZero));
     }
 
     #[test]
     fn 未定義変数はエラー() {
-        assert_eq!(eval("q + 1;"), Err(AwaError::UndefinedVariable("q".to_string())));
+        assert_eq!(eval("q + 1"), Err(AwaError::UndefinedVariable("q".to_string())));
     }
 
     #[test]
     fn 型エラー_boolに算術() {
         assert_eq!(
-            eval("true + 1;"),
+            eval("true + 1"),
             Err(AwaError::TypeError { expected: "Num", found: "Bool" })
         );
     }
@@ -868,7 +923,7 @@ mod tests {
     #[test]
     fn 型エラー_ifの条件が数値() {
         assert_eq!(
-            eval("if 1 { 2 } else { 3 };"),
+            eval("if 1 { 2 } else { 3 }"),
             Err(AwaError::TypeError { expected: "Bool", found: "Num" })
         );
     }
@@ -876,7 +931,7 @@ mod tests {
     #[test]
     fn 型エラー_numとboolの比較() {
         assert_eq!(
-            eval("1 == true;"),
+            eval("1 == true"),
             Err(AwaError::TypeError { expected: "Num", found: "Bool" })
         );
     }
@@ -884,29 +939,25 @@ mod tests {
     #[test]
     fn repl_env持ち越し() {
         let mut env = Env::new();
-        assert_eq!(run("let x = 10;", &mut env), Ok(vec![Value::Num(10.0)]));
-        assert_eq!(run("x + 5;", &mut env), Ok(vec![Value::Num(15.0)]));
+        assert_eq!(run("let x = 10", &mut env), Ok(vec![Value::Num(10.0)]));
+        assert_eq!(run("x + 5", &mut env), Ok(vec![Value::Num(15.0)]));
     }
 
     #[test]
     fn 括弧の対応が壊れた入力() {
-        assert_eq!(eval("(1 + 2;"), Err(AwaError::UnexpectedToken("Semicolon".to_string())));
-    }
-
-    #[test]
-    fn セミコロン無しはエラー() {
-        assert_eq!(eval("1 + 2"), Err(AwaError::UnexpectedEof));
+        // (1 + 2 ; → ) を期待した位置で終端（;）が来る
+        assert_eq!(eval("(1 + 2;"), Err(AwaError::UnexpectedToken("Terminator".to_string())));
     }
 
     #[test]
     fn 基本的な関数呼び出し() {
-        assert_eq!(eval("let add = fn(a, b) { a + b }; add(1, 2);"), Ok(num(3.0)));
+        assert_eq!(eval("let add = fn(a, b) { a + b }; add(1, 2)"), Ok(num(3.0)));
     }
 
     #[test]
     fn クロージャは定義時の変数を捕捉する() {
         assert_eq!(
-            eval("let make_adder = fn(n) { fn(x) { x + n } }; let add5 = make_adder(5); add5(10);"),
+            eval("let make_adder = fn(n) { fn(x) { x + n } }; let add5 = make_adder(5); add5(10)"),
             Ok(num(15.0))
         );
     }
@@ -914,7 +965,7 @@ mod tests {
     #[test]
     fn 高階関数_関数を引数に渡せる() {
         assert_eq!(
-            eval("let inc = fn(x) { x + 1 }; let twice = fn(f, x) { f(f(x)) }; twice(inc, 0);"),
+            eval("let inc = fn(x) { x + 1 }; let twice = fn(f, x) { f(f(x)) }; twice(inc, 0)"),
             Ok(num(2.0))
         );
     }
@@ -922,7 +973,7 @@ mod tests {
     #[test]
     fn 再帰関数() {
         assert_eq!(
-            eval("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5);"),
+            eval("let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)"),
             Ok(num(120.0))
         );
     }
@@ -930,7 +981,7 @@ mod tests {
     #[test]
     fn レキシカルスコープ_呼び出し場所の変数は見えない() {
         assert_eq!(
-            eval("let f = fn() { x }; let x = 99; f();"),
+            eval("let f = fn() { x }; let x = 99; f()"),
             Err(AwaError::UndefinedVariable("x".to_string()))
         );
     }
@@ -938,19 +989,92 @@ mod tests {
     #[test]
     fn 引数の個数が合わないとエラー() {
         assert_eq!(
-            eval("let add = fn(a, b) { a + b }; add(1);"),
+            eval("let add = fn(a, b) { a + b }; add(1)"),
             Err(AwaError::ArityMismatch { expected: 2, found: 1 })
         );
     }
 
     #[test]
     fn 関数でない値の呼び出しはエラー() {
-        assert_eq!(eval("let x = 5; x(1);"), Err(AwaError::NotCallable("Num")));
+        assert_eq!(eval("let x = 5; x(1)"), Err(AwaError::NotCallable("Num")));
+    }
+
+    // ===== Scala 風の文法（ASI・ブロック・Unit・コメント）=====
+
+    #[test]
+    fn セミコロン無しでも単文は評価できる() {
+        // 終端も改行もない単一の式。末尾の終端は省略可。
+        assert_eq!(eval("1 + 2"), Ok(num(3.0)));
     }
 
     #[test]
-    fn 複数行に折り返した式() {
-        // 改行は空白扱い。式が複数行にまたがれる。
-        assert_eq!(eval("1 +\n2 +\n3;"), Ok(num(6.0)));
+    fn 改行が文の区切りになる() {
+        // セミコロン無しでも改行で 2 文に分かれる（自動セミコロン推論）。
+        let mut env = Env::new();
+        assert_eq!(
+            run("let x = 5\nx + 1", &mut env),
+            Ok(vec![Value::Num(5.0), Value::Num(6.0)])
+        );
+    }
+
+    #[test]
+    fn 演算子の直後の改行は継続扱い() {
+        // 行末が + なので改行は区切りにならず、式が次行へ続く。
+        assert_eq!(eval("1 +\n2 +\n3"), Ok(num(6.0)));
+    }
+
+    #[test]
+    fn 区切り無しで式が連続するとエラー() {
+        // 1 行に区切り無しで 2 式 → 2 つ目でエラー。
+        assert_eq!(eval("1 2"), Err(AwaError::UnexpectedToken("Num(2.0)".to_string())));
+    }
+
+    #[test]
+    fn ブロックの値は末尾の式() {
+        assert_eq!(eval("let v = { let a = 2; a * 3 }; v"), Ok(num(6.0)));
+    }
+
+    #[test]
+    fn ブロックは新しいスコープを作る() {
+        // ブロック内の let は外に漏れない。最後の a は外側の 1。
+        assert_eq!(eval("let a = 1; { let a = 99; a }; a"), Ok(num(1.0)));
+    }
+
+    #[test]
+    fn 末尾がletのブロックはunit() {
+        assert_eq!(eval("{ let a = 1 }"), Ok(Value::Unit));
+    }
+
+    #[test]
+    fn 空ブロックはunit() {
+        assert_eq!(eval("{}"), Ok(Value::Unit));
+    }
+
+    #[test]
+    fn 関数本体に複数文ブロック() {
+        assert_eq!(
+            eval("let f = fn(x) { let y = x * 2; y + 1 }; f(10)"),
+            Ok(num(21.0))
+        );
+    }
+
+    #[test]
+    fn 行コメントは無視される() {
+        assert_eq!(eval("1 + 2 // これは無視される\n"), Ok(num(3.0)));
+    }
+
+    #[test]
+    fn ブロックコメントは無視される() {
+        assert_eq!(eval("1 + /* 途中の */ 2"), Ok(num(3.0)));
+    }
+
+    #[test]
+    fn 閉じないブロックコメントはエラー() {
+        assert_eq!(eval("1 + /* 閉じない"), Err(AwaError::UnterminatedComment));
+    }
+
+    #[test]
+    fn 括弧内は改行を無視して複数行に書ける() {
+        assert_eq!(eval("let add = fn(a, b) { a + b }; add(\n1,\n2\n)"), Ok(num(3.0)));
     }
 }

@@ -1,6 +1,14 @@
-let x = 5;
-let y = x * 2 + 1;
-x + y;
-if x < y { x } else { y };
-let abs = if x - 10 < 0 { -(x - 10) } else { x - 10 };
-abs;
+// awa の基本機能のデモ（セミコロンは不要。改行が文の区切り）
+let x = 5
+let y = x * 2 + 1
+x + y
+
+// if は式。各腕はブロック
+if x < y { x } else { y }
+
+// ブロックは新しいスコープを作り、末尾の式が値になる
+let abs = {
+  let d = x - 10
+  if d < 0 { -d } else { d }
+}
+abs

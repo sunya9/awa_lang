@@ -1,12 +1,22 @@
-let add = fn(a, b) { a + b };
-add(1, 2);
+// 第一級関数・クロージャ・再帰のデモ（Scala 風: セミコロン不要）
+let add = fn(a, b) { a + b }
+add(1, 2)
 
-let make_adder = fn(n) { fn(x) { x + n } };
-let add5 = make_adder(5);
-add5(10);
+// クロージャ: 返された関数が n を覚えている
+let make_adder = fn(n) { fn(x) { x + n } }
+let add5 = make_adder(5)
+add5(10)
 
-let apply_twice = fn(f, x) { f(f(x)) };
-apply_twice(add5, 0);
+// 高階関数: 関数を引数に渡す
+let apply_twice = fn(f, x) { f(f(x)) }
+apply_twice(add5, 0)
 
-let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } };
-fact(5);
+// 再帰と複数文ブロック
+let fact = fn(n) {
+  if n == 0 {
+    1
+  } else {
+    n * fact(n - 1)
+  }
+}
+fact(5)
