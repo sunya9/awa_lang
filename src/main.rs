@@ -1788,9 +1788,11 @@ mod tests {
             let n = s.read(&mut buf).ok()?;
             Some(String::from_utf8_lossy(&buf[..n]).to_string())
         })();
-        let _ = child.wait();
+        let status = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(echoed.as_deref(), Some("hello awa socket"));
+        // 継続 env も解放されるのでサーバは終了コード 0（リークなし）。
+        assert_eq!(status.ok().and_then(|s| s.code()), Some(0), "サーバがリークしている");
     }
 
     #[test]
@@ -1810,12 +1812,13 @@ mod tests {
     #[test]
     fn codegen_async_がネイティブ実行される() {
         // do/Future が C ランタイムのイベントループ上で native 実行される（インタプリタと一致）。
-        // 終了コードは継続クロージャの env リークで非0になりうるので stdout のみ確認。
-        let out = compile_and_run(
+        // 継続 env もランタイムが release するので終了コード 0（リークなし）。
+        let (out, code) = compile_run_status(
             "run(do { x <- delay(10, 1); y <- delay(5, 2); pure(x + y) })\n\
              run(delay(3, 20).map(fn(n: Int) -> Int { n + 1 }))",
         );
         assert_eq!(out, "3\n21\n");
+        assert_eq!(code, 0, "継続 env がリークしている（残存 {}）", code);
     }
 
     #[test]

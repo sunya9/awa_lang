@@ -81,6 +81,16 @@ long long awa_now(void) {
 // ===== 非同期イベントループ =====
 typedef long long Word;
 typedef Word (*ContFn)(void* state, Word x);
+
+// awa の参照カウント解放（codegen が .ll に定義）。継続クロージャの env を解放するのに使う。
+extern void awa_release(void* obj);
+// 継続の state（codegen が作った {fn, env} の 16 バイト）を後始末する。
+// owning convention 上、env の所有権はランタイムへ移っているので、発火後に release する。
+static void release_cont(void* state) {
+  void* env = *(void**)((char*)state + 8);
+  awa_release(env); // env が null（捕獲なし）なら awa_release 側で無視される
+  free(state);
+}
 typedef struct Waiter { int kind; long g; ContFn fn; void* state; struct Waiter* next; } Waiter;
 typedef struct { int resolved; Word value; Waiter* waiters; } Future;
 static Future* futs = 0;
@@ -122,21 +132,21 @@ static void resolve(long id, Word v) {
   while (w) {
     Waiter* next = w->next;
     if (w->kind == 0) resolve(w->g, v);
-    else if (w->kind == 1) { long h = w->fn(w->state, v); link_fut(h, w->g); }
-    else { Word y = w->fn(w->state, v); resolve(w->g, y); }
+    else if (w->kind == 1) { long h = w->fn(w->state, v); release_cont(w->state); link_fut(h, w->g); }
+    else { Word y = w->fn(w->state, v); release_cont(w->state); resolve(w->g, y); }
     free(w);
     w = next;
   }
 }
 long awa_future_flatmap(long f, ContFn fn, void* state) {
   long g = new_future(0, 0);
-  if (futs[f].resolved) { long h = fn(state, futs[f].value); link_fut(h, g); }
+  if (futs[f].resolved) { long h = fn(state, futs[f].value); release_cont(state); link_fut(h, g); }
   else { Waiter* w = (Waiter*)malloc(sizeof(Waiter)); w->kind = 1; w->g = g; w->fn = fn; w->state = state; w->next = futs[f].waiters; futs[f].waiters = w; }
   return g;
 }
 long awa_future_map(long f, ContFn fn, void* state) {
   long g = new_future(0, 0);
-  if (futs[f].resolved) { Word y = fn(state, futs[f].value); resolve(g, y); }
+  if (futs[f].resolved) { Word y = fn(state, futs[f].value); release_cont(state); resolve(g, y); }
   else { Waiter* w = (Waiter*)malloc(sizeof(Waiter)); w->kind = 2; w->g = g; w->fn = fn; w->state = state; w->next = futs[f].waiters; futs[f].waiters = w; }
   return g;
 }
