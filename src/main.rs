@@ -1005,6 +1005,31 @@ mod tests {
     }
 
     #[test]
+    fn gc_クロージャがリークしない() {
+        // make_adder のクロージャ（env を malloc）を複数回呼び、env が最後に解放されること。
+        let (out, code) = compile_run_status(
+            "let mk = fn(n: Int) { fn(x: Int) -> Int { x + n } }\n\
+             let add5 = mk(5)\n\
+             add5(10)\n\
+             add5(20)",
+        );
+        assert_eq!(out, "15\n25\n");
+        assert_eq!(code, 0, "クロージャ env がリークしている（残存 {}）", code);
+    }
+
+    #[test]
+    fn gc_文字列を捕獲したクロージャがリークしない() {
+        // env が動的文字列を捕獲 → env の drop_fn がそれを解放すること。
+        let (out, code) = compile_run_status(
+            "let mk = fn(s: String) { fn(x: Int) -> String { s } }\n\
+             let f = mk(\"a\" <> \"b\")\n\
+             f(0)",
+        );
+        assert_eq!(out, "ab\n");
+        assert_eq!(code, 0, "文字列を捕獲したクロージャがリークしている（残存 {}）", code);
+    }
+
+    #[test]
     fn codegen_再帰factがネイティブ実行される() {
         let out = compile_and_run(
             "let fact = fn(n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)",

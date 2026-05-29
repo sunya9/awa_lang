@@ -398,18 +398,39 @@ impl Gen {
 
     // 値の所有権を 1 増やす（owning convention の「変数を読む＝新たな所有参照を作る」）。
     // ヒープ型のみ対象。スカラ（Int/Bool 等）は何もしない。
-    // 文字列(M2a)・ADT(M2b) は ptr 直接。クロージャ(env) は M2c で追加する。
+    // 文字列(M2a)・ADT(M2b) は ptr 直接、クロージャ(M2c) は env ptr に対して行う。
     fn retain(&mut self, val: &str, ty: &Type) {
-        if matches!(ty, Type::Str | Type::Con(..)) {
-            self.line(&format!("call void @awa_retain(ptr {})", val));
+        match ty {
+            Type::Str | Type::Con(..) => {
+                self.line(&format!("call void @awa_retain(ptr {})", val));
+            }
+            Type::Fun(..) => {
+                let env = self.closure_env(val);
+                self.line(&format!("call void @awa_retain(ptr {})", env));
+            }
+            _ => {}
         }
     }
 
     // 値の所有権を 1 減らす（スコープ脱出・値の破棄）。0 で解放。
     fn release(&mut self, val: &str, ty: &Type) {
-        if matches!(ty, Type::Str | Type::Con(..)) {
-            self.line(&format!("call void @awa_release(ptr {})", val));
+        match ty {
+            Type::Str | Type::Con(..) => {
+                self.line(&format!("call void @awa_release(ptr {})", val));
+            }
+            Type::Fun(..) => {
+                let env = self.closure_env(val);
+                self.line(&format!("call void @awa_release(ptr {})", env));
+            }
+            _ => {}
         }
+    }
+
+    // クロージャ値 { ptr fn, ptr env } から env ポインタを取り出す。
+    fn closure_env(&mut self, clos: &str) -> String {
+        let r = format!("%t{}", self.fresh());
+        self.line(&format!("{} = extractvalue {} {}, 1", r, CLOSURE_TY, clos));
+        r
     }
 
     fn bind_local(&mut self, name: &str, operand: &str, ty: &Type) -> Result<()> {
@@ -786,7 +807,7 @@ impl Gen {
         // RC ヘッダを初期化（rc=1、drop=null）。
         self.init_header(&p)?;
         // ヒープ型フィールドがあれば drop_fn をヘッダ(offset 8)に設定。
-        if let Some(dropname) = ensure_drop_fn(m, &field_tys)? {
+        if let Some(dropname) = ensure_drop_fn(m, &field_tys, &bty, 3, "b")? {
             let dp = format!("%t{}", self.fresh());
             self.line(&format!("{} = getelementptr i8, ptr {}, i64 8", dp, p));
             self.line(&format!("store ptr @{}, ptr {}", dropname, dp));
@@ -884,6 +905,8 @@ impl Gen {
             fnp,
             call_args.join(", ")
         ));
+        // クロージャ値は consume（呼び出し後に release）。関数は env を借用しただけ。
+        self.release(&clos, &callee.ty);
         Ok(r)
     }
 
@@ -981,6 +1004,13 @@ impl Gen {
             let env = format!("%t{}", self.fresh());
             self.line(&format!("{} = call ptr @malloc(i64 {})", env, sz));
             self.init_header(&env)?;
+            // env がヒープ型をキャプチャするなら drop_fn を設定（解放時に各キャプチャを release）。
+            let cap_tys: Vec<Type> = caps.iter().map(|(_, t)| t.clone()).collect();
+            if let Some(dropname) = ensure_drop_fn(m, &cap_tys, &env_ty, 2, "e")? {
+                let dp = format!("%t{}", self.fresh());
+                self.line(&format!("{} = getelementptr i8, ptr {}, i64 8", dp, env));
+                self.line(&format!("store ptr @{}, ptr {}", dropname, dp));
+            }
             // 各キャプチャを格納（現スコープから load → env に store）。index 2+i（ヘッダの後）。
             for (i, (cname, cty)) in caps.iter().enumerate() {
                 let cv = self.var(cname, cty, m)?;
@@ -1008,39 +1038,46 @@ impl Gen {
     }
 }
 
-// 構築子ブロックの drop_fn を生成（メモ化）。ヒープ型フィールドを release してから戻る。
+fn is_heap(t: &Type) -> bool {
+    matches!(t, Type::Str | Type::Con(..) | Type::Fun(..))
+}
+
+// ヒープオブジェクトの drop_fn を生成（メモ化）。ヒープ型の構成要素を release してから戻る。
 // release（フリー）自体は awa_release が行うので、drop_fn の役目は「子の参照を1つ減らす」こと。
-// ヒープ型フィールドが無ければ None（ヘッダの drop は null のまま＝解放するだけ）。
-// キーはフィールド型のレイアウト（同一レイアウトの別構築子は drop_fn を共有）。
-fn ensure_drop_fn(m: &mut Module, field_tys: &[Type]) -> Result<Option<String>> {
-    let has_heap = field_tys
-        .iter()
-        .any(|t| matches!(t, Type::Str | Type::Con(..) | Type::Fun(..)));
-    if !has_heap {
+// ヒープ要素が無ければ None（ヘッダの drop は null のまま＝解放するだけ）。
+// 構築子ブロック（base=3, prefix="b"）と env（base=2, prefix="e"）の両方で使う。
+// 同じ要素型でもレイアウト（struct_ty/base）が違えば drop ロジックも違うので prefix で名前を分ける。
+fn ensure_drop_fn(
+    m: &mut Module,
+    tys: &[Type],
+    struct_ty: &str,
+    base: usize,
+    prefix: &str,
+) -> Result<Option<String>> {
+    if !tys.iter().any(is_heap) {
         return Ok(None);
     }
-    let key: String = field_tys.iter().map(mangle_ty).collect::<Vec<_>>().join("_");
-    let name = format!("drop${}", key);
+    let key: String = tys.iter().map(mangle_ty).collect::<Vec<_>>().join("_");
+    let name = format!("drop${}${}", prefix, key);
     if m.drops.contains(&name) {
         return Ok(Some(name));
     }
     m.drops.insert(name.clone());
-    let bty = block_ty(field_tys)?;
     let mut g = Gen::new();
-    for (i, fty) in field_tys.iter().enumerate() {
-        if !matches!(fty, Type::Str | Type::Con(..) | Type::Fun(..)) {
+    for (i, ty) in tys.iter().enumerate() {
+        if !is_heap(ty) {
             continue;
         }
         let fp = format!("%t{}", g.fresh());
         g.line(&format!(
             "{} = getelementptr {}, ptr %o, i32 0, i32 {}",
             fp,
-            bty,
-            i + 3
+            struct_ty,
+            base + i
         ));
         let fv = format!("%t{}", g.fresh());
-        g.line(&format!("{} = load {}, ptr {}", fv, llvm_ty(fty)?, fp));
-        g.release(&fv, fty);
+        g.line(&format!("{} = load {}, ptr {}", fv, llvm_ty(ty)?, fp));
+        g.release(&fv, ty);
     }
     g.line("ret void");
     m.funcs
@@ -1076,6 +1113,8 @@ fn gen_function(
             ));
             let v = format!("%t{}", g.fresh());
             g.line(&format!("{} = load {}, ptr {}", v, llvm_ty(cty)?, fp));
+            // env から借りた参照を関数のローカルとして所有するため retain（epilogue で release）。
+            g.retain(&v, cty);
             g.bind_local(cname, &v, cty)?;
         }
     }
