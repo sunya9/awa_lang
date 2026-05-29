@@ -103,6 +103,37 @@ fn resolve_field(texpr: &TypeExpr, param_map: &HashMap<String, Type>) -> Result<
     }
 }
 
+// or パターンを or-free のパターン集合へ展開（入れ子は直積）。compile_case が複製アームに使う。
+fn expand_pattern(p: &Pattern) -> Vec<Pattern> {
+    match p {
+        Pattern::Or(alts) => alts.iter().flat_map(expand_pattern).collect(),
+        Pattern::Ctor(name, subs) => {
+            let ex: Vec<Vec<Pattern>> = subs.iter().map(expand_pattern).collect();
+            cartesian(&ex)
+                .into_iter()
+                .map(|c| Pattern::Ctor(name.clone(), c))
+                .collect()
+        }
+        other => vec![other.clone()],
+    }
+}
+
+fn cartesian(lists: &[Vec<Pattern>]) -> Vec<Vec<Pattern>> {
+    let mut acc = vec![Vec::new()];
+    for list in lists {
+        let mut next = Vec::new();
+        for prefix in &acc {
+            for item in list {
+                let mut row = prefix.clone();
+                row.push(item.clone());
+                next.push(row);
+            }
+        }
+        acc = next;
+    }
+    acc
+}
+
 // 構築子ブロックの LLVM 型: { i32 tag, field0, ... }。
 fn block_ty(field_tys: &[Type]) -> Result<String> {
     let mut parts = vec!["i32".to_string()];
@@ -127,6 +158,7 @@ struct Module {
     funcs: String,                          // 全関数定義
     fn_ctr: usize,                          // 匿名関数 @fnN の採番
     globals: HashMap<String, GlobalFn>,     // トップレベル関数名 → 定義（本体つき）
+    value_globals: HashMap<String, Type>,   // トップレベルの値 let 名 → 型（LLVM グローバル変数）
     instances: HashSet<String>,             // 発行済みの特殊化インスタンス（マングル名）
     ctors: HashMap<String, CtorInfo>,       // 構築子名 → 情報
     strings: String,                        // 文字列リテラルのグローバル定義
@@ -376,7 +408,14 @@ impl Gen {
         let res = format!("%v{}", self.fresh());
         self.line(&format!("{} = alloca {}", res, res_ty));
         let end = format!("end{}", self.fresh());
+        // or パターンを展開（A | B -> body を A -> body; B -> body に複製）。
+        let mut expanded: Vec<(Pattern, &TExpr)> = Vec::new();
         for (pat, body) in arms {
+            for p in expand_pattern(pat) {
+                expanded.push((p, body));
+            }
+        }
+        for (pat, body) in &expanded {
             let next = format!("arm{}", self.fresh());
             let saved = self.scope.clone();
             self.match_pattern_ir(pat, &sv, &sty, &next, m)?;
@@ -401,7 +440,7 @@ impl Gen {
         value: &str,
         value_ty: &Type,
         fail: &str,
-        m: &Module,
+        m: &mut Module,
     ) -> Result<()> {
         match pat {
             Pattern::Wildcard => Ok(()),
@@ -415,8 +454,20 @@ impl Gen {
                 self.eq_or_fail("i64", value, &v, fail);
                 Ok(())
             }
-            Pattern::Str(_) => unsupported("文字列パターン（codegen 未対応）"),
-            Pattern::Or(_) => unsupported("or パターン（codegen 未対応）"),
+            // 文字列パターンは strcmp で中身比較。
+            Pattern::Str(s) => {
+                let lit = m.intern_string(s);
+                let c = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i32 @strcmp(ptr {}, ptr {})", c, value, lit));
+                let eq = format!("%t{}", self.fresh());
+                self.line(&format!("{} = icmp eq i32 {}, 0", eq, c));
+                let cont = format!("cont{}", self.fresh());
+                self.line(&format!("br i1 {}, label %{}, label %{}", eq, cont, fail));
+                self.label(&cont);
+                Ok(())
+            }
+            // or は compile_case で展開済み（ここには来ない）。
+            Pattern::Or(_) => unsupported("or パターン（展開漏れ）"),
             Pattern::Ctor(name, subs) => {
                 let ci = m
                     .ctors
@@ -480,6 +531,12 @@ impl Gen {
             let r = format!("%t{}", self.fresh());
             self.line(&format!("{} = load {}, ptr {}", r, llty, slot));
             Ok(r)
+        } else if let Some(vty) = m.value_globals.get(name).cloned() {
+            // トップレベル値 → グローバル変数 @name から load。
+            let llty = llvm_ty(&vty)?;
+            let r = format!("%t{}", self.fresh());
+            self.line(&format!("{} = load {}, ptr @{}", r, llty, name));
+            Ok(r)
         } else if let Some(ci) = m.ctors.get(name).cloned() {
             if ci.arity == 0 {
                 self.construct(&ci, &[]) // ヌル構築子
@@ -518,6 +575,21 @@ impl Gen {
         let llty = llvm_ty(&l.ty)?;
         let float = is_float(&l.ty);
         let reg = format!("%t{}", self.fresh());
+        // 整数除算は 0 除算を実行時チェック（0 ならメッセージを出して exit）。
+        if matches!(op, Token::Slash) && !float {
+            let c = format!("%t{}", self.fresh());
+            self.line(&format!("{} = icmp eq i64 {}, 0", c, rv));
+            let id = self.fresh();
+            let (dz, ok) = (format!("divzero{id}"), format!("divok{id}"));
+            self.line(&format!("br i1 {}, label %{}, label %{}", c, dz, ok));
+            self.label(&dz);
+            self.line("call i32 (ptr, ...) @printf(ptr @.dz)");
+            self.line("call void @exit(i32 1)");
+            self.line("unreachable");
+            self.label(&ok);
+            self.line(&format!("{} = sdiv i64 {}, {}", reg, lv, rv));
+            return Ok(reg);
+        }
         let arith = match op {
             Token::Plus => Some(if float { "fadd" } else { "add" }),
             Token::Minus => Some(if float { "fsub" } else { "sub" }),
@@ -766,8 +838,8 @@ impl Gen {
         let fv = free_vars(params, body);
         let mut caps: Vec<(String, Type)> = Vec::new();
         for name in &fv {
-            if m.globals.contains_key(name) {
-                continue; // トップレベル関数は名前参照（捕獲しない）
+            if m.globals.contains_key(name) || m.value_globals.contains_key(name) {
+                continue; // トップレベル関数/値は名前参照（捕獲しない）
             }
             match self.scope.get(name) {
                 Some((_, ty)) => caps.push((name.clone(), ty.clone())),
@@ -995,10 +1067,21 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
         }
     }
 
+    // トップレベルの値 let（関数でない）→ LLVM グローバル変数。関数本体からも参照可能。
+    let mut value_globals: HashMap<String, Type> = HashMap::new();
+    for s in stmts {
+        if let TStmt::Let(name, te) = s {
+            if !matches!(te.kind, TExprKind::Lambda(..)) {
+                value_globals.insert(name.clone(), te.ty.clone());
+            }
+        }
+    }
+
     let mut m = Module {
         funcs: String::new(),
         fn_ctr: 0,
         globals,
+        value_globals,
         instances: HashSet::new(),
         ctors,
         strings: String::new(),
@@ -1035,6 +1118,7 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare ptr @memcpy(ptr, ptr, i64)\n");
     module.push_str("declare i32 @strcmp(ptr, ptr)\n");
     module.push_str("declare i32 @snprintf(ptr, i64, ptr, ...)\n");
+    module.push_str("declare void @exit(i32)\n");
     // 書式・定数文字列。
     module.push_str("@.di = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n");
     module.push_str("@.df = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"\n");
@@ -1043,7 +1127,14 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("@.ff = private unnamed_addr constant [3 x i8] c\"%g\\00\"\n");
     module.push_str("@.t = private unnamed_addr constant [5 x i8] c\"true\\00\"\n");
     module.push_str("@.f = private unnamed_addr constant [6 x i8] c\"false\\00\"\n");
+    module.push_str("@.dz = private unnamed_addr constant [18 x i8] c\"division by zero\\0A\\00\"\n");
     module.push_str(&m.strings);
+    // トップレベル値のグローバル変数（main が store、関数本体が load）。
+    let mut vg: Vec<(&String, &Type)> = m.value_globals.iter().collect();
+    vg.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, ty) in vg {
+        module.push_str(&format!("@{} = global {} zeroinitializer\n", name, llvm_ty(ty)?));
+    }
     // 文字列連結ランタイム。
     module.push_str(
         "\ndefine ptr @awa_concat(ptr %a, ptr %b) {\n\
@@ -1069,9 +1160,10 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
     for s in stmts {
         match s {
             TStmt::Let(_, te) if matches!(te.kind, TExprKind::Lambda(..)) => {}
+            // トップレベル値はグローバル @name に格納（関数本体からも参照可能）。
             TStmt::Let(name, rhs) => {
                 let v = g.expr(rhs, m)?;
-                g.bind_local(name, &v, &rhs.ty)?;
+                g.line(&format!("store {} {}, ptr @{}", llvm_ty(&rhs.ty)?, v, name));
             }
             TStmt::Expr(e) => {
                 let v = g.expr(e, m)?;

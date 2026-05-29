@@ -1026,6 +1026,65 @@ mod tests {
     }
 
     #[test]
+    fn codegen_トップレベル値を関数から参照() {
+        // トップレベルの値 let が LLVM グローバル変数になり、関数本体から参照できる。
+        // 以前はキャプチャできず Unsupported だった。
+        let out = compile_and_run(
+            "let base = 100\n\
+             let add_base = fn(n: Int) -> Int { n + base }\n\
+             add_base(5)\n\
+             base",
+        );
+        assert_eq!(out, "105\n100\n");
+    }
+
+    #[test]
+    fn codegen_文字列パターン() {
+        // case の文字列パターンが strcmp 経由で native 実行される。
+        let out = compile_and_run(
+            "let greet = fn(lang: String) -> String { \
+               case lang { \"ja\" -> \"こんにちは\"; \"en\" -> \"hello\"; _ -> \"?\" } }; \
+             greet(\"ja\")\n\
+             greet(\"en\")\n\
+             greet(\"xx\")",
+        );
+        assert_eq!(out, "こんにちは\nhello\n?\n");
+    }
+
+    #[test]
+    fn codegen_orパターン() {
+        // or パターンが展開され、複数値が同じ腕に当たる。
+        let out = compile_and_run(
+            "let small = fn(n: Int) -> Bool { case n { 1 | 2 | 3 -> true; _ -> false } }; \
+             small(2)\n\
+             small(5)",
+        );
+        assert_eq!(out, "true\nfalse\n");
+    }
+
+    #[test]
+    fn codegen_ゼロ除算は実行時に検出() {
+        // 整数の 0 除算は実行時チェックで abort（終了コード 1）。
+        let ir = compile_to_llvm("let div = fn(a: Int, b: Int) -> Int { a / b }; div(10, 0)")
+            .expect("コンパイルは通る");
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        let ll = dir.join(format!("awa_cg_{}.ll", id));
+        let exe = dir.join(format!("awa_cg_{}", id));
+        std::fs::write(&ll, &ir).unwrap();
+        let st = std::process::Command::new("clang")
+            .arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+        assert!(st.success(), "clang が失敗");
+        let out = std::process::Command::new(&exe).output().expect("実行できる");
+        let _ = std::fs::remove_file(&ll);
+        let _ = std::fs::remove_file(&exe);
+        assert!(!out.status.success(), "0 除算は異常終了するはず");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("division by zero"), "メッセージ出力: {}", stdout);
+    }
+
+    #[test]
     fn example_native() {
         let src = include_str!("../examples/native.awa");
         let out = compile_and_run(src);
