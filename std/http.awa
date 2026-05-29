@@ -1,8 +1,9 @@
-// 標準ライブラリ: 最小 HTTP（client / server）。
+// 標準ライブラリ: HTTP（client / server）。
 // メッセージの組み立て/解析は純 awa（std/string の上）。実際の通信は socket 組込
 // （tcp_connect/sock_read/sock_write/tcp_listen/accept）の上に載るので native ビルド専用。
-// 既知の割り切り: HTTP/1.0・Connection: close 前提、ヘッダ名は完全一致（大小無視しない）、
-// chunked 転送や \uXXXX などは未対応。学習用の最小実装。
+// client: get/post/request（任意メソッド・ヘッダ・ボディ、解析済み Response を返す）。
+// server: serve_once（1 接続）/ serve（accept ループ）。ヘッダ取得は大小無視、
+// Content-Length はバイト長。割り切り: HTTP/1.0・Connection: close 前提、chunked 転送は未対応。
 import std/list
 import std/result
 import std/string
@@ -62,26 +63,36 @@ pub let resp_body = fn(r: Response) -> String {
   }
 }
 
-// text/plain なシンプルなレスポンス。
-pub let response = fn(status: Int, body: String) -> Response {
-  Response(status, list.Cons(pair.Pair("Content-Type", "text/plain"), list.Nil), body)
+// ヘッダ 1 つ（name, value）を作る小道具。
+pub let header = fn(name: String, value: String) -> pair.Pair(String, String) {
+  pair.Pair(name, value)
 }
 
-// ヘッダ取得（完全一致）。
-let header_find = fn(headers, name) {
+// text/plain なシンプルなレスポンス。
+pub let response = fn(status: Int, body: String) -> Response {
+  Response(status, list.Cons(header("Content-Type", "text/plain"), list.Nil), body)
+}
+
+// ヘッダを明示して作る。
+pub let response_with = fn(status: Int, headers, body: String) -> Response {
+  Response(status, headers, body)
+}
+
+// ヘッダ取得（HTTP の仕様どおり名前は大文字小文字を区別しない）。
+let header_find = fn(headers, lname) {
   case headers {
     list.Nil -> option.None
     list.Cons(h, t) -> case h {
-      pair.Pair(k, v) -> case k == name {
+      pair.Pair(k, v) -> case string.to_lower(k) == lname {
         true -> option.Some(v)
-        false -> header_find(t, name)
+        false -> header_find(t, lname)
       }
     }
   }
 }
 
 pub let get_header = fn(headers, name: String) -> option.Option(String) {
-  header_find(headers, name)
+  header_find(headers, string.to_lower(name))
 }
 
 // ----- 文字列ユーティリティ（このモジュール内）-----
@@ -193,14 +204,39 @@ pub let parse_request = fn(raw: String) -> result.Result(Request, String) {
 }
 
 // ----- 組み立て -----
-let reason = fn(status) {
+// ステータスコード → 理由句。
+pub let reason = fn(status: Int) -> String {
   case status == 200 {
     true -> "OK"
-    false -> case status == 404 {
-      true -> "Not Found"
-      false -> case status == 400 {
-        true -> "Bad Request"
-        false -> "OK"
+    false -> case status == 201 {
+      true -> "Created"
+      false -> case status == 204 {
+        true -> "No Content"
+        false -> case status == 301 {
+          true -> "Moved Permanently"
+          false -> case status == 302 {
+            true -> "Found"
+            false -> case status == 400 {
+              true -> "Bad Request"
+              false -> case status == 401 {
+                true -> "Unauthorized"
+                false -> case status == 403 {
+                  true -> "Forbidden"
+                  false -> case status == 404 {
+                    true -> "Not Found"
+                    false -> case status == 405 {
+                      true -> "Method Not Allowed"
+                      false -> case status == 500 {
+                        true -> "Internal Server Error"
+                        false -> "OK"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -215,20 +251,28 @@ let headers_to_string = fn(headers) {
   }
 }
 
-// Response → 生の文字列（Content-Length を自動付与）。
+// Response → 生の文字列（Content-Length をバイト長で自動付与）。
 pub let response_to_string = fn(resp: Response) -> String {
   case resp {
     Response(status, headers, body) -> {
       let line = "HTTP/1.0 " <> int_to_string(status) <> " " <> reason(status) <> "\r\n"
-      let clen = "Content-Length: " <> int_to_string(string_length(body)) <> "\r\n"
+      let clen = "Content-Length: " <> int_to_string(string.byte_length(body)) <> "\r\n"
       line <> headers_to_string(headers) <> clen <> "\r\n" <> body
     }
   }
 }
 
-// GET の生リクエスト（Connection: close）。
+// 任意メソッド・ヘッダ・ボディの生リクエスト（Connection: close）。
+pub let build_request = fn(method: String, host: String, path: String, headers, body: String) -> String {
+  let line = method <> " " <> path <> " HTTP/1.0\r\n"
+  let host_h = "Host: " <> host <> "\r\n"
+  let clen = "Content-Length: " <> int_to_string(string.byte_length(body)) <> "\r\n"
+  line <> host_h <> headers_to_string(headers) <> clen <> "Connection: close\r\n\r\n" <> body
+}
+
+// GET の生リクエスト（後方互換）。
 pub let get_request = fn(host: String, path: String) -> String {
-  "GET " <> path <> " HTTP/1.0\r\nHost: " <> host <> "\r\nConnection: close\r\n\r\n"
+  build_request("GET", host, path, list.Nil, "")
 }
 
 // ----- 通信（native ビルド専用）-----
@@ -243,18 +287,40 @@ let read_all = fn(sock, acc) -> Future(String) {
   }
 }
 
-// host:port:path に GET して生レスポンス文字列を返す（parse_response で解析できる）。
-pub let fetch = fn(host: String, port: Int, path: String) -> Future(String) {
+// 生リクエスト文字列を送り、レスポンス全体を読んで返す（低レベル）。
+pub let send_raw = fn(host: String, port: Int, raw: String) -> Future(String) {
   do {
     sock <- tcp_connect(host, port)
-    sock_write(sock, get_request(host, path))
+    sock_write(sock, raw)
     body <- read_all(sock, "")
     let _ = sock_close(sock)
     pure(body)
   }
 }
 
-// 1 接続だけ受けて handler で応答するサーバ。server は listen 済みソケット。
+// host:port:path に GET して生レスポンス文字列を返す（後方互換・低レベル）。
+pub let fetch = fn(host: String, port: Int, path: String) -> Future(String) {
+  send_raw(host, port, get_request(host, path))
+}
+
+// 任意メソッドで要求し、解析済み Response を返す（解析失敗は Err）。
+pub let request = fn(method: String, host: String, port: Int, path: String, headers, body: String) -> Future(result.Result(Response, String)) {
+  do {
+    raw <- send_raw(host, port, build_request(method, host, path, headers, body))
+    pure(parse_response(raw))
+  }
+}
+
+// GET / POST のショートカット（解析済み Response を返す）。
+pub let get = fn(host: String, port: Int, path: String) -> Future(result.Result(Response, String)) {
+  request("GET", host, port, path, list.Nil, "")
+}
+
+pub let post = fn(host: String, port: Int, path: String, body: String) -> Future(result.Result(Response, String)) {
+  request("POST", host, port, path, list.Nil, body)
+}
+
+// 1 接続を受けて handler で応答する（server は listen 済みソケット）。
 pub let serve_once = fn(server, handler) -> Future(Int) {
   do {
     client <- accept(server)
@@ -266,5 +332,14 @@ pub let serve_once = fn(server, handler) -> Future(Int) {
     sock_write(client, response_to_string(resp))
     let _ = sock_close(client)
     pure(0)
+  }
+}
+
+// 接続を受け続けるサーバ（1 接続ごとに serve_once、終わったら再帰でまた accept）。
+// 末尾再帰なので定数スタックで回り続ける。
+pub let serve = fn(server, handler) -> Future(Int) {
+  do {
+    serve_once(server, handler)
+    serve(server, handler)
   }
 }

@@ -3,9 +3,9 @@
 // 対して main が無いファイルは「最後のトップレベル式が答え」になるスクリプト形式。
 import std/io
 
-let greet = fn(name: String) -> String { "Hello, " <> __interp(name) <> "!" }
+let greet = fn(name: String) -> String { "Hello, ${name}!" }
 
 let main = fn() {
   io.println(greet("awa"))
-  io.println("1 + 2 = " <> __interp(1 + 2) <> "")
+  io.println("1 + 2 = ${1 + 2}")
 }

@@ -110,20 +110,27 @@ fn render(doc: &D, width: usize) -> String {
 }
 
 // ---- 文字列/数値リテラルの再出力 ----
-fn quote_str(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
+// 文字列の中身をエスケープ（クォートは付けない）。`${` に化ける `$`（直後が `{`）だけ
+// `\$` にして、再 lex で意図せず補間にならないようにする。
+fn escape_inner(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
+            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
             _ => out.push(c),
         }
     }
-    out.push('"');
     out
+}
+
+fn quote_str(s: &str) -> String {
+    format!("\"{}\"", escape_inner(s))
 }
 
 fn fmt_float(f: f64) -> String {
@@ -378,6 +385,12 @@ impl Fmt {
             ExprKind::Var(n) => text(n.clone()),
             ExprKind::Neg(x) => cat(text("-"), self.atom(x)),
             ExprKind::BinOp(l, op, r) => {
+                // `${}` 補間（lexer が `( "a" <> __interp(e) <> "b" )` へ脱糖）を文字列へ復元する。
+                if matches!(op, Token::Concat) {
+                    if let Some(doc) = self.try_interp(e) {
+                        return doc;
+                    }
+                }
                 let p = binop_prec(op);
                 concat(vec![
                     self.binop_operand(l, p, false),
@@ -440,6 +453,32 @@ impl Fmt {
                 braced(header, concat(parts))
             }
         }
+    }
+
+    // `<>` 連結が `${}` 補間の脱糖（文字列リテラルと __interp(e) の連結）なら、補間文字列へ復元。
+    // 純粋な補間（リテラルと __interp のみ・__interp が 1 つ以上）でなければ None。
+    fn try_interp(&mut self, e: &Expr) -> Option<D> {
+        let mut parts: Vec<InterpPart> = Vec::new();
+        if !flatten_concat(e, &mut parts) {
+            return None;
+        }
+        if !parts.iter().any(|p| matches!(p, InterpPart::Interp(_))) {
+            return None;
+        }
+        let mut s = String::from("\"");
+        for p in parts {
+            match p {
+                InterpPart::Lit(lit) => s.push_str(&escape_inner(lit)),
+                InterpPart::Interp(inner) => {
+                    let flat = render(&self.expr(inner), usize::MAX);
+                    s.push_str("${");
+                    s.push_str(flat.trim_end_matches('\n'));
+                    s.push('}');
+                }
+            }
+        }
+        s.push('"');
+        Some(text(s))
     }
 
     // ラムダ本体。Block ならそのまま、裸の式なら波括弧で包む（awa の fn は本体に { } 必須）。
@@ -614,6 +653,33 @@ fn type_doc(t: &TypeExpr) -> D {
     }
 }
 
+// `${}` 補間復元のための連結要素。
+enum InterpPart<'a> {
+    Lit(&'a str),
+    Interp(&'a Expr),
+}
+
+// `<>` 連結木を左から右へ平坦化する。葉が文字列リテラルか __interp(e) 呼び出しなら収集して
+// true、それ以外（ふつうの `<>` 連結のオペランド）が混ざっていれば false。
+fn flatten_concat<'a>(e: &'a Expr, out: &mut Vec<InterpPart<'a>>) -> bool {
+    match &e.kind {
+        ExprKind::BinOp(l, Token::Concat, r) => {
+            flatten_concat(l, out) && flatten_concat(r, out)
+        }
+        ExprKind::Str(s) => {
+            out.push(InterpPart::Lit(s));
+            true
+        }
+        ExprKind::Call(callee, args)
+            if args.len() == 1 && matches!(&callee.kind, ExprKind::Var(n) if n == "__interp") =>
+        {
+            out.push(InterpPart::Interp(&args[0]));
+            true
+        }
+        _ => false,
+    }
+}
+
 fn pattern_doc(p: &Pattern) -> D {
     match p {
         Pattern::Wildcard => text("_"),
@@ -709,6 +775,16 @@ mod tests {
     #[test]
     fn 文字列エスケープが再生成される() {
         assert_eq!(fmt("\"a\\nb\""), "\"a\\nb\"\n");
+    }
+
+    #[test]
+    fn 文字列補間が復元される() {
+        // ${} は lexer で __interp へ脱糖されるが、fmt は補間文字列へ戻す。
+        assert_eq!(fmt("let x = 1\n\"n=${x + 2}\""), "let x = 1\n\n\"n=${x + 2}\"\n");
+        // リテラルの $ は \$ に保つ（補間に化けない）。
+        assert_eq!(fmt("\"price \\${5}\""), "\"price \\${5}\"\n");
+        // 補間でない素の連結はそのまま。
+        assert_eq!(fmt("\"a\" <> \"b\""), "\"a\" <> \"b\"\n");
     }
 
     #[test]

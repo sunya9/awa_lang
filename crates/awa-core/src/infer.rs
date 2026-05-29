@@ -143,6 +143,7 @@ impl Checker {
         self.env.insert("now".to_string(), mono(vec![], Type::Int));
         self.env.insert("string_to_int".to_string(), mono(vec![Type::Str], Type::Int));
         self.env.insert("string_length".to_string(), mono(vec![Type::Str], Type::Int));
+        self.env.insert("string_byte_length".to_string(), mono(vec![Type::Str], Type::Int));
         // 文字単位の操作（JSON/HTTP パーサを awa で書くための土台）。
         // string_char_at: i 番目のコードポイント（範囲外は -1）。char_to_string: 1 文字 String。
         self.env.insert("string_char_at".to_string(), mono(vec![Type::Str, Type::Int], Type::Int));

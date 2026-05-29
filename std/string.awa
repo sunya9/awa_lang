@@ -6,6 +6,9 @@ import std/list
 
 pub let length = fn(s: String) -> Int { string_length(s) }
 
+// UTF-8 バイト数（HTTP の Content-Length などバイト単位が要るとき）。
+pub let byte_length = fn(s: String) -> Int { string_byte_length(s) }
+
 pub let is_empty = fn(s: String) -> Bool { string_length(s) == 0 }
 
 pub let to_int = fn(s: String) -> Int { string_to_int(s) }
@@ -17,6 +20,43 @@ pub let char_at = fn(s: String, i: Int) -> Int { string_char_at(s, i) }
 
 // コードポイント c の 1 文字 String。
 pub let from_char = fn(c: Int) -> String { char_to_string(c) }
+
+// 各文字に f（コードポイント→コードポイント）を適用した新しい文字列。
+let map_chars = fn(s, i, len, f) {
+  case i >= len {
+    true -> ""
+    false -> char_to_string(f(string_char_at(s, i))) <> map_chars(s, i + 1, len, f)
+  }
+}
+
+// ASCII の大小変換（非 ASCII はそのまま）。
+pub let to_lower = fn(s: String) -> String {
+  map_chars(
+    s,
+    0,
+    string_length(s),
+    fn(c) {
+      case c >= 65 && c <= 90 {
+        true -> c + 32
+        false -> c
+      }
+    }
+  )
+}
+
+pub let to_upper = fn(s: String) -> String {
+  map_chars(
+    s,
+    0,
+    string_length(s),
+    fn(c) {
+      case c >= 97 && c <= 122 {
+        true -> c - 32
+        false -> c
+      }
+    }
+  )
+}
 
 // 部分文字列 [start, end)（コードポイント単位）。
 pub let slice: fn(String, Int, Int) -> String = fn(s, start, end) {

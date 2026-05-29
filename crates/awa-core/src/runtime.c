@@ -86,6 +86,8 @@ long long awa_string_length(void* strobj) {
   while (*p) { if ((*p & 0xC0) != 0x80) n++; p++; }
   return n;
 }
+// UTF-8 バイト数（Content-Length 用）。
+long long awa_string_byte_length(void* strobj) { return (long long)strlen((char*)strobj + 16); }
 // 文字列 → 浮動小数（非数値は 0.0）。
 double awa_string_to_float(void* strobj) { return atof((char*)strobj + 16); }
 // i 番目（0 始まり）のコードポイントを返す。範囲外は -1。

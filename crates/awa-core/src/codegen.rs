@@ -96,6 +96,7 @@ fn is_io_builtin(name: &str) -> bool {
             | "now"
             | "string_to_int"
             | "string_length"
+            | "string_byte_length"
             | "string_char_at"
             | "char_to_string"
             | "string_to_float"
@@ -1117,6 +1118,13 @@ impl Gen {
                 self.release(&v, &args[0].ty); // String 引数を consume
                 Ok(r)
             }
+            "string_byte_length" => {
+                let v = self.expr(&args[0], m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i64 @awa_string_byte_length(ptr {})", r, v));
+                self.release(&v, &args[0].ty);
+                Ok(r)
+            }
             "string_char_at" => {
                 let s = self.expr(&args[0], m)?;
                 let i = self.expr(&args[1], m)?;
@@ -1726,6 +1734,7 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i64 @awa_now()\n");
     module.push_str("declare i64 @awa_string_to_int(ptr)\n");
     module.push_str("declare i64 @awa_string_length(ptr)\n");
+    module.push_str("declare i64 @awa_string_byte_length(ptr)\n");
     module.push_str("declare i64 @awa_string_char_at(ptr, i64)\n");
     module.push_str("declare ptr @awa_char_to_string(i64)\n");
     module.push_str("declare double @awa_string_to_float(ptr)\n");

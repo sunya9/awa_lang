@@ -707,6 +707,12 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
             }
             unreachable!("string_length の引数は String");
         }
+        "string_byte_length" => {
+            if let Some(Value::Str(s)) = args.into_iter().next() {
+                return Ok(Value::Int(s.len() as i64)); // UTF-8 バイト数（Content-Length 用）
+            }
+            unreachable!("string_byte_length の引数は String");
+        }
         "string_to_int" => {
             if let Some(Value::Str(s)) = args.into_iter().next() {
                 // 非数値は 0（C の atoll と揃える）。先頭の数値部だけを読む。
@@ -814,6 +820,7 @@ pub fn builtins_env() -> Env {
         "now",
         "string_to_int",
         "string_length",
+        "string_byte_length",
         "string_char_at",
         "char_to_string",
         "string_to_float",

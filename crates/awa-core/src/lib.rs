@@ -2217,6 +2217,50 @@ mod tests {
     }
 
     #[test]
+    fn 文字列_バイト長と大小変換() {
+        // UTF-8: "あ" は 1 文字・3 バイト。
+        assert_eq!(eval(r#"string_byte_length("あ")"#), Ok(Value::Int(3)));
+        assert_eq!(eval(r#"string_length("あ")"#), Ok(Value::Int(1)));
+    }
+
+    #[test]
+    fn std_string_lower_upper() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/string\n\
+             io.println(string.to_lower(\"Hello, WORLD! 日本\"))\n\
+             io.println(string.to_upper(\"Hello, world!\"))\n\
+             io.println(\"${string.byte_length(\"あ\")}\")\n",
+        );
+        assert_eq!(out, "hello, world! 日本\nHELLO, WORLD!\n3\n");
+    }
+
+    #[test]
+    fn std_http_大小無視ヘッダと任意メソッド() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/http\n\
+             import std/list\n\
+             import std/option\n\
+             import std/result\n\
+             let raw = \"HTTP/1.1 201 Created\\r\\nCONTENT-TYPE: application/json\\r\\n\\r\\n{}\"\n\
+             io.println(case http.parse_response(raw) {\n\
+               result.Ok(r) -> case http.get_header(http.resp_headers(r), \"content-type\") {\n\
+                 option.Some(v) -> \"${http.resp_status(r)}:${v}\"\n\
+                 option.None -> \"no-ctype\"\n\
+               }\n\
+               result.Err(e) -> e\n\
+             })\n\
+             io.println(http.build_request(\"POST\", \"h\", \"/p\", list.Cons(http.header(\"X-A\", \"1\"), list.Nil), \"body\"))\n",
+        );
+        // 大文字ヘッダを小文字名で引ける／build_request は Content-Length=4（バイト）。
+        assert!(out.contains("201:application/json\n"), "got: {out}");
+        assert!(out.contains("POST /p HTTP/1.0\r\n"), "got: {out:?}");
+        assert!(out.contains("X-A: 1\r\n"));
+        assert!(out.contains("Content-Length: 4\r\n"));
+    }
+
+    #[test]
     fn std_http_parse_and_build() {
         // ソケットを使わない純粋関数（parse_response / parse_request / response_to_string）を検証。
         let out = std_build_run(

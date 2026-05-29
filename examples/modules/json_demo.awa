@@ -8,6 +8,6 @@ let main = fn() {
   let src = "{\"lang\":\"awa\",\"version\":1,\"tags\":[\"fp\",\"ml\"],\"stable\":false}"
   case json.parse(src) {
     result.Ok(j) -> io.println(json.stringify(j))  // 往復して同じ JSON
-    result.Err(e) -> io.println("parse error: " <> __interp(e) <> "")
+    result.Err(e) -> io.println("parse error: ${e}")
   }
 }

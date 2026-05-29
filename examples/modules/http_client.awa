@@ -1,14 +1,11 @@
-// 最小 HTTP クライアント（native 専用）。GET して status/body を表示する。
+// HTTP クライアント（native 専用）。GET して解析済み Response を表示する。
 import std/io
 import std/http
 import std/result
 
 let main = fn() {
-  let raw = run(http.fetch("127.0.0.1", 18080, "/hello"))
-  case http.parse_response(raw) {
-    result.Ok(resp) -> io.println(
-      "status=" <> __interp(http.resp_status(resp)) <> " body=" <> __interp(http.resp_body(resp)) <> ""
-    )
-    result.Err(e) -> io.println("parse error: " <> __interp(e) <> "")
+  case run(http.get("127.0.0.1", 18080, "/hello")) {
+    result.Ok(resp) -> io.println("status=${http.resp_status(resp)} body=${http.resp_body(resp)}")
+    result.Err(e) -> io.println("parse error: ${e}")
   }
 }

@@ -27,6 +27,6 @@ let computed = do {
 }
 
 let main = fn() {
-  io.println("total   = " <> __interp(option.unwrap_or(total, 0)) <> "")  // 42
-  io.println("computed= " <> __interp(result.unwrap_or(computed, 0 - 1)) <> "")  // 5
+  io.println("total   = ${option.unwrap_or(total, 0)}")  // 42
+  io.println("computed= ${result.unwrap_or(computed, 0 - 1)}")  // 5
 }
