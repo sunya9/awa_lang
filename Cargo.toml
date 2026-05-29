@@ -4,3 +4,5 @@
 [workspace]
 members = ["crates/awa-core", "crates/awa-cli", "crates/awa-lsp"]
 resolver = "2"
+# `cargo run` / `cargo build` を引数なしで叩いたとき既定で awa-cli（awa コマンド）を対象にする。
+default-members = ["crates/awa-cli"]

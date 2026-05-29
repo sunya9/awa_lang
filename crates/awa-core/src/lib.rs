@@ -7,6 +7,7 @@ pub mod infer;
 pub mod lexer;
 pub mod match_check;
 pub mod parser;
+pub mod query;
 pub mod resolve;
 pub mod span;
 pub mod token;

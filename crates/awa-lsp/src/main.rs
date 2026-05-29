@@ -1,54 +1,71 @@
-// awa の Language Server。まずは診断（型/構文エラー）だけを提供する。
-// コンパイラは awa-core を再利用: check_source でエラーを取り、span を LSP の Range に変換する。
+// awa の Language Server。診断（型/構文エラー）に加え、hover（型表示）・定義ジャンプ・補完を提供する。
+// コンパイラは awa-core を再利用: 診断は check_source、位置クエリは query::{type_at, definition_at, completions}。
 // 通信は LSP（stdio・JSON-RPC）。エディタがこのバイナリを起動して話す。
+use std::collections::HashMap;
 use std::error::Error;
 
-use awa_core::check_source;
-use awa_core::span::offset_to_line_col;
-use lsp_server::{Connection, Message, Notification};
+use awa_core::query::{completions, definition_at, type_at};
+use awa_core::span::{line_col_to_offset, offset_to_line_col};
+use awa_core::{check_source, span::Span};
+use lsp_server::{Connection, Message, Notification, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics};
 use lsp_types::{
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    Position, PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url,
+    CompletionItem, CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, Location, MarkedString, OneOf, Position, PublishDiagnosticsParams,
+    Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
+use serde_json::Value;
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
-    // stdio で LSP 接続を張る。
     let (connection, io_threads) = Connection::stdio();
-    // テキスト同期は FULL（変更のたびに全文を受け取る）。診断のみなのでこれで十分。
     let capabilities = serde_json::to_value(ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions::default()),
         ..Default::default()
     })?;
     connection.initialize(capabilities)?;
-    // main_loop は Connection を所有して消費する。戻ると Connection が drop され、
-    // sender が閉じて writer スレッドが終わる → io_threads.join() が返れる
-    //（借用のままだと join がハングする lsp-server の定番の罠）。
+    // main_loop は Connection を所有して消費する（戻ると drop され io_threads.join() が返れる）。
     main_loop(connection)?;
     io_threads.join()?;
     Ok(())
 }
 
 fn main_loop(conn: Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
+    // 開いている文書（uri → 全文）。hover/定義/補完はこの内容に対して位置クエリする。
+    let mut docs: HashMap<Url, String> = HashMap::new();
     for msg in &conn.receiver {
         match msg {
             Message::Request(req) => {
                 if conn.handle_shutdown(&req)? {
                     return Ok(());
                 }
-                // hover/補完/定義ジャンプは未対応（診断のみ）。
+                let result = match req.method.as_str() {
+                    "textDocument/hover" => handle_hover(&docs, req.params),
+                    "textDocument/definition" => handle_definition(&docs, req.params),
+                    "textDocument/completion" => handle_completion(&docs, req.params),
+                    _ => Value::Null,
+                };
+                conn.sender
+                    .send(Message::Response(Response::new_ok(req.id, result)))?;
             }
             Message::Notification(not) => match not.method.as_str() {
                 "textDocument/didOpen" => {
                     let p: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
-                    publish(&conn, p.text_document.uri, &p.text_document.text);
+                    let uri = p.text_document.uri;
+                    docs.insert(uri.clone(), p.text_document.text.clone());
+                    publish(&conn, uri, &p.text_document.text);
                 }
                 "textDocument/didChange" => {
                     let p: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
+                    let uri = p.text_document.uri;
                     // FULL 同期なので最後の変更が全文。
                     if let Some(change) = p.content_changes.into_iter().last() {
-                        publish(&conn, p.text_document.uri, &change.text);
+                        docs.insert(uri.clone(), change.text.clone());
+                        publish(&conn, uri, &change.text);
                     }
                 }
                 _ => {}
@@ -59,31 +76,92 @@ fn main_loop(conn: Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
     Ok(())
 }
 
+// span（char オフセット）を LSP の Range に変換。
+fn span_to_range(text: &str, span: Span) -> Range {
+    let (sl, sc) = offset_to_line_col(text, span.start);
+    let (el, ec) = offset_to_line_col(text, span.end);
+    Range::new(Position::new(sl, sc), Position::new(el, ec))
+}
+
+// hover: カーソル位置の式の型を表示。
+fn handle_hover(docs: &HashMap<Url, String>, params: Value) -> Value {
+    let p: HoverParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return Value::Null,
+    };
+    let pos = p.text_document_position_params.position;
+    let Some(text) = docs.get(&p.text_document_position_params.text_document.uri) else {
+        return Value::Null;
+    };
+    let off = line_col_to_offset(text, pos.line, pos.character);
+    match type_at(text, off) {
+        Some(ty) => serde_json::to_value(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(ty)),
+            range: None,
+        })
+        .unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
+// 定義ジャンプ: カーソル位置の名前のトップレベル定義へ。
+fn handle_definition(docs: &HashMap<Url, String>, params: Value) -> Value {
+    let p: GotoDefinitionParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return Value::Null,
+    };
+    let uri = p.text_document_position_params.text_document.uri;
+    let pos = p.text_document_position_params.position;
+    let Some(text) = docs.get(&uri) else {
+        return Value::Null;
+    };
+    let off = line_col_to_offset(text, pos.line, pos.character);
+    match definition_at(text, off) {
+        Some(span) => {
+            let loc = Location::new(uri, span_to_range(text, span));
+            serde_json::to_value(GotoDefinitionResponse::Scalar(loc)).unwrap_or(Value::Null)
+        }
+        None => Value::Null,
+    }
+}
+
+// 補完: キーワード＋組込＋トップレベル名。
+fn handle_completion(docs: &HashMap<Url, String>, params: Value) -> Value {
+    let p: CompletionParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return Value::Null,
+    };
+    let Some(text) = docs.get(&p.text_document_position.text_document.uri) else {
+        return Value::Null;
+    };
+    let items: Vec<CompletionItem> = completions(text)
+        .into_iter()
+        .map(|label| CompletionItem {
+            label,
+            ..Default::default()
+        })
+        .collect();
+    serde_json::to_value(CompletionResponse::Array(items)).unwrap_or(Value::Null)
+}
+
 // テキストを検査して診断を publish する。
 fn publish(conn: &Connection, uri: Url, text: &str) {
-    let diagnostics = diagnostics_for(text);
     let params = PublishDiagnosticsParams {
         uri,
-        diagnostics,
+        diagnostics: diagnostics_for(text),
         version: None,
     };
     let not = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
     let _ = conn.sender.send(Message::Notification(not));
 }
 
-// awa-core の check_source を呼び、エラーがあれば 1 個の Diagnostic にする
-//（awa は最初のエラーで止まるので診断は 0 個か 1 個）。
+// awa-core の check_source を呼び、エラーがあれば 1 個の Diagnostic にする（awa は最初のエラーで止まる）。
 fn diagnostics_for(text: &str) -> Vec<Diagnostic> {
     match check_source(text) {
         Ok(()) => Vec::new(),
         Err(e) => {
             let range = match e.span {
-                Some(s) => {
-                    let (sl, sc) = offset_to_line_col(text, s.start);
-                    let (el, ec) = offset_to_line_col(text, s.end);
-                    Range::new(Position::new(sl, sc), Position::new(el, ec))
-                }
-                // 位置不明なら先頭を指す。
+                Some(s) => span_to_range(text, s),
                 None => Range::new(Position::new(0, 0), Position::new(0, 1)),
             };
             vec![Diagnostic {
@@ -112,13 +190,11 @@ mod tests {
         let d = diagnostics_for("true + 1");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
-        // 位置（true + 1 は 0:0 から）。
         assert_eq!(d[0].range.start, Position::new(0, 0));
     }
 
     #[test]
     fn 複数行のエラー位置() {
-        // 2 行目の未定義変数 nope を指す（0 始まり: line 1）。
         let d = diagnostics_for("let x = 1\nnope");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].range.start.line, 1);
@@ -127,7 +203,6 @@ mod tests {
     #[test]
     fn didopenで診断がpublishされる() {
         use std::time::Duration;
-        // メモリ接続でループを駆動し、エラーのある文書を開いて診断が返るか確認。
         let (server, client) = Connection::memory();
         let handle = std::thread::spawn(move || {
             let _ = main_loop(server);
@@ -154,7 +229,40 @@ mod tests {
             }
             other => panic!("通知を期待: {:?}", other),
         }
-        drop(client); // チャネルを閉じてループを終わらせる
+        drop(client);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn hover補完定義のスモーク() {
+        // ドキュメントを直接入れて各ハンドラを呼ぶ（位置クエリの結線確認）。
+        let mut docs = HashMap::new();
+        let uri = Url::parse("file:///t.awa").unwrap();
+        let src = "let double = fn(n: Int) -> Int { n * 2 }\ndouble(21)".to_string();
+        docs.insert(uri.clone(), src.clone());
+
+        // hover: 2 行目の double（line 1, col 0）の型は fn(Int) -> Int。
+        let hover_params = serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 0 }
+        });
+        let h = handle_hover(&docs, hover_params);
+        assert!(h.to_string().contains("fn(Int) -> Int"), "hover: {}", h);
+
+        // definition: double の定義（1 行目）へ。
+        let def_params = serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        });
+        let d = handle_definition(&docs, def_params);
+        assert!(d.to_string().contains("\"line\":0"), "definition: {}", d);
+
+        // completion: double と組込/キーワードが候補に。
+        let comp_params = serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 0 }
+        });
+        let c = handle_completion(&docs, comp_params);
+        assert!(c.to_string().contains("double"), "completion: {}", c);
     }
 }

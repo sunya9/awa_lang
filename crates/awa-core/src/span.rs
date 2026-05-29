@@ -41,6 +41,24 @@ pub fn offset_to_line_col(source: &str, offset: usize) -> (u32, u32) {
     (line, col)
 }
 
+// 0 始まりの (行, 列) を char オフセットに変換する（LSP の Position → span 用）。
+pub fn line_col_to_offset(source: &str, line: u32, col: u32) -> usize {
+    let mut cur_line = 0u32;
+    let mut cur_col = 0u32;
+    for (i, c) in source.chars().enumerate() {
+        if cur_line == line && cur_col == col {
+            return i;
+        }
+        if c == '\n' {
+            cur_line += 1;
+            cur_col = 0;
+        } else {
+            cur_col += 1;
+        }
+    }
+    source.chars().count()
+}
+
 // 値に span を添えた汎用ラッパ。トークン列に使う。
 #[derive(Debug, Clone)]
 pub struct Spanned<T> {
