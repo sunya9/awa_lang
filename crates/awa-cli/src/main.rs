@@ -165,8 +165,10 @@ fn build_file(path: &str) {
         eprintln!("ランタイムを書けません ({}): {}", rt_path, e);
         std::process::exit(1);
     }
+    // -O2: LLVM の sibling-call 最適化で末尾再帰が定数スタックになる（ループ相当）。
+    // 併せて未使用関数の除去（globaldce）など一般的な最適化も効く。
     let status = std::process::Command::new("clang")
-        .args([&rt_path, &ll_path, "-o", base])
+        .args(["-O2", &rt_path, &ll_path, "-o", base])
         .status();
     match status {
         Ok(s) if s.success() => println!("built: {}", base),
@@ -225,6 +227,16 @@ fn fmt_file(args: &[String]) {
 }
 
 fn main() {
+    // インタプリタは eval_expr が Rust 再帰なので、深い（末尾）再帰でスタックが溢れる。
+    // 大きなスタックのスレッドで実行して実用的な深さを吸収する（native は -O2 の TCO で定数スタック）。
+    let child = std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024) // 1 GiB
+        .spawn(run_cli)
+        .expect("スレッド起動");
+    child.join().expect("実行スレッド");
+}
+
+fn run_cli() {
     // 引数: awa emit/build <file> はコンパイル、awa fmt <file> は整形、
     // awa <file> はインタプリタ実行、引数なしは REPL。
     let args: Vec<String> = std::env::args().collect();

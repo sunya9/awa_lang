@@ -536,6 +536,13 @@ mod tests {
     }
 
     #[test]
+    fn 末尾再帰はtcoで定数スタック() {
+        // 20 万段。TCO（トランポリン）が無ければテストスレッドのスタックを溢れさせる深さ。
+        let src = "let c = fn(n: Int, a: Int) -> Int { case n == 0 { true -> a; false -> c(n - 1, a + 1) } }; c(200000, 0)";
+        assert_eq!(eval(src), Ok(Value::Int(200000)));
+    }
+
+    #[test]
     fn レキシカルスコープ_呼び出し場所の変数は見えない() {
         assert_eq!(
             eval("let f = fn() { x }; let x = 99; f()"),
@@ -1266,6 +1273,7 @@ mod tests {
         std::fs::write(&ll, &ir).unwrap();
         std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
+            .arg("-O2")
             .arg(&rt)
             .arg(&ll)
             .arg("-o")
@@ -1292,7 +1300,7 @@ mod tests {
         std::fs::write(&ll, &ir).unwrap();
         std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+            .arg("-O2").arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行できる");
         let _ = std::fs::remove_file(&ll);
@@ -1323,7 +1331,7 @@ mod tests {
         std::fs::write(&ll, &ir).unwrap();
         std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+            .arg("-O2").arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行できる");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1870,7 +1878,7 @@ mod tests {
         std::fs::write(&ll, &ir).unwrap();
         std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang");
+            .arg("-O2").arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang");
         assert!(st.success(), "clang が失敗");
         let mut child = std::process::Command::new(&exe).spawn().expect("起動");
         // ポートファイルが書かれるまで待つ（並列テストで CPU 飽和しても十分なよう ~15 秒）。
@@ -1938,7 +1946,7 @@ mod tests {
         std::fs::write(&ll, &ir).unwrap();
         std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang");
+            .arg("-O2").arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang");
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2140,6 +2148,17 @@ mod tests {
     }
 
     #[test]
+    fn codegen_末尾再帰は定数スタック_tco() {
+        // -O2 の sibling-call 最適化で 100 万段の末尾再帰が定数スタックで回る。
+        let (out, code) = compile_run_status(
+            "let c = fn(n: Int, a: Int) -> Int { case n == 0 { true -> a; false -> c(n - 1, a + 1) } }\n\
+             print(int_to_string(c(1000000, 0)))",
+        );
+        assert_eq!(out, "1000000\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn codegen_main関数が入口になる() {
         // main を定義するとそれが入口。戻り値は表示されず（出力なし）、RC も釣り合う（終了コード 0）。
         let (out, code) = compile_run_status("let main = fn() -> Int { 1 + 2 }");
@@ -2208,7 +2227,7 @@ mod tests {
         std::fs::write(&ll, &ir).unwrap();
         std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+            .arg("-O2").arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行できる");
         let _ = std::fs::remove_file(&ll);

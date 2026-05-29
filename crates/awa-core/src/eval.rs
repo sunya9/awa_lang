@@ -260,29 +260,106 @@ fn num_cmp(l: &Value, r: &Value) -> std::cmp::Ordering {
     }
 }
 
+// 末尾位置評価の結果。Value=確定、Tail=末尾の関数呼び出し（呼び出し元のループが処理する）。
+enum Step {
+    Value(Value),
+    Tail(Value, Vec<Value>, Span),
+}
+
+// 式を「末尾位置」として評価する。末尾の関数呼び出しは Rust 再帰せず Step::Tail で返し、
+// call_value のループが反復処理する（TCO）。末尾でない部分式は通常の eval_expr で評価する。
+fn eval_tail(expr: &TExpr, env: &Env) -> Result<Step, LocatedError> {
+    let span = expr.span;
+    match &expr.kind {
+        // 末尾の呼び出し: 対象と引数だけ評価して Tail を返す（本体には潜らない）。
+        TExprKind::Call(callee, args) => {
+            let callee_val = eval_expr(callee, env)?;
+            let mut arg_values = Vec::with_capacity(args.len());
+            for arg in args {
+                arg_values.push(eval_expr(arg, env)?);
+            }
+            Ok(Step::Tail(callee_val, arg_values, span))
+        }
+        // ブロック: 最後の式だけが末尾位置。それ以外は通常評価。
+        TExprKind::Block(stmts) => {
+            let mut block_env = env.clone();
+            let n = stmts.len();
+            for (i, stmt) in stmts.iter().enumerate() {
+                let last = i + 1 == n;
+                match stmt {
+                    TStmt::Let(name, e) => {
+                        let v = bind_name(eval_expr(e, &block_env)?, name);
+                        block_env.insert(name.clone(), v);
+                    }
+                    TStmt::Type(def) => register_ctors(def, &mut block_env),
+                    TStmt::Impl(ms) => register_methods(ms, &mut block_env),
+                    TStmt::Expr(e) => {
+                        if last {
+                            return eval_tail(e, &block_env);
+                        }
+                        eval_expr(e, &block_env)?;
+                    }
+                }
+            }
+            Ok(Step::Value(Value::Unit)) // 空ブロック or 末尾が let
+        }
+        // case: 当たった腕の本体が末尾位置。
+        TExprKind::Case(subject, arms) => {
+            let value = eval_expr(subject, env)?;
+            for (pattern, body) in arms {
+                if let Some(bindings) = match_pattern(pattern, &value) {
+                    let mut arm_env = env.clone();
+                    for (name, v) in bindings {
+                        arm_env.insert(name, v);
+                    }
+                    return eval_tail(body, &arm_env);
+                }
+            }
+            Err(LocatedError::at(AwaError::NoMatch, span))
+        }
+        // その他は末尾呼び出しを含まないので普通に値へ。
+        _ => Ok(Step::Value(eval_expr(expr, env)?)),
+    }
+}
+
 // 値を引数列に適用する（関数・構築子・組込の振り分け）。eval_expr の Call と
 // イベントループの継続呼び出しの両方から使う共通経路。
 fn call_value(callee: Value, arg_values: Vec<Value>, span: Span) -> Result<Value, LocatedError> {
     match callee {
-        Value::Func(closure) => {
-            if arg_values.len() != closure.params.len() {
-                return Err(LocatedError::at(
-                    AwaError::ArityMismatch {
-                        expected: closure.params.len(),
-                        found: arg_values.len(),
+        // クロージャ適用はループで回す（末尾呼び出し最適化）。本体を末尾位置で評価し、
+        // 末尾が関数呼び出しなら Rust 再帰せずループを continue する＝定数スタックで反復できる。
+        Value::Func(mut closure) => {
+            let mut args = arg_values;
+            loop {
+                if args.len() != closure.params.len() {
+                    return Err(LocatedError::at(
+                        AwaError::ArityMismatch {
+                            expected: closure.params.len(),
+                            found: args.len(),
+                        },
+                        span,
+                    ));
+                }
+                // 本体はキャプチャ env（レキシカルスコープ）をベースに評価する。
+                let mut call_env = closure.env.clone();
+                if let Some(name) = &closure.name {
+                    call_env.insert(name.clone(), Value::Func(closure.clone()));
+                }
+                for (param, value) in closure.params.iter().zip(args) {
+                    call_env.insert(param.clone(), value);
+                }
+                match eval_tail(&closure.body, &call_env)? {
+                    Step::Value(v) => return Ok(v),
+                    // 末尾呼び出し: 相手がクロージャなら積まずにループ続行、それ以外は通常適用。
+                    Step::Tail(next, next_args, call_span) => match next {
+                        Value::Func(c2) => {
+                            closure = c2;
+                            args = next_args;
+                        }
+                        other => return call_value(other, next_args, call_span),
                     },
-                    span,
-                ));
+                }
             }
-            // 本体はキャプチャ env（レキシカルスコープ）をベースに評価する。
-            let mut call_env = closure.env.clone();
-            if let Some(name) = &closure.name {
-                call_env.insert(name.clone(), Value::Func(closure.clone()));
-            }
-            for (param, value) in closure.params.iter().zip(arg_values) {
-                call_env.insert(param.clone(), value);
-            }
-            eval_expr(&closure.body, &call_env)
         }
         Value::Ctor { name, arity } => {
             if arg_values.len() != arity {
