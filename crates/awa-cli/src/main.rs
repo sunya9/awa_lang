@@ -144,7 +144,8 @@ fn emit_file(path: &str) {
 }
 
 // `awa build <file>`: IR を生成し clang でネイティブ実行ファイルを作る。
-fn build_file(path: &str) {
+// out_name が Some なら実行ファイル名をそれにする（awa.toml の name 用）。
+fn build_file(path: &str, out_name: Option<&str>) {
     let modules = load_or_exit(path);
     let ir = match compile_modules_to_ir(&modules) {
         Ok(ir) => ir,
@@ -154,6 +155,7 @@ fn build_file(path: &str) {
         }
     };
     let base = path.strip_suffix(".awa").unwrap_or(path);
+    let exe = out_name.unwrap_or(base);
     let ll_path = format!("{}.ll", base);
     if let Err(e) = std::fs::write(&ll_path, &ir) {
         eprintln!("IR を書けません ({}): {}", ll_path, e);
@@ -168,10 +170,10 @@ fn build_file(path: &str) {
     // -O2: LLVM の sibling-call 最適化で末尾再帰が定数スタックになる（ループ相当）。
     // 併せて未使用関数の除去（globaldce）など一般的な最適化も効く。
     let status = std::process::Command::new("clang")
-        .args(["-O2", &rt_path, &ll_path, "-o", base])
+        .args(["-O2", &rt_path, &ll_path, "-o", exe])
         .status();
     match status {
-        Ok(s) if s.success() => println!("built: {}", base),
+        Ok(s) if s.success() => println!("built: {}", exe),
         Ok(s) => {
             eprintln!("clang が失敗しました: {}", s);
             std::process::exit(1);
@@ -226,6 +228,71 @@ fn fmt_file(args: &[String]) {
     }
 }
 
+// プロジェクトマニフェスト awa.toml（最小）。name と entry だけ見る。
+struct Manifest {
+    name: Option<String>,
+    entry: Option<String>,
+}
+
+// 最小 TOML パーサ: `key = "value"` 行のみ。コメント(#)・空行・[section] は無視。
+fn parse_manifest(src: &str) -> Manifest {
+    let mut name = None;
+    let mut entry = None;
+    for line in src.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim().trim_matches('"').to_string();
+            match k.trim() {
+                "name" => name = Some(v),
+                "entry" => entry = Some(v),
+                _ => {}
+            }
+        }
+    }
+    Manifest { name, entry }
+}
+
+fn load_manifest() -> Option<Manifest> {
+    std::fs::read_to_string("awa.toml")
+        .ok()
+        .map(|s| parse_manifest(&s))
+}
+
+// `awa init [name]`: awa.toml と src/main.awa の雛形を作る。
+fn init_project(name: Option<&str>) {
+    if std::path::Path::new("awa.toml").exists() {
+        eprintln!("awa.toml は既に存在します");
+        std::process::exit(1);
+    }
+    let name = name.map(String::from).unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "app".to_string())
+    });
+    let manifest = format!(
+        "# awa プロジェクト設定\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"src/main.awa\"\n"
+    );
+    if let Err(e) = std::fs::write("awa.toml", manifest) {
+        eprintln!("awa.toml を書けません: {e}");
+        std::process::exit(1);
+    }
+    let _ = std::fs::create_dir_all("src");
+    if !std::path::Path::new("src/main.awa").exists() {
+        let main_src = "import std/io\n\nlet main = fn() {\n  io.println(\"Hello from awa!\")\n}\n";
+        if let Err(e) = std::fs::write("src/main.awa", main_src) {
+            eprintln!("src/main.awa を書けません: {e}");
+            std::process::exit(1);
+        }
+    }
+    println!("created awa.toml and src/main.awa");
+    println!("  awa         # インタプリタ実行");
+    println!("  awa build   # ネイティブビルド");
+}
+
 fn main() {
     // インタプリタは eval_expr が Rust 再帰なので、深い（末尾）再帰でスタックが溢れる。
     // 大きなスタックのスレッドで実行して実用的な深さを吸収する（native は -O2 の TCO で定数スタック）。
@@ -237,28 +304,66 @@ fn main() {
 }
 
 fn run_cli() {
-    // 引数: awa emit/build <file> はコンパイル、awa fmt <file> は整形、
-    // awa <file> はインタプリタ実行、引数なしは REPL。
+    // 引数: awa emit/build [file] はコンパイル、awa fmt は整形、awa init は雛形生成、
+    // awa <file> はインタプリタ実行。ファイル省略時は awa.toml の entry、無ければ REPL。
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("emit") | Some("build") => {
-            let Some(path) = args.get(2) else {
-                eprintln!("使い方: awa {} <file.awa>", &args[1]);
-                std::process::exit(1);
+            let is_emit = args[1] == "emit";
+            // ファイル引数があればそれ、無ければ awa.toml の entry。
+            let (path, out_name) = match args.get(2) {
+                Some(p) => (p.clone(), None),
+                None => {
+                    let m = load_manifest().unwrap_or_else(|| {
+                        eprintln!("使い方: awa {} <file.awa>（または awa.toml に entry）", args[1]);
+                        std::process::exit(1);
+                    });
+                    let entry = m.entry.unwrap_or_else(|| {
+                        eprintln!("awa.toml に entry がありません");
+                        std::process::exit(1);
+                    });
+                    (entry, m.name)
+                }
             };
-            if args[1] == "emit" {
-                emit_file(path);
+            if is_emit {
+                emit_file(&path);
             } else {
-                build_file(path);
+                build_file(&path, out_name.as_deref());
             }
         }
         Some("fmt") => fmt_file(&args),
+        Some("init") => init_project(args.get(2).map(|s| s.as_str())),
         Some(path) => run_file(path),
         None => {
+            // 引数なし: awa.toml の entry を実行、無ければ REPL。
+            if let Some(entry) = load_manifest().and_then(|m| m.entry) {
+                run_file(&entry);
+                return;
+            }
             if let Err(e) = repl() {
                 eprintln!("REPL エラー: {}", e);
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_manifest;
+
+    #[test]
+    fn manifest_の最小パース() {
+        let src = "# project\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.awa\"\n";
+        let m = parse_manifest(src);
+        assert_eq!(m.name.as_deref(), Some("demo"));
+        assert_eq!(m.entry.as_deref(), Some("src/main.awa"));
+    }
+
+    #[test]
+    fn manifest_は欠落キーを許容() {
+        let m = parse_manifest("name = \"x\"\n");
+        assert_eq!(m.name.as_deref(), Some("x"));
+        assert_eq!(m.entry, None);
     }
 }
