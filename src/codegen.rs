@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{TExpr, TExprKind, TStmt};
+use crate::ast::{Pattern, TExpr, TExprKind, TStmt, TypeExpr};
 use crate::error::AwaError;
 use crate::token::Token;
 use crate::types::Type;
@@ -21,15 +21,66 @@ fn unsupported<T>(what: impl Into<String>) -> Result<T> {
     Err(AwaError::Unsupported(what.into()))
 }
 
-// awa の型 → LLVM 型。関数型はクロージャ構造体。
+// awa の型 → LLVM 型。関数型はクロージャ構造体、ADT はヒープブロックへの ptr。
 fn llvm_ty(ty: &Type) -> Result<String> {
     match ty {
         Type::Int | Type::Long => Ok("i64".into()),
         Type::Float => Ok("double".into()),
         Type::Bool => Ok("i1".into()),
         Type::Fun(..) => Ok(CLOSURE_TY.into()),
+        Type::Con(..) => Ok("ptr".into()),
         other => unsupported(format!("型 {}", other)),
     }
+}
+
+// 構築子の情報（タグ・arity・所属型・フィールド型式・型パラメータ）。
+#[derive(Clone)]
+struct CtorInfo {
+    tag: u32,
+    arity: usize,
+    type_params: Vec<String>,
+    field_texprs: Vec<TypeExpr>,
+}
+
+// 型式＋param→具体型 の対応で、ADT フィールドの具体型を求める（単相前提）。
+fn resolve_field(texpr: &TypeExpr, param_map: &HashMap<String, Type>) -> Result<Type> {
+    match texpr {
+        TypeExpr::Var(p) => param_map
+            .get(p)
+            .cloned()
+            .ok_or_else(|| AwaError::Unsupported(format!("型パラメータ {}", p))),
+        TypeExpr::Con(name, args) => {
+            let resolved: Vec<Type> = args
+                .iter()
+                .map(|a| resolve_field(a, param_map))
+                .collect::<Result<_>>()?;
+            Ok(match name.as_str() {
+                "Int" => Type::Int,
+                "Long" => Type::Long,
+                "Float" => Type::Float,
+                "String" => Type::Str,
+                "Bool" => Type::Bool,
+                "Nil" => Type::Unit,
+                _ => Type::Con(name.clone(), resolved),
+            })
+        }
+        TypeExpr::Fun(ps, r) => {
+            let ps: Vec<Type> = ps
+                .iter()
+                .map(|p| resolve_field(p, param_map))
+                .collect::<Result<_>>()?;
+            Ok(Type::Fun(ps, Box::new(resolve_field(r, param_map)?)))
+        }
+    }
+}
+
+// 構築子ブロックの LLVM 型: { i32 tag, field0, ... }。
+fn block_ty(field_tys: &[Type]) -> Result<String> {
+    let mut parts = vec!["i32".to_string()];
+    for t in field_tys {
+        parts.push(llvm_ty(t)?);
+    }
+    Ok(format!("{{ {} }}", parts.join(", ")))
 }
 
 fn is_float(ty: &Type) -> bool {
@@ -47,6 +98,7 @@ struct Module {
     funcs: String,                          // 全関数定義
     fn_ctr: usize,                          // 匿名関数 @fnN の採番
     globals: HashMap<String, (Vec<Type>, Type)>, // トップレベル関数名 → (引数型, 戻り型)
+    ctors: HashMap<String, CtorInfo>,       // 構築子名 → 情報
 }
 
 impl Module {
@@ -118,17 +170,134 @@ impl Gen {
             TExprKind::Call(callee, args) => self.call(callee, args, m),
             TExprKind::Block(stmts) => self.block(stmts, m),
             TExprKind::Lambda(params, body) => self.lambda(params, body, &e.ty, m),
-            TExprKind::Case(..) => unsupported("case（パターンマッチ）"),
+            TExprKind::Case(subject, arms) => self.compile_case(subject, arms, m),
         }
     }
 
-    // 変数参照: ローカル/キャプチャ（scope の alloca）→ load、トップレベル関数 → クロージャ値 {@name, null}。
+    // case を逐次マッチへコンパイル。各腕でパターンを検査し、不一致なら次の腕へ、
+    // 一致したらフィールドを束縛して本体を評価する。網羅性は静的検査済み（最後は unreachable）。
+    fn compile_case(
+        &mut self,
+        subject: &TExpr,
+        arms: &[(Pattern, TExpr)],
+        m: &mut Module,
+    ) -> Result<String> {
+        let sv = self.expr(subject, m)?;
+        let sty = subject.ty.clone();
+        let res_ty = llvm_ty(&arms[0].1.ty)?;
+        let res = format!("%v{}", self.fresh());
+        self.line(&format!("{} = alloca {}", res, res_ty));
+        let end = format!("end{}", self.fresh());
+        for (pat, body) in arms {
+            let next = format!("arm{}", self.fresh());
+            let saved = self.scope.clone();
+            self.match_pattern_ir(pat, &sv, &sty, &next, m)?;
+            let bv = self.expr(body, m)?;
+            self.line(&format!("store {} {}, ptr {}", res_ty, bv, res));
+            self.line(&format!("br label %{}", end));
+            self.scope = saved;
+            self.label(&next);
+        }
+        // どの腕にも当たらない経路（網羅性が保証するので到達しない）。
+        self.line("unreachable");
+        self.label(&end);
+        let r = format!("%t{}", self.fresh());
+        self.line(&format!("{} = load {}, ptr {}", r, res_ty, res));
+        Ok(r)
+    }
+
+    // パターンを値に照合する IR を出す。不一致なら fail へ br、一致なら束縛して継続。
+    fn match_pattern_ir(
+        &mut self,
+        pat: &Pattern,
+        value: &str,
+        value_ty: &Type,
+        fail: &str,
+        m: &Module,
+    ) -> Result<()> {
+        match pat {
+            Pattern::Wildcard => Ok(()),
+            Pattern::Var(n) => self.bind_local(n, value, value_ty),
+            Pattern::Bool(b) => {
+                self.eq_or_fail("i1", value, if *b { "1" } else { "0" }, fail);
+                Ok(())
+            }
+            Pattern::Int(n) => {
+                let v = n.to_string();
+                self.eq_or_fail("i64", value, &v, fail);
+                Ok(())
+            }
+            Pattern::Str(_) => unsupported("文字列パターン（codegen 未対応）"),
+            Pattern::Or(_) => unsupported("or パターン（codegen 未対応）"),
+            Pattern::Ctor(name, subs) => {
+                let ci = m
+                    .ctors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| AwaError::Unsupported(format!("未知の構築子 {}", name)))?;
+                // tag は先頭の i32。
+                let tag = format!("%t{}", self.fresh());
+                self.line(&format!("{} = load i32, ptr {}", tag, value));
+                self.eq_or_fail("i32", &tag, &ci.tag.to_string(), fail);
+                if subs.is_empty() {
+                    return Ok(());
+                }
+                // フィールド型を解決（型パラメータ → scrutinee の具体型引数）。
+                let Type::Con(_, typeargs) = value_ty else {
+                    return unsupported("構築子パターンの主語が ADT でない");
+                };
+                let param_map: HashMap<String, Type> = ci
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(typeargs.iter().cloned())
+                    .collect();
+                let field_tys: Vec<Type> = ci
+                    .field_texprs
+                    .iter()
+                    .map(|t| resolve_field(t, &param_map))
+                    .collect::<Result<_>>()?;
+                let bty = block_ty(&field_tys)?;
+                for (i, (sub, fty)) in subs.iter().zip(field_tys.iter()).enumerate() {
+                    let fp = format!("%t{}", self.fresh());
+                    self.line(&format!(
+                        "{} = getelementptr {}, ptr {}, i32 0, i32 {}",
+                        fp,
+                        bty,
+                        value,
+                        i + 1
+                    ));
+                    let fv = format!("%t{}", self.fresh());
+                    self.line(&format!("{} = load {}, ptr {}", fv, llvm_ty(fty)?, fp));
+                    self.match_pattern_ir(sub, &fv, fty, fail, m)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // value == lit なら継続、違えば fail へ。
+    fn eq_or_fail(&mut self, llty: &str, value: &str, lit: &str, fail: &str) {
+        let c = format!("%t{}", self.fresh());
+        self.line(&format!("{} = icmp eq {} {}, {}", c, llty, value, lit));
+        let cont = format!("cont{}", self.fresh());
+        self.line(&format!("br i1 {}, label %{}, label %{}", c, cont, fail));
+        self.label(&cont);
+    }
+
+    // 変数参照: ローカル/キャプチャ → load、ヌル構築子 → 構築、トップレベル関数 → クロージャ値。
     fn var(&mut self, name: &str, m: &Module) -> Result<String> {
         if let Some((slot, ty)) = self.scope.get(name).cloned() {
             let llty = llvm_ty(&ty)?;
             let r = format!("%t{}", self.fresh());
             self.line(&format!("{} = load {}, ptr {}", r, llty, slot));
             Ok(r)
+        } else if let Some(ci) = m.ctors.get(name).cloned() {
+            if ci.arity == 0 {
+                self.construct(&ci, &[]) // ヌル構築子
+            } else {
+                unsupported(format!("構築子を値として使う: {}", name))
+            }
         } else if m.globals.contains_key(name) {
             // トップレベル関数を値として使う → クロージャ {@name, null}。
             let c0 = format!("%t{}", self.fresh());
@@ -206,9 +375,50 @@ impl Gen {
         Ok(r)
     }
 
+    // 構築子ブロックを malloc して tag と各フィールドを格納し、その ptr を返す。
+    fn construct(&mut self, ci: &CtorInfo, fields: &[(String, Type)]) -> Result<String> {
+        let field_tys: Vec<Type> = fields.iter().map(|(_, t)| t.clone()).collect();
+        let bty = block_ty(&field_tys)?;
+        let szp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = getelementptr {}, ptr null, i32 1", szp, bty));
+        let sz = format!("%t{}", self.fresh());
+        self.line(&format!("{} = ptrtoint ptr {} to i64", sz, szp));
+        let p = format!("%t{}", self.fresh());
+        self.line(&format!("{} = call ptr @malloc(i64 {})", p, sz));
+        let tp = format!("%t{}", self.fresh());
+        self.line(&format!(
+            "{} = getelementptr {}, ptr {}, i32 0, i32 0",
+            tp, bty, p
+        ));
+        self.line(&format!("store i32 {}, ptr {}", ci.tag, tp));
+        for (i, (op, ty)) in fields.iter().enumerate() {
+            let fp = format!("%t{}", self.fresh());
+            self.line(&format!(
+                "{} = getelementptr {}, ptr {}, i32 0, i32 {}",
+                fp,
+                bty,
+                p,
+                i + 1
+            ));
+            self.line(&format!("store {} {}, ptr {}", llvm_ty(ty)?, op, fp));
+        }
+        Ok(p)
+    }
+
     fn call(&mut self, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
         // 引数の型と値。
         let mut arg_parts = Vec::with_capacity(args.len());
+        // callee が構築子なら、引数を評価して Data ブロックを構築。
+        if let TExprKind::Var(name) = &callee.kind {
+            if let Some(ci) = m.ctors.get(name).cloned() {
+                let mut fields = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = self.expr(a, m)?;
+                    fields.push((v, a.ty.clone()));
+                }
+                return self.construct(&ci, &fields);
+            }
+        }
         // callee がトップレベル関数名なら直接呼び出し（env=null）。
         if let TExprKind::Var(name) = &callee.kind {
             if let Some((params, ret)) = m.globals.get(name).cloned() {
@@ -498,10 +708,29 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
         }
     }
 
+    // 構築子レジストリ（タグは型ごとに宣言順 0,1,...）。
+    let mut ctors: HashMap<String, CtorInfo> = HashMap::new();
+    for s in stmts {
+        if let TStmt::Type(def) = s {
+            for (tag, v) in def.variants.iter().enumerate() {
+                ctors.insert(
+                    v.name.clone(),
+                    CtorInfo {
+                        tag: tag as u32,
+                        arity: v.fields.len(),
+                        type_params: def.params.clone(),
+                        field_texprs: v.fields.clone(),
+                    },
+                );
+            }
+        }
+    }
+
     let mut m = Module {
         funcs: String::new(),
         fn_ctr: 0,
         globals,
+        ctors,
     };
 
     // トップレベル関数を @name で出力（キャプチャなし＝env は使わない）。
@@ -634,10 +863,14 @@ mod tests {
     }
 
     #[test]
-    fn adtは未対応() {
-        assert!(matches!(
-            try_ir("type Opt(a) { Some(a); None }; Some(1)"),
-            Err(AwaError::Unsupported(_))
-        ));
+    fn adtの構築とcaseを出力する() {
+        let out = ir(
+            "type Opt(a) { Some(a); None }; \
+             let f = fn(o: Opt(Int), d: Int) -> Int { case o { Some(x) -> x; None -> d } }; \
+             f(Some(1), 0)",
+        );
+        assert!(out.contains("@malloc")); // 構築でヒープ確保
+        assert!(out.contains("load i32")); // case で tag を読む
+        assert!(out.contains("unreachable")); // 網羅後のフォールスルー
     }
 }

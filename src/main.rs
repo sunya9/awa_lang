@@ -984,6 +984,21 @@ mod tests {
     }
 
     #[test]
+    fn codegen_adtとパターンマッチ() {
+        // Option の構築・case と、再帰 ADT(List)の畳み込みが native 実行される。
+        let out = compile_and_run(
+            "type Opt(a) { Some(a); None }; \
+             let uw = fn(o: Opt(Int), d: Int) -> Int { case o { Some(x) -> x; None -> d } }; \
+             uw(Some(42), 0)\n\
+             uw(None, 7)\n\
+             type List(a) { Cons(a, List(a)); Nil }; \
+             let sum = fn(xs: List(Int)) -> Int { case xs { Nil -> 0; Cons(h, t) -> h + sum(t) } }; \
+             sum(Cons(1, Cons(2, Cons(3, Nil))))",
+        );
+        assert_eq!(out, "42\n7\n6\n");
+    }
+
+    #[test]
     fn example_native() {
         let src = include_str!("../examples/native.awa");
         let out = compile_and_run(src);
