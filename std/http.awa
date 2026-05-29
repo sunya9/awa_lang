@@ -155,8 +155,61 @@ let parse_headers = fn(lines) {
   }
 }
 
+// ----- chunked 転送デコード -----
+let hex_digit = fn(c) {
+  case c >= 48 && c <= 57 {
+    true -> c - 48
+    false -> case c >= 97 && c <= 102 {
+      true -> c - 97 + 10
+      false -> case c >= 65 && c <= 70 {
+        true -> c - 65 + 10
+        false -> -1
+      }
+    }
+  }
+}
+
+let hex_loop = fn(s, i, acc) {
+  let d = hex_digit(string_char_at(s, i))
+  case d == -1 {
+    true -> acc
+    false -> hex_loop(s, i + 1, acc * 16 + d)
+  }
+}
+
+// チャンクサイズ行（16進、; 拡張は無視）→ サイズ。
+let parse_hex = fn(s) { hex_loop(s, 0, 0) }
+
+// 位置 i から \n のインデックス（無ければ末尾）。
+let next_nl = fn(s, i) {
+  let c = string_char_at(s, i)
+  case c == 10 {
+    true -> i
+    false -> case c == -1 {
+      true -> i
+      false -> next_nl(s, i + 1)
+    }
+  }
+}
+
+// chunked ボディをデコード。i は次のサイズ行の先頭。サイズはバイト単位（ASCII 前提）。
+let dechunk_from = fn(s, i, acc) {
+  let nl = next_nl(s, i)
+  let size = parse_hex(strip_cr(string.slice(s, i, nl)))
+  case size == 0 {
+    true -> acc
+    false -> {
+      let data = nl + 1
+      dechunk_from(s, data + size + 2, acc <> string.slice(s, data, data + size))
+    }
+  }
+}
+
+// Transfer-Encoding: chunked のボディを連結された生データへ。
+pub let dechunk = fn(s: String) -> String { dechunk_from(s, 0, "") }
+
 // ----- 解析 -----
-// 生のレスポンス文字列 → Response。
+// 生のレスポンス文字列 → Response（chunked なら自動デコード）。
 pub let parse_response = fn(raw: String) -> result.Result(Response, String) {
   let b = find_sub(raw, "\r\n\r\n")
   case b == -1 {
@@ -171,7 +224,16 @@ pub let parse_response = fn(raw: String) -> result.Result(Response, String) {
             list.Cons(_, list.Cons(codestr, _)) -> string.to_int(codestr)
             _ -> 0
           }
-          result.Ok(Response(code, parse_headers(rest), body))
+          let headers = parse_headers(rest)
+          // Transfer-Encoding: chunked ならボディをデコードする。
+          let final_body = case get_header(headers, "transfer-encoding") {
+            option.Some(te) -> case string.to_lower(te) == "chunked" {
+              true -> dechunk(body)
+              false -> body
+            }
+            option.None -> body
+          }
+          result.Ok(Response(code, headers, final_body))
         }
       }
     }

@@ -2302,6 +2302,21 @@ mod tests {
     }
 
     #[test]
+    fn std_http_chunked_デコード() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/http\n\
+             import std/result\n\
+             let raw = \"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n4\\r\\nWiki\\r\\n5\\r\\npedia\\r\\n0\\r\\n\\r\\n\"\n\
+             io.println(case http.parse_response(raw) {\n\
+               result.Ok(r) -> http.resp_body(r)\n\
+               result.Err(e) -> e\n\
+             })\n",
+        );
+        assert_eq!(out, "Wikipedia\n");
+    }
+
+    #[test]
     fn std_http_parse_and_build() {
         // ソケットを使わない純粋関数（parse_response / parse_request / response_to_string）を検証。
         let out = std_build_run(
