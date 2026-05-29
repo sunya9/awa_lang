@@ -1,5 +1,8 @@
 // shapes モジュール: pub type は型と全構築子を公開する。
-pub type Shape { Circle(Int); Square(Int) }
+pub type Shape {
+  Circle(Int)
+  Square(Int)
+}
 
 pub let area = fn(s: Shape) -> Int {
   case s {

@@ -21,115 +21,74 @@ pub type Json {
 }
 
 // パーサの途中状態: 値と次の位置。
-type Parsed(a) { Parsed(a, Int) }
+type Parsed(a) {
+  Parsed(a, Int)
+}
 
 // ===== パーサ =====
-
 // 空白（スペース/タブ/改行/復帰）を読み飛ばし、次の位置を返す。
 let skip_ws = fn(s, i) {
-  let c = string_char_at(s, i);
-  if c == 32 {
-    skip_ws(s, i + 1)
-  } else {
-    if c == 10 {
-      skip_ws(s, i + 1)
-    } else {
-      if c == 9 {
-        skip_ws(s, i + 1)
-      } else {
-        if c == 13 { skip_ws(s, i + 1) } else { i }
-      }
+  let c = string_char_at(s, i)
+  if c == 32 { skip_ws(s, i + 1) } else {
+    if c == 10 { skip_ws(s, i + 1) } else {
+      if c == 9 { skip_ws(s, i + 1) } else { if c == 13 { skip_ws(s, i + 1) } else { i } }
     }
   }
 }
 
 // "..." の中身を 1 文字ずつ読む（エスケープ対応・\uXXXX は未対応）。i は開きクォートの次。
 let scan_string = fn(s, i, acc) {
-  let c = string_char_at(s, i);
-  if c == -1 {
-    result.Err("unterminated string")
-  } else {
-    if c == 34 {
-      result.Ok(Parsed(acc, i + 1))
-    } else {
+  let c = string_char_at(s, i)
+  if c == -1 { result.Err("unterminated string") } else {
+    if c == 34 { result.Ok(Parsed(acc, i + 1)) } else {
       if c == 92 {
-        let e = string_char_at(s, i + 1);
-        let ch = if e == 110 {
-          char_to_string(10)
-        } else {
-          if e == 116 {
-            char_to_string(9)
-          } else {
-            if e == 114 {
-              char_to_string(13)
-            } else {
-              if e == 34 {
-                char_to_string(34)
-              } else {
+        let e = string_char_at(s, i + 1)
+        let ch = if e == 110 { char_to_string(10) } else {
+          if e == 116 { char_to_string(9) } else {
+            if e == 114 { char_to_string(13) } else {
+              if e == 34 { char_to_string(34) } else {
                 if e == 92 { char_to_string(92) } else { char_to_string(e) }
               }
             }
           }
-        };
+        }
         scan_string(s, i + 2, acc <> ch)
-      } else {
-        scan_string(s, i + 1, acc <> char_to_string(c))
-      }
+      } else { scan_string(s, i + 1, acc <> char_to_string(c)) }
     }
   }
 }
 
 // i は開きクォート。文字列を読んで Parsed(String) を返す。
 let parse_string_raw = fn(s, i) {
-  if string_char_at(s, i) == 34 {
-    scan_string(s, i + 1, "")
-  } else {
-    result.Err("expected string")
-  }
+  if string_char_at(s, i) == 34 { scan_string(s, i + 1, "") } else { result.Err("expected string") }
 }
 
 // 数値トークンの終端位置（[0-9 - + . e E] が続く限り）。
 let num_end = fn(s, i) {
-  let c = string_char_at(s, i);
-  let ok = if c == 45 {
-    true
-  } else {
-    if c == 43 {
-      true
-    } else {
-      if c == 46 {
-        true
-      } else {
-        if c == 101 {
-          true
-        } else {
-          if c == 69 {
-            true
-          } else {
-            if c >= 48 { c <= 57 } else { false }
-          }
+  let c = string_char_at(s, i)
+  let ok = if c == 45 { true } else {
+    if c == 43 { true } else {
+      if c == 46 { true } else {
+        if c == 101 { true } else {
+          if c == 69 { true } else { if c >= 48 { c <= 57 } else { false } }
         }
       }
     }
-  };
+  }
   if ok { num_end(s, i + 1) } else { i }
 }
 
 let parse_number = fn(s, i) {
-  let e = num_end(s, i);
-  if e == i {
-    result.Err("invalid number")
-  } else {
+  let e = num_end(s, i)
+  if e == i { result.Err("invalid number") } else {
     result.Ok(Parsed(JNum(string_to_float(string.slice(s, i, e))), e))
   }
 }
 
 // word（"true"/"false"/"null"）に一致すれば val を返す。
 let parse_lit = fn(s, i, word, val) {
-  let wl = string_length(word);
-  if string.slice(s, i, i + wl) == word {
-    result.Ok(Parsed(val, i + wl))
-  } else {
+  let wl = string_length(word)
+  if string.slice(s, i, i + wl) == word { result.Ok(Parsed(val, i + wl)) } else {
     result.Err("invalid literal")
   }
 }
@@ -137,21 +96,15 @@ let parse_lit = fn(s, i, word, val) {
 // 配列要素ループ。pv = 値パーサ（parse_value 自身を受け取る＝相互再帰の回避）。
 // acc は逆順に積む（呼び元が reverse する）。i は要素 or ']' の位置。
 let parse_elems = fn(s, i, acc, pv) {
-  let j = skip_ws(s, i);
-  if string_char_at(s, j) == 93 {
-    result.Ok(Parsed(acc, j + 1))
-  } else {
+  let j = skip_ws(s, i)
+  if string_char_at(s, j) == 93 { result.Ok(Parsed(acc, j + 1)) } else {
     case pv(s, j) {
       result.Err(e) -> result.Err(e)
       result.Ok(Parsed(v, k)) -> {
-        let m = skip_ws(s, k);
-        let cc = string_char_at(s, m);
-        if cc == 44 {
-          parse_elems(s, m + 1, list.Cons(v, acc), pv)
-        } else {
-          if cc == 93 {
-            result.Ok(Parsed(list.Cons(v, acc), m + 1))
-          } else {
+        let m = skip_ws(s, k)
+        let cc = string_char_at(s, m)
+        if cc == 44 { parse_elems(s, m + 1, list.Cons(v, acc), pv) } else {
+          if cc == 93 { result.Ok(Parsed(list.Cons(v, acc), m + 1)) } else {
             result.Err("expected , or ] in array")
           }
         }
@@ -162,34 +115,26 @@ let parse_elems = fn(s, i, acc, pv) {
 
 // オブジェクトメンバループ。pv = 値パーサ。i は "key" or '}' の位置。
 let parse_members = fn(s, i, acc, pv) {
-  let j = skip_ws(s, i);
-  if string_char_at(s, j) == 125 {
-    result.Ok(Parsed(acc, j + 1))
-  } else {
+  let j = skip_ws(s, i)
+  if string_char_at(s, j) == 125 { result.Ok(Parsed(acc, j + 1)) } else {
     case parse_string_raw(s, j) {
       result.Err(e) -> result.Err(e)
       result.Ok(Parsed(key, k)) -> {
-        let colon = skip_ws(s, k);
+        let colon = skip_ws(s, k)
         if string_char_at(s, colon) == 58 {
           case pv(s, colon + 1) {
             result.Err(e) -> result.Err(e)
             result.Ok(Parsed(v, m)) -> {
-              let n = skip_ws(s, m);
-              let cc = string_char_at(s, n);
-              if cc == 44 {
-                parse_members(s, n + 1, list.Cons(pair.Pair(key, v), acc), pv)
-              } else {
-                if cc == 125 {
-                  result.Ok(Parsed(list.Cons(pair.Pair(key, v), acc), n + 1))
-                } else {
+              let n = skip_ws(s, m)
+              let cc = string_char_at(s, n)
+              if cc == 44 { parse_members(s, n + 1, list.Cons(pair.Pair(key, v), acc), pv) } else {
+                if cc == 125 { result.Ok(Parsed(list.Cons(pair.Pair(key, v), acc), n + 1)) } else {
                   result.Err("expected , or } in object")
                 }
               }
             }
           }
-        } else {
-          result.Err("expected : in object")
-        }
+        } else { result.Err("expected : in object") }
       }
     }
   }
@@ -197,8 +142,8 @@ let parse_members = fn(s, i, acc, pv) {
 
 // 1 つの JSON 値をパース。配列/オブジェクトは自分自身を pv として渡す（自己再帰）。
 let parse_value = fn(s, i) {
-  let j = skip_ws(s, i);
-  let c = string_char_at(s, j);
+  let j = skip_ws(s, i)
+  let c = string_char_at(s, j)
   if c == 34 {
     case parse_string_raw(s, j) {
       result.Err(e) -> result.Err(e)
@@ -217,17 +162,9 @@ let parse_value = fn(s, i) {
           result.Ok(Parsed(items, k)) -> result.Ok(Parsed(JArr(list.reverse(items)), k))
         }
       } else {
-        if c == 116 {
-          parse_lit(s, j, "true", JBool(true))
-        } else {
-          if c == 102 {
-            parse_lit(s, j, "false", JBool(false))
-          } else {
-            if c == 110 {
-              parse_lit(s, j, "null", JNull)
-            } else {
-              parse_number(s, j)
-            }
+        if c == 116 { parse_lit(s, j, "true", JBool(true)) } else {
+          if c == 102 { parse_lit(s, j, "false", JBool(false)) } else {
+            if c == 110 { parse_lit(s, j, "null", JNull) } else { parse_number(s, j) }
           }
         }
       }
@@ -244,33 +181,21 @@ pub let parse = fn(input: String) -> result.Result(Json, String) {
 }
 
 // ===== シリアライザ =====
-
 // JSON 文字列値のエスケープ（" \ 改行 タブ 復帰。最小限）。
 let escape_at = fn(s, i, len) {
-  if i >= len {
-    ""
-  } else {
-    let c = string_char_at(s, i);
-    let piece = if c == 34 {
-      "\\\""
-    } else {
-      if c == 92 {
-        "\\\\"
-      } else {
-        if c == 10 {
-          "\\n"
-        } else {
-          if c == 9 {
-            "\\t"
-          } else {
-            if c == 13 { "\\r" } else { char_to_string(c) }
-          }
+  if i >= len { "" } else {
+    let c = string_char_at(s, i)
+    let piece = if c == 34 { "\\\"" } else {
+      if c == 92 { "\\\\" } else {
+        if c == 10 { "\\n" } else {
+          if c == 9 { "\\t" } else { if c == 13 { "\\r" } else { char_to_string(c) } }
         }
       }
-    };
+    }
     piece <> escape_at(s, i + 1, len)
   }
 }
+
 let escape_str = fn(s) { "\"" <> escape_at(s, 0, string_length(s)) <> "\"" }
 
 // Json 値を文字列へ。入れ子は list.map に stringify 自身を渡してたどる（自己再帰）。
@@ -281,15 +206,18 @@ pub let stringify = fn(j: Json) -> String {
     JNum(n) -> float_to_string(n)
     JStr(s) -> escape_str(s)
     JArr(items) -> {
-      let parts = list.map(items, fn(x) { stringify(x) });
+      let parts = list.map(items, fn(x) { stringify(x) })
       "[" <> string.join(parts, ",") <> "]"
     }
     JObj(fields) -> {
-      let parts = list.map(fields, fn(p) {
-        case p {
-          pair.Pair(k, v) -> escape_str(k) <> ":" <> stringify(v)
+      let parts = list.map(
+        fields,
+        fn(p) {
+          case p {
+            pair.Pair(k, v) -> escape_str(k) <> ":" <> stringify(v)
+          }
         }
-      });
+      )
       "{" <> string.join(parts, ",") <> "}"
     }
   }

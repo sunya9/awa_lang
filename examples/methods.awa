@@ -1,7 +1,6 @@
 // ===== 限定メソッド（impl ブロック）のデモ =====
 // impl で型にメソッドを生やし、receiver.method(args) で呼ぶ。
 // 解決はレシーバの「具体型」で静的に行われる。
-
 type Option(a) {
   Some(a)
   None
@@ -25,30 +24,35 @@ impl Option(a) {
 
 let inc = fn(n) { n + 1 }
 
-Some(5).map(inc)                    // Some(6)
-Some(5).map(inc).unwrap_or(0)       // 6（チェーン）
-None.map(inc).unwrap_or(99)         // 99
+Some(5).map(inc)  // Some(6)
+
+Some(5).map(inc).unwrap_or(0)  // 6（チェーン）
+
+None.map(inc).unwrap_or(99)  // 99
 
 // ユーザー定義型の自己再帰メソッド。
 type Tree(a) {
   Leaf(a)
   Branch(Tree(a), Tree(a))
 }
+
 impl Tree(a) {
   fn map(self, f) {
     case self {
-      Leaf(x)      -> Leaf(f(x))
-      Branch(l, r) -> Branch(l.map(f), r.map(f))   // 自己再帰メソッド呼び出し
+      Leaf(x) -> Leaf(f(x))
+      Branch(l, r) -> Branch(l.map(f), r.map(f))  // 自己再帰メソッド呼び出し
     }
   }
 }
-Branch(Leaf(1), Leaf(2)).map(inc)   // Branch(Leaf(2), Leaf(3))
+
+Branch(Leaf(1), Leaf(2)).map(inc)  // Branch(Leaf(2), Leaf(3))
 
 // 組込型にもメソッドを生やせる。
 impl Int {
   fn double(self) { self * 2 }
 }
-5.double()                          // 10
+
+5.double()  // 10
 
 // 末尾（統合テストで検査）: Some(6) を map して unwrap → 7。
-Some(6).map(inc).unwrap_or(0)       // 7
+Some(6).map(inc).unwrap_or(0)  // 7

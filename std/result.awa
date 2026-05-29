@@ -1,8 +1,10 @@
 // 標準ライブラリ: Result（成功 Ok か失敗 Err）。純粋 awa＝stdlib。
-pub type Result(a, e) { Ok(a); Err(e) }
+pub type Result(a, e) {
+  Ok(a)
+  Err(e)
+}
 
 // ----- 関数版（qualified `result.map(r, f)` / pipe 向き）-----
-
 // Ok の中身に関数を適用する（Err はそのまま伝播）。
 pub let map: fn(Result(a, e), fn(a) -> b) -> Result(b, e) = fn(r, f) {
   case r {

@@ -2,7 +2,10 @@
 // 再帰関数なので let に関数型注釈を付ける（戻り型を確定させ、引数型はラムダへ流れる）。
 import std/option
 
-pub type List(a) { Cons(a, List(a)); Nil }
+pub type List(a) {
+  Cons(a, List(a))
+  Nil
+}
 
 // 要素数。
 pub let length: fn(List(a)) -> Int = fn(xs) {
@@ -45,9 +48,7 @@ pub let append: fn(List(a), List(a)) -> List(a) = fn(xs, ys) {
 }
 
 // 逆順（fold で積み直す）。
-pub let reverse: fn(List(a)) -> List(a) = fn(xs) {
-  fold(xs, Nil, fn(acc, x) { Cons(x, acc) })
-}
+pub let reverse: fn(List(a)) -> List(a) = fn(xs) { fold(xs, Nil, fn(acc, x) { Cons(x, acc) }) }
 
 // いずれかの要素が述語を満たすか（最初の真で短絡）。
 pub let any: fn(List(a), fn(a) -> Bool) -> Bool = fn(xs, pred) {
@@ -76,9 +77,7 @@ pub let find = fn(xs, pred) {
 
 // 先頭から最大 n 個。
 pub let take: fn(List(a), Int) -> List(a) = fn(xs, n) {
-  if n <= 0 {
-    Nil
-  } else {
+  if n <= 0 { Nil } else {
     case xs {
       Nil -> Nil
       Cons(h, t) -> Cons(h, take(t, n - 1))
@@ -88,9 +87,7 @@ pub let take: fn(List(a), Int) -> List(a) = fn(xs, n) {
 
 // 先頭の n 個を捨てた残り。
 pub let drop: fn(List(a), Int) -> List(a) = fn(xs, n) {
-  if n <= 0 {
-    xs
-  } else {
+  if n <= 0 { xs } else {
     case xs {
       Nil -> Nil
       Cons(_, t) -> drop(t, n - 1)

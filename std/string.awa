@@ -20,22 +20,17 @@ pub let from_char = fn(c: Int) -> String { char_to_string(c) }
 
 // 部分文字列 [start, end)（コードポイント単位）。
 pub let slice: fn(String, Int, Int) -> String = fn(s, start, end) {
-  if start >= end {
-    ""
-  } else {
+  if start >= end { "" } else {
     char_to_string(string_char_at(s, start)) <> slice(s, start + 1, end)
   }
 }
 
 // ch（コードポイント）が最初に現れる位置。無ければ -1。
 let index_from = fn(s, ch, i) {
-  let c = string_char_at(s, i);
-  if c == -1 {
-    -1
-  } else {
-    if c == ch { i } else { index_from(s, ch, i + 1) }
-  }
+  let c = string_char_at(s, i)
+  if c == -1 { -1 } else { if c == ch { i } else { index_from(s, ch, i + 1) } }
 }
+
 pub let index_of = fn(s: String, ch: Int) -> Int { index_from(s, ch, 0) }
 
 // ch（コードポイント）を含むか。
@@ -43,30 +38,27 @@ pub let contains_char = fn(s: String, ch: Int) -> Bool { index_from(s, ch, 0) >=
 
 // prefix で始まるか。
 pub let starts_with = fn(s: String, prefix: String) -> Bool {
-  let pl = string_length(prefix);
+  let pl = string_length(prefix)
   if string_length(s) < pl { false } else { slice(s, 0, pl) == prefix }
 }
 
 // suffix で終わるか。
 pub let ends_with = fn(s: String, suffix: String) -> Bool {
-  let sl = string_length(s);
-  let fl = string_length(suffix);
+  let sl = string_length(s)
+  let fl = string_length(suffix)
   if sl < fl { false } else { slice(s, sl - fl, sl) == suffix }
 }
 
 // sep（コードポイント）で分割した断片のリスト。連続/末尾の sep は空文字を生む。
 let split_from = fn(s, sep, i, cur) {
-  let c = string_char_at(s, i);
-  if c == -1 {
-    list.Cons(cur, list.Nil)
-  } else {
-    if c == sep {
-      list.Cons(cur, split_from(s, sep, i + 1, ""))
-    } else {
+  let c = string_char_at(s, i)
+  if c == -1 { list.Cons(cur, list.Nil) } else {
+    if c == sep { list.Cons(cur, split_from(s, sep, i + 1, "")) } else {
       split_from(s, sep, i + 1, cur <> char_to_string(c))
     }
   }
 }
+
 pub let split = fn(s: String, sep: Int) -> list.List(String) { split_from(s, sep, 0, "") }
 
 // 文字列のリストを sep で連結。
@@ -74,9 +66,10 @@ let join_from = fn(xs, sep, first) {
   case xs {
     list.Nil -> ""
     list.Cons(h, t) -> {
-      let pre = if first { "" } else { sep };
+      let pre = if first { "" } else { sep }
       pre <> h <> join_from(t, sep, false)
     }
   }
 }
+
 pub let join = fn(xs: list.List(String), sep: String) -> String { join_from(xs, sep, true) }

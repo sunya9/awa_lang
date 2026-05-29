@@ -7,15 +7,16 @@ use std::path::PathBuf;
 
 use awa_core::query::{completions, definition_at, type_at};
 use awa_core::span::{line_col_to_offset, offset_to_line_col};
-use awa_core::{check_document, check_source, span::Span};
+use awa_core::{check_document, check_source, fmt, span::Span};
 use lsp_server::{Connection, Message, Notification, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics};
 use lsp_types::{
     CompletionItem, CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
     DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, Location, MarkedString, OneOf, Position, PublishDiagnosticsParams,
-    Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DocumentFormattingParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, Location, MarkedString, OneOf, Position,
+    PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Url,
 };
 use serde_json::Value;
 
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions::default()),
+        document_formatting_provider: Some(OneOf::Left(true)),
         ..Default::default()
     })?;
     connection.initialize(capabilities)?;
@@ -48,6 +50,7 @@ fn main_loop(conn: Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
                     "textDocument/hover" => handle_hover(&docs, req.params),
                     "textDocument/definition" => handle_definition(&docs, req.params),
                     "textDocument/completion" => handle_completion(&docs, req.params),
+                    "textDocument/formatting" => handle_formatting(&docs, req.params),
                     _ => Value::Null,
                 };
                 conn.sender
@@ -190,6 +193,28 @@ fn import_completions(uri: &Url) -> Vec<String> {
     paths
 }
 
+// textDocument/formatting: 文書全体を整形し、全体を置換する 1 つの TextEdit を返す。
+// 構文エラーで整形できないときは編集なし（null）。
+fn handle_formatting(docs: &HashMap<Url, String>, params: Value) -> Value {
+    let p: DocumentFormattingParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return Value::Null,
+    };
+    let Some(text) = docs.get(&p.text_document.uri) else {
+        return Value::Null;
+    };
+    let Ok(formatted) = fmt::format_source(text) else {
+        return Value::Null;
+    };
+    // 文書全体の範囲（先頭〜末尾）。end は最終行・最終桁。
+    let last_line = text.lines().count().max(1) as u32;
+    let edit = TextEdit {
+        range: Range::new(Position::new(0, 0), Position::new(last_line, 0)),
+        new_text: formatted,
+    };
+    serde_json::to_value(vec![edit]).unwrap_or(Value::Null)
+}
+
 // テキストを検査して診断を publish する。
 fn publish(conn: &Connection, uri: Url, text: &str) {
     let params = PublishDiagnosticsParams {
@@ -286,6 +311,20 @@ mod tests {
         let comp = import_completions(&uri());
         assert!(comp.iter().any(|c| c == "std/io"));
         assert!(comp.iter().any(|c| c == "std/list"));
+    }
+
+    #[test]
+    fn formatting要求は全体を整形するtextedit() {
+        let mut docs = HashMap::new();
+        docs.insert(uri(), "let  x=1+2".to_string());
+        let params = serde_json::json!({
+            "textDocument": { "uri": uri().to_string() },
+            "options": { "tabSize": 2, "insertSpaces": true }
+        });
+        let v = handle_formatting(&docs, params);
+        let edits: Vec<TextEdit> = serde_json::from_value(v).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "let x = 1 + 2\n");
     }
 
     #[test]

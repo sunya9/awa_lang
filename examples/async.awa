@@ -1,26 +1,30 @@
 // ===== 非同期（論理時間イベントループ）のデモ =====
 // Future はランタイムが持つ不透明ハンドル。awa は純粋のまま、do 記法が
 // flatMap 連鎖へ脱糖されて async/await のように書ける。
-//   pure  : a -> Future(a)
-//   delay : (Int, a) -> Future(a)   // Int 論理tick後に解決
-//   .flatMap / .map                 // 継続を繋ぐ
-//   run   : Future(a) -> a          // ループを回して最終値
+// pure  : a -> Future(a)
+// delay : (Int, a) -> Future(a)   // Int 論理tick後に解決
+// .flatMap / .map                 // 継続を繋ぐ
+// run   : Future(a) -> a          // ループを回して最終値
 // awa examples/async.awa
-
 // 2 つの遅延を do で合成（5tick後と10tick後 → 順に解決され合算）。
-run(do {
-  x <- delay(10, 1)
-  y <- delay(5, 2)
-  pure(x + y)
-})
+run(
+  do {
+    x <- delay(10, 1)
+    y <- delay(5, 2)
+    pure(x + y)
+  }
+)
 
 // map で結果を変換。
 run(delay(3, 20).map(fn(n: Int) -> Int { n + 1 }))
 
 // Future を返す関数を段階的に繋ぐ。
 let step = fn(n: Int) -> Future(Int) { delay(1, n * 2) }
-run(do {
-  a <- step(3)
-  b <- step(a)
-  pure(b)
-})
+
+run(
+  do {
+    a <- step(3)
+    b <- step(a)
+    pure(b)
+  }
+)

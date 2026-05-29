@@ -1,5 +1,6 @@
 // util モジュール: pub を付けた定義だけが外から見える。
 pub let double = fn(n: Int) -> Int { n * 2 }
+
 pub let inc = fn(n: Int) -> Int { n + 1 }
 
 // pub なし = モジュール内限定（main からは参照できない）。

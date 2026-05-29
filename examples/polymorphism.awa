@@ -1,36 +1,48 @@
 // ===== let 多相のデモ =====
 // 同じ関数を異なる型で使い回せる（Gleam/ML 流の暗黙 Hindley-Milner）。
 // 各行は実行すると「値 : 型」で表示される。型変数は a, b, ... と出る。
-
 // 恒等関数。型は fn(a) -> a に一般化される。
 let id = fn(x) { x }
-id(42)        // Num に使う      → 42 : Num
-id(true)      // Bool に使う     → true : Bool
+
+id(42)  // Num に使う      → 42 : Num
+
+id(true)  // Bool に使う     → true : Bool
 
 // 適用関数。fn(fn(a) -> b, a) -> b。多相な id を両方の型に渡せる。
 let apply = fn(f, x) { f(x) }
-apply(id, 7)      // 7 : Num
+
+apply(id, 7)  // 7 : Num
+
 apply(id, false)  // false : Bool
 
 // 関数合成。fn(fn(b) -> c, fn(a) -> b) -> fn(a) -> c。
 let compose = fn(f, g) { fn(x) { f(g(x)) } }
+
 let inc = fn(n) { n + 1 }
+
 let double = fn(n) { n * 2 }
+
 let incThenDouble = compose(double, inc)
-incThenDouble(10)   // double(inc(10)) = 22 : Num
+
+incThenDouble(10)  // double(inc(10)) = 22 : Num
 
 // 2 回適用。fn(fn(a) -> a, a) -> a。多相な id を渡してもよい。
 let twice = fn(f, x) { f(f(x)) }
-twice(id, 5)        // id(id(5)) = 5 : Num
+
+twice(id, 5)  // id(id(5)) = 5 : Num
 
 // 定数関数。fn(a) -> fn(b) -> a（カリー化）。
 // const(3) は「関数適用の結果」だが、awa は可変参照を持たない純粋な言語なので
 // value restriction なしに fn(b) -> Num へ一般化される（ML より素直に多相になる点）。
 let const = fn(a) { fn(b) { a } }
+
 let always3 = const(3)
-always3(true)       // 3 : Num
-always3(999)        // 3 : Num
+
+always3(true)  // 3 : Num
+
+always3(999)  // 3 : Num
 
 // 再帰関数も型推論される（単相再帰）。fn(Num) -> Num。
 let fact = fn(n) { if n == 0 { 1 } else { n * fact(n - 1) } }
-fact(6)             // 720 : Num
+
+fact(6)  // 720 : Num

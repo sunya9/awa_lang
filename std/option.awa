@@ -1,8 +1,10 @@
 // 標準ライブラリ: Option（値があるかもしれない）。純粋に awa で書ける＝組込でなく stdlib。
-pub type Option(a) { Some(a); None }
+pub type Option(a) {
+  Some(a)
+  None
+}
 
 // ----- 関数版（qualified `option.map(o, f)` / pipe 向き）-----
-
 // 中身に関数を適用する（None はそのまま）。
 pub let map: fn(Option(a), fn(a) -> b) -> Option(b) = fn(o, f) {
   case o {

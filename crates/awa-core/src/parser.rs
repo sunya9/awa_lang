@@ -193,6 +193,7 @@ impl Parser {
 
     // import 文: `import seg1/seg2/...`。セグメントは識別子、区切りは `/`（Slash トークン）。
     fn parse_import(&mut self) -> Result<Import, LocatedError> {
+        let start = self.span_here().start;
         self.expect(Token::Import)?;
         let mut path = Vec::new();
         loop {
@@ -218,7 +219,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Import { path, alias })
+        Ok(Import { path, alias, span: Span::new(start, self.last_span().end) })
     }
 
     // ブロック { 文; ...; 式 }。'{' は呼び出し側が消費済みとして '}' まで読む。
@@ -279,6 +280,7 @@ impl Parser {
 
     // メソッド定義 impl Name(params)? { (method terminator)* }。
     fn parse_impl(&mut self) -> Result<ImplBlock, LocatedError> {
+        let start = self.span_here().start;
         self.next(); // 'impl' を消費
         let type_name = self.expect_upper_ident()?;
         let params = if self.peek() == Some(&Token::LParen) {
@@ -313,6 +315,7 @@ impl Parser {
             params,
             methods,
             is_pub: false, // pub は parse_module 側で設定する
+            span: Span::new(start, self.last_span().end),
         })
     }
 
@@ -376,6 +379,7 @@ impl Parser {
     // 型宣言 type Name(params) { Variant(fields) ... }。
     // params/variants は終端（改行 or ;）区切り、ブロックと同じ流儀で読む。
     fn parse_type_def(&mut self) -> Result<TypeDef, LocatedError> {
+        let start = self.span_here().start;
         self.next(); // 'type' を消費
         let name = self.expect_upper_ident()?;
         let params = if self.peek() == Some(&Token::LParen) {
@@ -430,6 +434,7 @@ impl Parser {
             name,
             params,
             variants,
+            span: Span::new(start, self.last_span().end),
         })
     }
 

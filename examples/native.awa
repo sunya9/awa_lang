@@ -1,27 +1,17 @@
 // ===== LLVM コード生成で native 化できるサブセットのデモ =====
 // Int/Bool・算術・比較・if・トップレベル関数・再帰のみ（クロージャ/ADT/String 等は未対応）。
 // awa build examples/native.awa && ./examples/native
-
 let add = fn(a: Int, b: Int) -> Int { a + b }
 
-let fact = fn(n: Int) -> Int {
-  if n == 0 {
-    1
-  } else {
-    n * fact(n - 1)
-  }
-}
+let fact = fn(n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }
 
 // フィボナッチ（再帰）。
-let fib = fn(n: Int) -> Int {
-  if n < 2 {
-    n
-  } else {
-    fib(n - 1) + fib(n - 2)
-  }
-}
+let fib = fn(n: Int) -> Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
 
-add(3, 4)        // 7
-fact(5)          // 120
-fib(10)          // 55
-3 < 5            // true（Bool も出力できる）
+add(3, 4)  // 7
+
+fact(5)  // 120
+
+fib(10)  // 55
+
+3 < 5  // true（Bool も出力できる）

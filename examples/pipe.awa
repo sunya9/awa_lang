@@ -1,32 +1,35 @@
 // ===== パイプ演算子 |> のデモ =====
 // x |> f は f(x)、x |> f(a) は f(x, a)（左辺を第一引数に挿入）。
 // 純粋な構文糖で、左から右へ「値を関数に通す」読み方ができる。
-
 let inc = fn(n) { n + 1 }
+
 let double = fn(n) { n * 2 }
+
 let add = fn(a: Int, b: Int) { a + b }
 
-5 |> inc                 // inc(5) = 6
-5 |> inc |> double       // double(inc(5)) = 12
-1 |> add(2) |> inc       // inc(add(1, 2)) = 4
+inc(5)  // inc(5) = 6
+
+double(inc(5))  // double(inc(5)) = 12
+
+inc(add(1, 2))  // inc(add(1, 2)) = 4
 
 // パイプは最も緩いので、算術より後に適用される。
-1 + 2 |> inc             // inc(1 + 2) = 4
+inc(1 + 2)  // inc(1 + 2) = 4
 
 // ADT と組み合わせる: 値をデータ処理関数に通す。
 type List(a) {
   Cons(a, List(a))
   Nil
 }
+
 let length = fn(xs) {
   case xs {
     Nil -> 0
     Cons(h, t) -> 1 + length(t)
   }
 }
-Cons(1, Cons(2, Cons(3, Nil))) |> length   // 3
+
+length(Cons(1, Cons(2, Cons(3, Nil))))  // 3
 
 // 多行は行末 |> で繋ぐ（演算子継続。行頭 |> は v1 非対応）。
-1 |>
-add(10) |>
-double                   // double(add(1, 10)) = 22（末尾。統合テストで 22 を検査）
+double(add(1, 10))  // double(add(1, 10)) = 22（末尾。統合テストで 22 を検査）

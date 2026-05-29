@@ -181,8 +181,52 @@ fn build_file(path: &str) {
     }
 }
 
+// `awa fmt [-w|--check] <file>`: 整形して stdout へ。-w で上書き、--check で差分検査。
+fn fmt_file(args: &[String]) {
+    let (mode, path) = match args.get(2).map(|s| s.as_str()) {
+        Some("-w") | Some("--write") => ("write", args.get(3)),
+        Some("--check") => ("check", args.get(3)),
+        Some(_) => ("stdout", args.get(2)),
+        None => ("stdout", None),
+    };
+    let Some(path) = path else {
+        eprintln!("使い方: awa fmt [-w|--check] <file.awa>");
+        std::process::exit(1);
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("読めません ({}): {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let formatted = match awa_core::fmt::format_source(&src) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", awa_core::error::report(&e, &src));
+            std::process::exit(1);
+        }
+    };
+    match mode {
+        "write" => {
+            if let Err(e) = std::fs::write(path, &formatted) {
+                eprintln!("書けません ({}): {}", path, e);
+                std::process::exit(1);
+            }
+        }
+        "check" => {
+            if src != formatted {
+                eprintln!("整形されていません: {}", path);
+                std::process::exit(1);
+            }
+        }
+        _ => print!("{}", formatted),
+    }
+}
+
 fn main() {
-    // 引数: awa emit/build <file> はコンパイル、awa <file> はインタプリタ実行、引数なしは REPL。
+    // 引数: awa emit/build <file> はコンパイル、awa fmt <file> は整形、
+    // awa <file> はインタプリタ実行、引数なしは REPL。
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("emit") | Some("build") => {
@@ -196,6 +240,7 @@ fn main() {
                 build_file(path);
             }
         }
+        Some("fmt") => fmt_file(&args),
         Some(path) => run_file(path),
         None => {
             if let Err(e) = repl() {

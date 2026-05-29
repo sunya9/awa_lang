@@ -1,16 +1,14 @@
 // 最小 HTTP サーバ（native 専用）。1 接続だけ受けて応答して終了する。
 // awa build examples/modules/http_server.awa && ./examples/modules/http_server
-//   別端末: curl http://127.0.0.1:18080/hello
+// 別端末: curl http://127.0.0.1:18080/hello
 import std/io
 import std/http
 
-let handler = fn(req) {
-  http.response(200, "Hello from awa! path=" <> http.req_path(req))
-}
+let handler = fn(req) { http.response(200, "Hello from awa! path=" <> http.req_path(req)) }
 
 let main = fn() {
-  let server = tcp_listen(18080);
-  let _ = io.println("listening on 18080 (serves one request)");
-  let _ = run(http.serve_once(server, handler));
+  let server = tcp_listen(18080)
+  let _ = io.println("listening on 18080 (serves one request)")
+  let _ = run(http.serve_once(server, handler))
   io.println("done")
 }

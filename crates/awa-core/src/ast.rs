@@ -80,6 +80,7 @@ pub struct TypeDef {
     pub name: String,            // "Option"
     pub params: Vec<String>,     // ["a"]（型パラメータ名）
     pub variants: Vec<Variant>,
+    pub span: Span,              // フォーマッタのコメント再配置に使う
 }
 
 // ===== 型付き AST（型検査の出力 = elaboration の結果）=====
@@ -157,6 +158,7 @@ pub enum Stmt {
 pub struct Import {
     pub path: Vec<String>,
     pub alias: Option<String>,
+    pub span: Span, // フォーマッタのコメント再配置に使う
 }
 
 impl Import {
@@ -184,6 +186,7 @@ pub struct ImplBlock {
     pub params: Vec<String>,     // 型パラメータ（ADT なら ["a"]、組込なら空）
     pub methods: Vec<Method>,
     pub is_pub: bool,            // pub impl なら全メソッドを他モジュールへ公開
+    pub span: Span,              // フォーマッタのコメント再配置に使う
 }
 
 // 1 つのメソッド。params[0] がレシーバ（self）。

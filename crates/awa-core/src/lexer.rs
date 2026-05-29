@@ -54,9 +54,34 @@ fn emit_string(
     Ok(())
 }
 
+// 収集したコメント（フォーマッタが再配置するために使う。通常の字句解析では捨てる）。
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub span: Span,
+    pub text: String, // "// ..." または "/* ... */" の生テキスト
+    pub block: bool,  // ブロックコメントなら true
+}
+
 // ===== 字句解析（Lexer）=====
 // 各トークンに span（ソース上の char 範囲）を添えて返す。失敗時は位置つきエラー。
 pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
+    let mut sink: Vec<Comment> = Vec::new();
+    tokenize_collecting(input, &mut sink)
+}
+
+// トークンに加えてコメントも返す（フォーマッタ用）。
+pub fn tokenize_with_comments(
+    input: &str,
+) -> Result<(Vec<Spanned<Token>>, Vec<Comment>), LocatedError> {
+    let mut comments: Vec<Comment> = Vec::new();
+    let tokens = tokenize_collecting(input, &mut comments)?;
+    Ok((tokens, comments))
+}
+
+fn tokenize_collecting(
+    input: &str,
+    comments: &mut Vec<Comment>,
+) -> Result<Vec<Spanned<Token>>, LocatedError> {
     let mut tokens: Vec<Spanned<Token>> = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -97,6 +122,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     while i < chars.len() && chars[i] != '\n' {
                         i += 1;
                     }
+                    comments.push(Comment {
+                        span: Span::new(start, i),
+                        text: chars[start..i].iter().collect::<String>().trim_end().to_string(),
+                        block: false,
+                    });
                 }
                 // ブロックコメント /* ... */: 対応する */ まで読み飛ばす。
                 Some('*') => {
@@ -114,6 +144,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                         }
                         i += 1;
                     }
+                    comments.push(Comment {
+                        span: Span::new(start, i),
+                        text: chars[start..i].iter().collect(),
+                        block: true,
+                    });
                 }
                 _ => {
                     tokens.push(Spanned::new(Token::Slash, Span::new(start, start + 1)));

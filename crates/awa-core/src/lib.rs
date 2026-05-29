@@ -3,6 +3,7 @@ pub mod ast;
 pub mod codegen;
 pub mod error;
 pub mod eval;
+pub mod fmt;
 pub mod infer;
 pub mod lexer;
 pub mod match_check;

@@ -1,6 +1,5 @@
 // ===== 代数的データ型（ADT）＋パターンマッチのデモ =====
 // 先頭大文字 = 型名／構築子、小文字 = 変数／型変数（Gleam と同じ規約）。
-
 // 直和型 Option(a)。Some(値) か None のどちらか。
 type Option(a) {
   Some(a)
@@ -15,8 +14,10 @@ let unwrap_or = fn(o, d) {
     None -> d
   }
 }
-unwrap_or(Some(5), 0)     // 5 : Num
-unwrap_or(None, 99)       // 99 : Num
+
+unwrap_or(Some(5), 0)  // 5 : Num
+
+unwrap_or(None, 99)  // 99 : Num
 
 // 再帰的な総称データ型 List(a)。Cons(先頭, 残り) か Nil。
 type List(a) {
@@ -41,7 +42,8 @@ let sum = fn(xs) {
 }
 
 let nums = Cons(1, Cons(2, Cons(3, Nil)))
-length(nums)             // 3 : Num
+
+length(nums)  // 3 : Num
 
 // ヌル構築子だけの列挙型（exhaustiveness は Phase 3b で静的検査予定）。
 type Color {
@@ -49,6 +51,7 @@ type Color {
   Green
   Blue
 }
+
 let code = fn(c) {
   case c {
     Red -> 1
@@ -56,7 +59,8 @@ let code = fn(c) {
     Blue -> 3
   }
 }
-code(Green)              // 2 : Num
+
+code(Green)  // 2 : Num
 
 // or パターン: 複数の構築子を 1 つの腕にまとめる（A | B）。Blue も含めて網羅的。
 let warm = fn(c) {
@@ -65,7 +69,8 @@ let warm = fn(c) {
     Blue -> false
   }
 }
-warm(Red)                // true : Bool
+
+warm(Red)  // true : Bool
 
 // 入れ子パターン: Some(Cons(先頭, _)) で「中身があり、その先頭」を取り出す。
 let head_or = fn(o, d) {
@@ -75,6 +80,7 @@ let head_or = fn(o, d) {
     None -> d
   }
 }
-head_or(Some(Cons(7, Nil)), 0)   // 7 : Num
 
-sum(nums)                // 6 : Num（末尾。統合テストで 6 を検査）
+head_or(Some(Cons(7, Nil)), 0)  // 7 : Num
+
+sum(nums)  // 6 : Num（末尾。統合テストで 6 を検査）

@@ -16,6 +16,7 @@ let total = do {
 let safe_div = fn(a: Int, b: Int) -> result.Result(Int, String) {
   if b == 0 { result.Err("division by zero") } else { result.Ok(a / b) }
 }
+
 let computed = do {
   x <- safe_div(100, 5)
   y <- safe_div(x, 4)
@@ -23,6 +24,6 @@ let computed = do {
 }
 
 let main = fn() {
-  io.println("total   = ${option.unwrap_or(total, 0)}")        // 42
-  io.println("computed= ${result.unwrap_or(computed, 0 - 1)}") // 5
+  io.println("total   = " <> __interp(option.unwrap_or(total, 0)) <> "")  // 42
+  io.println("computed= " <> __interp(result.unwrap_or(computed, 0 - 1)) <> "")  // 5
 }
