@@ -191,6 +191,19 @@ pub fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, Str
         .map_err(|e| format_error(&e, modules))?;
     // 型検査後にメソッド可視性を検査（非公開メソッドの越境呼び出しを弾く）。
     resolve::check_visibility(&typed, &resolved).map_err(|e| format_error(&e, modules))?;
+    // 入口 main（引数なし関数）があるとき、トップレベルのむき出しの式は禁止。
+    // 処理は main の中に書く（script 形式と main 形式の混在を防ぐ）。
+    let has_entry_main = typed.iter().any(|s| {
+        matches!(s, TStmt::Let(n, te)
+            if n == "main"
+            && matches!(&te.kind, ast::TExprKind::Lambda(p, _) if p.is_empty()))
+    });
+    if has_entry_main {
+        if let Some(TStmt::Expr(e)) = typed.iter().find(|s| matches!(s, TStmt::Expr(_))) {
+            let err = LocatedError::at(AwaError::EntryConflict, e.span);
+            return Err(format_error(&err, modules));
+        }
+    }
     Ok(typed)
 }
 
@@ -1959,6 +1972,35 @@ mod tests {
         // std/string と main の 2 モジュールが読めていること。
         assert!(modules.iter().any(|m| m.path == vec!["std".to_string(), "string".to_string()]));
         assert!(!typed.is_empty());
+    }
+
+    #[test]
+    fn codegen_main関数が入口になる() {
+        // main を定義するとそれが入口。戻り値は表示されず（出力なし）、RC も釣り合う（終了コード 0）。
+        let (out, code) = compile_run_status("let main = fn() -> Int { 1 + 2 }");
+        assert_eq!(out, "");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn codegen_main_はヒープ値を返してもリークしない() {
+        // main の戻り値（String=ヒープ）が release され、生存数 0 で終了する。
+        let (out, code) = compile_run_status("let main = fn() -> String { \"hi\" <> \"!\" }");
+        assert_eq!(out, "");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn main_と裸のトップレベル式の混在はエラー() {
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_entry_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.awa"), "let main = fn() { 1 }\n2\n").unwrap();
+        let modules = load_program(&dir, None, "main").unwrap();
+        let err = check_program_modules(&modules).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("main") && err.contains("トップレベル"), "got: {err}");
     }
 
     #[test]

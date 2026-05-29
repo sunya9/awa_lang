@@ -58,6 +58,7 @@ pub enum AwaError {
     NotExported { module: String, name: String }, // 参照先がそのモジュールで pub 公開されていない
     UnknownModule(String),                        // 修飾アクセスの左がモジュールでない（未 import 等）
     PrivateMethod { ty: String, method: String }, // 非公開メソッドを他モジュールから呼んだ
+    EntryConflict, // 入口 main があるのにトップレベルにむき出しの式がある
     // ----- 非同期（Phase 11） -----
     Deadlock,    // イベントループが空なのに run の Future が未解決
     // ----- OS 連携（Phase 12） -----
@@ -129,6 +130,12 @@ impl fmt::Display for AwaError {
             }
             AwaError::Unsupported(what) => {
                 write!(f, "コード生成は未対応です: {}", what)
+            }
+            AwaError::EntryConflict => {
+                write!(
+                    f,
+                    "main があるときはトップレベルにむき出しの式を置けません（処理は main の中へ）"
+                )
             }
             AwaError::NotExported { module, name } => {
                 write!(f, "{} は {} で公開されていません（pub を付けてください）", name, module)

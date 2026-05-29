@@ -1,0 +1,11 @@
+// `main`（引数なし関数）を定義すると、それがプログラムの入口になる。
+// 入口があるときはトップレベルにむき出しの式を置けない（処理は main の中へ）。
+// 対して main が無いファイルは「最後のトップレベル式が答え」になるスクリプト形式。
+import std/io
+
+let greet = fn(name: String) -> String { "Hello, ${name}!" }
+
+let main = fn() {
+  io.println(greet("awa"))
+  io.println("1 + 2 = ${1 + 2}")
+}

@@ -26,8 +26,18 @@ fn unsupported<T>(what: impl Into<String>) -> Result<T> {
 }
 
 // awa のグローバル名を LLVM の `@`-シンボル token にする。`#`（メソッドのマングル "型頭#名"）など
-// 非英数字を含む名前はクォート識別子 @"..." にする（LLVM は受理する）。"." "_" "$" は素のまま可。
+// ユーザーが書ける名前 → LLVM シンボル。
+// "main" は codegen が生成するエントリ @main(i32) と衝突するので別名へ退避する
+// （ユーザーの main 関数/値はこの名前で出し、エントリ @main から呼ぶ）。
 fn sym(name: &str) -> String {
+    if name == "main" {
+        return "@awa_user_main".to_string();
+    }
+    user_sym(name)
+}
+
+// 非英数字を含む名前はクォート識別子 @"..." にする（LLVM は受理する）。"." "_" "$" は素のまま可。
+fn user_sym(name: &str) -> String {
     if name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'$'))
@@ -708,7 +718,7 @@ impl Gen {
             // トップレベル値 → グローバル変数 @name から load。
             let llty = llvm_ty(&vty)?;
             let r = format!("%t{}", self.fresh());
-            self.line(&format!("{} = load {}, ptr @{}", r, llty, name));
+            self.line(&format!("{} = load {}, ptr {}", r, llty, sym(name)));
             self.retain(&r, &vty);
             Ok(r)
         } else if let Some(ci) = m.ctors.get(name).cloned() {
@@ -1710,7 +1720,11 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     let mut vg: Vec<(&String, &Type)> = m.value_globals.iter().collect();
     vg.sort_by(|a, b| a.0.cmp(b.0));
     for (name, ty) in vg {
-        module.push_str(&format!("@{} = global {} zeroinitializer\n", name, llvm_ty(ty)?));
+        module.push_str(&format!(
+            "{} = global {} zeroinitializer\n",
+            sym(name),
+            llvm_ty(ty)?
+        ));
     }
     // 参照カウントのランタイム。
     // retain: rc++（null と rc<0 の不滅オブジェクトは無視）。
@@ -1797,13 +1811,19 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
 
 fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
     let mut g = Gen::new();
+    // 引数なしのトップレベル関数 main があれば、それがプログラムの入口。
+    let main_ret = m
+        .globals
+        .get("main")
+        .filter(|gf| gf.param_names.is_empty())
+        .map(|gf| gf.ret.clone());
     for s in stmts {
         match s {
             TStmt::Let(_, te) if matches!(te.kind, TExprKind::Lambda(..)) => {}
             // トップレベル値はグローバル @name に格納（関数本体からも参照可能）。
             TStmt::Let(name, rhs) => {
                 let v = g.expr(rhs, m)?;
-                g.line(&format!("store {} {}, ptr @{}", llvm_ty(&rhs.ty)?, v, name));
+                g.line(&format!("store {} {}, ptr {}", llvm_ty(&rhs.ty)?, v, sym(name)));
             }
             TStmt::Expr(e) => {
                 let v = g.expr(e, m)?;
@@ -1812,6 +1832,16 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
             }
             TStmt::Type(_) | TStmt::Impl(_) => {}
         }
+    }
+    // 入口 main() を呼ぶ（戻り値は表示せず破棄。副作用が本体）。
+    if let Some(ret) = &main_ret {
+        let r = format!("%t{}", g.fresh());
+        g.line(&format!(
+            "{} = call {} @awa_user_main(ptr null)",
+            r,
+            llvm_ty(ret)?
+        ));
+        g.release(&r, ret);
     }
     // プログラム終了前に、トップレベル値（グローバル変数が保持する +1）を release。
     // これで RC が正しければ生存数 @awa_live は 0 になる。
@@ -1824,7 +1854,7 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
     for (name, ty) in vg {
         if is_heap(&ty) {
             let v = format!("%t{}", g.fresh());
-            g.line(&format!("{} = load {}, ptr @{}", v, llvm_ty(&ty)?, name));
+            g.line(&format!("{} = load {}, ptr {}", v, llvm_ty(&ty)?, sym(&name)));
             g.release(&v, &ty);
         }
     }

@@ -717,6 +717,8 @@ pub fn builtins_env() -> Env {
 // env は呼び出し側が所有して渡す（REPL は行をまたいで使い回す）。
 pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, LocatedError> {
     loop_reset(); // 非同期イベントループを初期化（前回実行の状態を持ち越さない）
+    // 引数なしのトップレベル関数 main があれば、それがプログラムの入口。
+    let has_main = stmts.iter().any(is_entry_main);
     let mut results = Vec::new();
     for stmt in stmts {
         match stmt {
@@ -732,5 +734,25 @@ pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, Locate
             TStmt::Impl(ms) => register_methods(ms, env),
         };
     }
+    if has_main {
+        // 定義をすべて束縛したあと入口 main() を呼ぶ（戻り値は表示せず、副作用が本体）。
+        // 表示行は出さない（ネイティブの @main と挙動を揃える）。
+        let main_fn = env
+            .get("main")
+            .cloned()
+            .expect("main は束縛済みのはず");
+        call_value(main_fn, Vec::new(), Span::new(0, 0))?;
+        return Ok(Vec::new());
+    }
     Ok(results)
+}
+
+// トップレベルの `let main = fn() { ... }`（引数なしの関数）か。これがあると入口になる。
+fn is_entry_main(stmt: &TStmt) -> bool {
+    matches!(
+        stmt,
+        TStmt::Let(name, te)
+            if name == "main"
+            && matches!(&te.kind, TExprKind::Lambda(params, _) if params.is_empty())
+    )
 }
