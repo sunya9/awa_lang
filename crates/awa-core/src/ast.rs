@@ -42,6 +42,9 @@ pub enum ExprKind {
     // 配列リテラル [e1, e2, ...]。不変・永続なインデックス配列 Array(a) を構築する。
     // 連結リスト（list.Cons）とは別物。空 [] も含む。
     ArrayLit(Vec<Expr>),
+    // タプルリテラル (e1, e2, ...)。要素ごとに型が異なる固定長の組 Tuple(t1, ..., tn)。
+    // 要素は 2 個以上（(e) は単なるグループ化）。
+    TupleLit(Vec<Expr>),
 }
 
 // ===== パターン（case の腕の左辺）=====
@@ -57,6 +60,8 @@ pub enum Pattern {
     // 配列パターン [a, b, ...]（固定長）。主語が Array(a) で長さがちょうど一致すれば成立。
     // 配列は不変だが任意長なので、配列パターンは網羅的になり得ない（常に _ 等の既定腕が要る）。
     Array(Vec<Pattern>),
+    // タプルパターン (a, b, ...)。要素数は型で固定なので各位置を分解する（網羅的になり得る）。
+    Tuple(Vec<Pattern>),
     // or パターン A | B | ...。どれかに当たれば成立。各選択肢は同じ変数を束縛する必要がある。
     Or(Vec<Pattern>),
 }
@@ -115,6 +120,8 @@ pub enum TExprKind {
     Case(Box<TExpr>, Vec<(Pattern, TExpr)>),
     // 配列リテラル [e1, ...]（要素型は自身の ty=Con("Array",[elem]) に入っている）。
     ArrayLit(Vec<TExpr>),
+    // タプルリテラル (e1, ...)（要素型は自身の ty=Con("Tuple",[t1,...]) に入っている）。
+    TupleLit(Vec<TExpr>),
 }
 
 #[derive(Debug, Clone)]

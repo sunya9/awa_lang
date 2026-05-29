@@ -1,0 +1,27 @@
+// タプル (a, b, ...) のデモ。要素ごとに型が異なる固定長の組。
+// アクセスはパターンマッチで分解する。`(e)` は単なるグループ化（タプルではない）。
+import std/io
+
+let main = fn() {
+  // ヘテロなタプル。
+  let person = ("Alice", 30, true)
+  case person {
+    (name, age, active) -> io.println("${name} (${age}) active=${active}")
+  }
+
+  // 関数の引数・戻り値にタプル。型注釈は (Int, String)。
+  let swap = fn(p: (Int, String)) {
+    case p {
+      (n, s) -> (s, n)
+    }
+  }
+  case swap((7, "seven")) {
+    (s, n) -> io.println("${s} = ${n}")
+  }
+
+  // ネストしたタプル。
+  let line = ((0, 0), (3, 4))
+  case line {
+    ((x1, y1), (x2, y2)) -> io.println("(${x1},${y1}) -> (${x2},${y2})")
+  }
+}

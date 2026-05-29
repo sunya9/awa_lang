@@ -118,6 +118,14 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
             }
             Ok(Value::Array(Rc::new(vals)))
         }
+        // タプルリテラル (e1, ...): 各要素を評価して組にまとめる。
+        TExprKind::TupleLit(elems) => {
+            let mut vals = Vec::with_capacity(elems.len());
+            for e in elems {
+                vals.push(eval_expr(e, env)?);
+            }
+            Ok(Value::Tuple(Rc::new(vals)))
+        }
     }
 }
 
@@ -153,6 +161,17 @@ fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)
         // 配列パターン [a, b, ...]: 長さがちょうど一致したとき各要素を照合する。
         Pattern::Array(subs) => match value {
             Value::Array(xs) if xs.len() == subs.len() => {
+                let mut bindings = Vec::new();
+                for (sub, x) in subs.iter().zip(xs.iter()) {
+                    bindings.extend(match_pattern(sub, x)?);
+                }
+                Some(bindings)
+            }
+            _ => None,
+        },
+        // タプルパターン (a, b, ...): 要素数は型で一致しているので各位置を照合する。
+        Pattern::Tuple(subs) => match value {
+            Value::Tuple(xs) if xs.len() == subs.len() => {
                 let mut bindings = Vec::new();
                 for (sub, x) in subs.iter().zip(xs.iter()) {
                     bindings.extend(match_pattern(sub, x)?);

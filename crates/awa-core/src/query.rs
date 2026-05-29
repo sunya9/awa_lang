@@ -242,7 +242,7 @@ fn smallest_in_expr(te: &TExpr, offset: usize, best: &mut Option<(Span, Type)>) 
                 smallest_in_expr(body, offset, best);
             }
         }
-        TExprKind::ArrayLit(elems) => {
+        TExprKind::ArrayLit(elems) | TExprKind::TupleLit(elems) => {
             for e in elems {
                 smallest_in_expr(e, offset, best);
             }

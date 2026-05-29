@@ -461,6 +461,10 @@ impl Fmt {
                 let docs: Vec<D> = elems.iter().map(|x| self.expr(x)).collect();
                 concat(vec![text("["), join(docs, text(", ")), text("]")])
             }
+            ExprKind::TupleLit(elems) => {
+                let docs: Vec<D> = elems.iter().map(|x| self.expr(x)).collect();
+                concat(vec![text("("), join(docs, text(", ")), text(")")])
+            }
             ExprKind::Block(stmts) => self.block(stmts, e.span.end),
             ExprKind::Case(subj, arms) => {
                 let header = concat(vec![text("case "), self.expr(subj)]);
@@ -658,6 +662,11 @@ fn import_doc(imp: &Import) -> D {
 fn type_doc(t: &TypeExpr) -> D {
     match &t.kind {
         TypeExprKind::Var(n) => text(n.clone()),
+        // タプル型は (A, B) と表示する（Tuple(A, B) ではなく）。
+        TypeExprKind::Con(name, args) if name == "Tuple" => {
+            let a: Vec<D> = args.iter().map(type_doc).collect();
+            concat(vec![text("("), join(a, text(", ")), text(")")])
+        }
         TypeExprKind::Con(name, args) => {
             if args.is_empty() {
                 text(name.clone())
@@ -715,6 +724,10 @@ fn pattern_doc(p: &Pattern) -> D {
         Pattern::Array(subs) => {
             let s: Vec<D> = subs.iter().map(pattern_doc).collect();
             concat(vec![text("["), join(s, text(", ")), text("]")])
+        }
+        Pattern::Tuple(subs) => {
+            let s: Vec<D> = subs.iter().map(pattern_doc).collect();
+            concat(vec![text("("), join(s, text(", ")), text(")")])
         }
         Pattern::Ctor(name, subs) => {
             if subs.is_empty() {

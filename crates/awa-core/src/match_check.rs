@@ -49,6 +49,9 @@ enum Head {
     // 配列パターン [..] の頭。長さで区別する（[a] と [a,b] は別の頭、arity=長さ）。
     // 配列は任意長なので無限ドメイン扱い（完全シグネチャを作れず catch-all 必須）。
     Array(usize),
+    // タプルパターン (..) の頭。要素数は型で固定なので、その唯一の頭で完全になり得る
+    //（単一ヴァリアントの直積＝(a, b) を分解し尽くせば網羅的）。
+    Tuple(usize),
 }
 
 fn head_of(p: &Pattern) -> Option<Head> {
@@ -59,6 +62,7 @@ fn head_of(p: &Pattern) -> Option<Head> {
         Pattern::Str(s) => Some(Head::Str(s.clone())),
         Pattern::Ctor(name, _) => Some(Head::Ctor(name.clone())),
         Pattern::Array(subs) => Some(Head::Array(subs.len())),
+        Pattern::Tuple(subs) => Some(Head::Tuple(subs.len())),
         // 行列・クエリは expand で or を除いてから組むので、ここに Or は来ない。
         Pattern::Or(_) => unreachable!("or パターンは expand 済みのはず"),
     }
@@ -82,6 +86,10 @@ fn expand(p: &Pattern) -> Vec<Pattern> {
                 .into_iter()
                 .map(Pattern::Array)
                 .collect()
+        }
+        Pattern::Tuple(subs) => {
+            let expanded: Vec<Vec<Pattern>> = subs.iter().map(expand).collect();
+            cartesian(&expanded).into_iter().map(Pattern::Tuple).collect()
         }
         other => vec![other.clone()],
     }
@@ -109,6 +117,7 @@ fn subpatterns(p: &Pattern) -> Vec<Pattern> {
     match p {
         Pattern::Ctor(_, subs) => subs.clone(),
         Pattern::Array(subs) => subs.clone(),
+        Pattern::Tuple(subs) => subs.clone(),
         _ => Vec::new(),
     }
 }
@@ -120,6 +129,7 @@ fn head_to_pattern(h: &Head, subs: Vec<Pattern>) -> Pattern {
         Head::Int(n) => Pattern::Int(*n),
         Head::Str(s) => Pattern::Str(s.clone()),
         Head::Array(_) => Pattern::Array(subs),
+        Head::Tuple(_) => Pattern::Tuple(subs),
     }
 }
 
@@ -143,6 +153,8 @@ fn complete_signature(present: &[Head], sigs: &Sigs) -> Option<Vec<(Head, usize)
         Head::Bool(_) => vec![(Head::Bool(true), 0), (Head::Bool(false), 0)],
         // Int/String/配列は無限ドメインなので決して完全にならない（catch-all 必須）。
         Head::Int(_) | Head::Str(_) | Head::Array(_) => return None,
+        // タプルは要素数固定の単一の頭。その頭が現れていれば（直積を分解できれば）完全。
+        Head::Tuple(n) => vec![(Head::Tuple(*n), *n)],
         Head::Ctor(name) => sigs
             .siblings(name)?
             .iter()
@@ -303,6 +315,10 @@ fn render_pattern(p: &Pattern) -> String {
             let inner: Vec<String> = subs.iter().map(render_pattern).collect();
             format!("[{}]", inner.join(", "))
         }
+        Pattern::Tuple(subs) => {
+            let inner: Vec<String> = subs.iter().map(render_pattern).collect();
+            format!("({})", inner.join(", "))
+        }
         Pattern::Or(alts) => alts
             .iter()
             .map(render_pattern)
@@ -408,7 +424,7 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
             Ok(())
         }
         ExprKind::Field(receiver, _) => check_expr(receiver, sigs),
-        ExprKind::ArrayLit(elems) => {
+        ExprKind::ArrayLit(elems) | ExprKind::TupleLit(elems) => {
             for e in elems {
                 check_expr(e, sigs)?;
             }

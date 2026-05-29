@@ -31,6 +31,8 @@ pub enum Value {
     // 不変・永続なインデックス配列 Array(a)。Rc で包んで複製を安価にし、更新系
     // （set/push）は新しい Vec を作って返す（永続データ構造）。
     Array(Rc<Vec<Value>>),
+    // タプル (a, b, ...)。要素ごとに型が異なる固定長の組。
+    Tuple(Rc<Vec<Value>>),
 }
 
 // クロージャ = 関数 + 定義時の環境。
@@ -64,8 +66,9 @@ impl PartialEq for Value {
                 Value::Data { ctor: c1, args: a1 },
                 Value::Data { ctor: c2, args: a2 },
             ) => c1 == c2 && a1 == a2,
-            // 配列は要素ごとに構造比較。
+            // 配列・タプルは要素ごとに構造比較。
             (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Tuple(a), Value::Tuple(b)) => a == b,
             _ => false,
         }
     }
@@ -99,6 +102,17 @@ impl fmt::Display for Value {
                     write!(f, "{}", x)?;
                 }
                 write!(f, "]")
+            }
+            // タプルは (1, "a") のように表示する。
+            Value::Tuple(xs) => {
+                write!(f, "(")?;
+                for (i, x) in xs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", x)?;
+                }
+                write!(f, ")")
             }
             Value::Unit => write!(f, "Nil"),
             Value::Ctor { name, arity } => write!(f, "<ctor {}/{}>", name, arity),
@@ -134,6 +148,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Data { .. } => "Data",
         Value::Future(_) => "Future",
         Value::Array(_) => "Array",
+        Value::Tuple(_) => "Tuple",
     }
 }
 

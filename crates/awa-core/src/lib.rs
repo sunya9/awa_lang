@@ -2235,6 +2235,62 @@ mod tests {
     }
 
     #[test]
+    fn タプル_interp() {
+        // (a, b) はヘテロな組。パターンで分解。型表示は (A, B)。
+        assert_eq!(
+            eval("case (1, 2) { (a, b) -> a + b }"),
+            Ok(Value::Int(3))
+        );
+        // ネストと混在型。
+        assert_eq!(
+            eval("case ((1, true), 3) { ((a, _), c) -> a + c }"),
+            Ok(Value::Int(4))
+        );
+        // (e) は単なるグループ化（タプルではない）。
+        assert_eq!(eval("(5) + 1"), Ok(Value::Int(6)));
+        // タプル値の等価。
+        assert_eq!(eval("(1, 2) == (1, 2)"), Ok(Value::Bool(true)));
+        assert_eq!(eval("(1, 2) == (1, 3)"), Ok(Value::Bool(false)));
+    }
+
+    #[test]
+    fn タプル_網羅性() {
+        // (Bool, Bool) は要素を尽くせば網羅的（catch-all 不要）。
+        let mut checker = Checker::new();
+        assert!(run_values(
+            "let f = fn(p: (Bool, Bool)) { case p { (true, x) -> x; (false, x) -> x } }\nf((true, false))",
+            &mut eval::builtins_env(),
+            &mut checker,
+        )
+        .is_ok());
+        // 漏れがあれば NonExhaustiveMatch。
+        let mut checker2 = Checker::new();
+        let err = run_values(
+            "let f = fn(p: (Bool, Bool)) { case p { (true, true) -> 1; (false, false) -> 2 } }\nf((true, true))",
+            &mut eval::builtins_env(),
+            &mut checker2,
+        );
+        assert!(matches!(err, Err(AwaError::NonExhaustiveMatch { .. })));
+    }
+
+    #[test]
+    fn タプル_native() {
+        // ネイティブでタプル（ヘテロ・ネスト・型注釈・グループ化）。終了コード=リーク数=0。
+        let (out, code) = compile_run_status(
+            "let p = (1, \"hi\")\n\
+             case p { (n, s) -> print(\"${n} ${s}\") }\n\
+             let t = (true, 42, \"x\")\n\
+             case t { (b, n, s) -> print(\"${b} ${n} ${s}\") }\n\
+             let swap = fn(q: (Int, String)) { case q { (a, b) -> (b, a) } }\n\
+             case swap((7, \"seven\")) { (s, n) -> print(\"${s} ${n}\") }\n\
+             case ((1, 2), 3) { ((a, b), c) -> print(\"${a} ${b} ${c}\") }\n\
+             print(\"${(5) + 1}\")\n",
+        );
+        assert_eq!(out, "1 hi\ntrue 42 x\nseven 7\n1 2 3\n6\n");
+        assert_eq!(code, 0, "リーク検出（生存ヒープ {}）", code);
+    }
+
+    #[test]
     fn std_option_do記法() {
         // do は .flatMap 連鎖へ脱糖し、Option の pub impl メソッドで解決される。
         let out = std_build_run(

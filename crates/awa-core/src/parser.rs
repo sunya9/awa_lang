@@ -513,6 +513,28 @@ impl Parser {
                 let ret = self.parse_type_expr()?;
                 TypeExprKind::Fun(params, Box::new(ret))
             }
+            // タプル型 (T1, T2, ...) or グループ化 (T)。Tuple という Con 名にする。
+            Some(Token::LParen) => {
+                let first = self.parse_type_expr()?;
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        let mut elems = vec![first];
+                        while self.peek() == Some(&Token::Comma) {
+                            self.next(); // ','
+                            if self.peek() == Some(&Token::RParen) {
+                                break;
+                            }
+                            elems.push(self.parse_type_expr()?);
+                        }
+                        self.expect(Token::RParen)?;
+                        TypeExprKind::Con("Tuple".to_string(), elems)
+                    }
+                    _ => {
+                        self.expect(Token::RParen)?;
+                        first.kind // グループ化はそのまま
+                    }
+                }
+            }
             Some(other) => return Err(self.unexpected(&other)),
             None => return Err(self.eof()),
         };
@@ -581,6 +603,28 @@ impl Parser {
                 }
                 self.expect(Token::RBracket)?;
                 Ok(Pattern::Array(elems))
+            }
+            // タプルパターン (a, b, ...)。`(p)` 単体はグループ化＝そのパターン。
+            Some(Token::LParen) => {
+                let first = self.parse_pattern()?;
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        let mut elems = vec![first];
+                        while self.peek() == Some(&Token::Comma) {
+                            self.next(); // ','
+                            if self.peek() == Some(&Token::RParen) {
+                                break;
+                            }
+                            elems.push(self.parse_pattern()?);
+                        }
+                        self.expect(Token::RParen)?;
+                        Ok(Pattern::Tuple(elems))
+                    }
+                    _ => {
+                        self.expect(Token::RParen)?;
+                        Ok(first)
+                    }
+                }
             }
             Some(Token::Ident(name)) => {
                 if name == "_" {
@@ -932,8 +976,25 @@ impl Parser {
             Some(Token::LBrace) => self.parse_block(),
             Some(Token::LParen) => {
                 let e = self.parse_expr()?;
-                self.expect(Token::RParen)?;
-                Ok(e)
+                // `,` が続けばタプル (e1, e2, ...)、無ければ単なるグループ化 (e)。
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        let mut elems = vec![e];
+                        while self.peek() == Some(&Token::Comma) {
+                            self.next(); // ','
+                            if self.peek() == Some(&Token::RParen) {
+                                break; // 末尾カンマ許容
+                            }
+                            elems.push(self.parse_expr()?);
+                        }
+                        self.expect(Token::RParen)?;
+                        Ok(self.finish(start, ExprKind::TupleLit(elems)))
+                    }
+                    _ => {
+                        self.expect(Token::RParen)?;
+                        Ok(e)
+                    }
+                }
             }
             Some(other) => Err(self.unexpected(&other)),
             None => Err(self.eof()),

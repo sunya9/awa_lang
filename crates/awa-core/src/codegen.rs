@@ -291,6 +291,10 @@ fn expand_pattern(p: &Pattern) -> Vec<Pattern> {
             let ex: Vec<Vec<Pattern>> = subs.iter().map(expand_pattern).collect();
             cartesian(&ex).into_iter().map(Pattern::Array).collect()
         }
+        Pattern::Tuple(subs) => {
+            let ex: Vec<Vec<Pattern>> = subs.iter().map(expand_pattern).collect();
+            cartesian(&ex).into_iter().map(Pattern::Tuple).collect()
+        }
         other => vec![other.clone()],
     }
 }
@@ -456,7 +460,7 @@ fn subst_types(te: &mut TExpr, s: &crate::types::Subst) {
                 subst_types(b, s);
             }
         }
-        TExprKind::ArrayLit(elems) => {
+        TExprKind::ArrayLit(elems) | TExprKind::TupleLit(elems) => {
             for e in elems {
                 subst_types(e, s);
             }
@@ -641,7 +645,46 @@ impl Gen {
             TExprKind::Lambda(params, body) => self.lambda(params, body, &e.ty, m),
             TExprKind::Case(subject, arms) => self.compile_case(subject, arms, m),
             TExprKind::ArrayLit(elems) => self.array_lit(elems, &e.ty, m),
+            TExprKind::TupleLit(elems) => self.tuple_lit(elems, &e.ty, m),
         }
+    }
+
+    // タプルリテラル (e0, e1, ...) → タグ無し単一ヴァリアントの ADT ブロックを構築。
+    // レイアウトは構築子ブロックと同じ { rc, drop, i32 tag(=0), field0, ... }。要素値は
+    // 所有権が移る（retain/release しない＝construct と同様）。
+    fn tuple_lit(&mut self, elems: &[TExpr], ty: &Type, m: &mut Module) -> Result<String> {
+        let Type::Con(_, field_tys) = ty else {
+            return unsupported("タプルリテラルの型が Tuple でない");
+        };
+        let field_tys = field_tys.clone();
+        // 先に全要素を評価（評価順を保つ）。
+        let mut vals = Vec::with_capacity(elems.len());
+        for e in elems {
+            vals.push(self.expr(e, m)?);
+        }
+        let bty = block_ty(&field_tys)?;
+        let szp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = getelementptr {}, ptr null, i32 1", szp, bty));
+        let sz = format!("%t{}", self.fresh());
+        self.line(&format!("{} = ptrtoint ptr {} to i64", sz, szp));
+        let p = format!("%t{}", self.fresh());
+        self.line(&format!("{} = call ptr @malloc(i64 {})", p, sz));
+        self.init_header(&p)?;
+        if let Some(dropname) = ensure_drop_fn(m, &field_tys, &bty, 3, "b")? {
+            let dp = format!("%t{}", self.fresh());
+            self.line(&format!("{} = getelementptr i8, ptr {}, i64 8", dp, p));
+            self.line(&format!("store ptr @{}, ptr {}", dropname, dp));
+        }
+        // tag は使わないが、レイアウトを構築子ブロックと揃えて 0 を格納。
+        let tp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = getelementptr {}, ptr {}, i32 0, i32 2", tp, bty, p));
+        self.line(&format!("store i32 0, ptr {}", tp));
+        for (i, (v, fty)) in vals.iter().zip(field_tys.iter()).enumerate() {
+            let fp = format!("%t{}", self.fresh());
+            self.line(&format!("{} = getelementptr {}, ptr {}, i32 0, i32 {}", fp, bty, p, i + 3));
+            self.line(&format!("store {} {}, ptr {}", llvm_ty(fty)?, v, fp));
+        }
+        Ok(p)
     }
 
     // 配列リテラル [e0, e1, ...] → ヒープ配列を確保し各要素を移動格納してその ptr を返す。
@@ -866,6 +909,28 @@ impl Gen {
                 }
                 Ok(())
             }
+            // タプルパターン (a, b, ...): タグ無し単一ヴァリアント＝検査なしで各フィールドを束縛。
+            Pattern::Tuple(subs) => {
+                let Type::Con(_, field_tys) = value_ty else {
+                    return unsupported("タプルパターンの主語が Tuple でない");
+                };
+                let field_tys = field_tys.clone();
+                let bty = block_ty(&field_tys)?;
+                for (i, (sub, fty)) in subs.iter().zip(field_tys.iter()).enumerate() {
+                    let fp = format!("%t{}", self.fresh());
+                    self.line(&format!(
+                        "{} = getelementptr {}, ptr {}, i32 0, i32 {}",
+                        fp,
+                        bty,
+                        value,
+                        i + 3
+                    ));
+                    let fv = format!("%t{}", self.fresh());
+                    self.line(&format!("{} = load {}, ptr {}", fv, llvm_ty(fty)?, fp));
+                    self.match_pattern_ir(sub, &fv, fty, fail, m)?;
+                }
+                Ok(())
+            }
             Pattern::Ctor(name, subs) => {
                 let ci = m
                     .ctors
@@ -985,6 +1050,14 @@ impl Gen {
         }
         let llty = llvm_ty(&l.ty)?;
         let float = is_float(&l.ty);
+        // 複合ヒープ型（ADT/タプル/配列）の ==/!= はポインタ比較になってしまい構造的でない。
+        // 黙って誤った結果＋リークを出すより、明示的に未対応とする（パターンマッチを使う）。
+        // String はこの手前で str_binop（中身比較）に分岐済み。
+        if matches!(op, Token::EqEq | Token::NotEq) && llty == "ptr" {
+            return unsupported(
+                "複合型（ADT/タプル/配列）の ==/!= は native 未対応です。case で分解して比較してください",
+            );
+        }
         let reg = format!("%t{}", self.fresh());
         // 整数除算は 0 除算を実行時チェック（0 ならメッセージを出して exit）。
         if matches!(op, Token::Slash) && !float {
@@ -1840,7 +1913,7 @@ fn fv(e: &TExpr, bound: &HashSet<String>, free: &mut Vec<String>) {
                 fv(body, &b2, free);
             }
         }
-        TExprKind::ArrayLit(elems) => {
+        TExprKind::ArrayLit(elems) | TExprKind::TupleLit(elems) => {
             for e in elems {
                 fv(e, bound, free);
             }
@@ -1854,7 +1927,7 @@ fn pattern_vars(p: &crate::ast::Pattern, out: &mut HashSet<String>) {
         Pattern::Var(n) => {
             out.insert(n.clone());
         }
-        Pattern::Ctor(_, subs) | Pattern::Or(subs) | Pattern::Array(subs) => {
+        Pattern::Ctor(_, subs) | Pattern::Or(subs) | Pattern::Array(subs) | Pattern::Tuple(subs) => {
             for s in subs {
                 pattern_vars(s, out);
             }

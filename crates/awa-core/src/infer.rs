@@ -338,7 +338,7 @@ fn resolve_texpr(te: &mut TExpr, subst: &Subst) {
                 resolve_texpr(body, subst);
             }
         }
-        TExprKind::ArrayLit(elems) => {
+        TExprKind::ArrayLit(elems) | TExprKind::TupleLit(elems) => {
             for e in elems {
                 resolve_texpr(e, subst);
             }
@@ -414,7 +414,9 @@ fn check_numeric(te: &TExpr) -> Result<(), LocatedError> {
             check_numeric(subject)?;
             arms.iter().try_for_each(|(_, b)| check_numeric(b))
         }
-        TExprKind::ArrayLit(elems) => elems.iter().try_for_each(check_numeric),
+        TExprKind::ArrayLit(elems) | TExprKind::TupleLit(elems) => {
+            elems.iter().try_for_each(check_numeric)
+        }
     }
 }
 
@@ -544,6 +546,8 @@ fn resolve_con(name: &str, args: Vec<Type>, arities: &Arities) -> Result<Type, A
         "String" if args.is_empty() => Ok(Type::Str),
         "Bool" if args.is_empty() => Ok(Type::Bool),
         "Nil" if args.is_empty() => Ok(Type::Unit),
+        // タプルは可変アリティの組込型（要素数ぶんの型引数を持つ）。
+        "Tuple" => Ok(Type::Con("Tuple".to_string(), args)),
         _ => match arities.get(name) {
             Some(&arity) if arity == args.len() => Ok(Type::Con(name.to_string(), args)),
             _ => Err(AwaError::UnknownType(name.to_string())),
@@ -939,6 +943,17 @@ fn infer_expr(
             let ty = Type::Con("Array".to_string(), vec![apply(subst, &elem)]);
             (TExprKind::ArrayLit(telems), ty)
         }
+        // タプルリテラル (e1, ...): 各要素を独立に推論し Tuple(t1, ..., tn) を返す。
+        ExprKind::TupleLit(elems) => {
+            let mut telems = Vec::with_capacity(elems.len());
+            let mut tys = Vec::with_capacity(elems.len());
+            for e in elems {
+                let te = infer_expr(e, env, subst, vargen, arities, methods)?;
+                tys.push(apply(subst, &te.ty));
+                telems.push(te);
+            }
+            (TExprKind::TupleLit(telems), Type::Con("Tuple".to_string(), tys))
+        }
         // パターンマッチ: 主語の型に各腕のパターン型を unify、全腕の本体型を互いに unify。
         ExprKind::Case(subject, arms) => {
             let st = infer_expr(subject, env, subst, vargen, arities, methods)?;
@@ -1071,6 +1086,17 @@ fn infer_pattern(
             }
             let ty = Type::Con("Array".to_string(), vec![apply(subst, &elem)]);
             Ok((ty, bindings))
+        }
+        // タプルパターン (a, b, ...): 各位置を独立に推論し Tuple(t1, ..., tn) を覆う。
+        Pattern::Tuple(subs) => {
+            let mut bindings = Vec::new();
+            let mut tys = Vec::with_capacity(subs.len());
+            for sub in subs {
+                let (sty, sbind) = infer_pattern(sub, env, subst, vargen)?;
+                tys.push(sty);
+                bindings.extend(sbind);
+            }
+            Ok((Type::Con("Tuple".to_string(), tys), bindings))
         }
         // or パターン: 全選択肢を同じ型に unify し、束縛変数の集合が一致することを確かめる
         // （本体がどの選択肢でマッチしても同じ変数を参照できるように）。

@@ -53,6 +53,17 @@ impl fmt::Display for Type {
                     write!(f, "{}{}", letter, suffix)
                 }
             }
+            // タプルは (A, B) と表示する（Tuple(A, B) ではなく）。
+            Type::Con(name, args) if name == "Tuple" => {
+                write!(f, "(")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", a)?;
+                }
+                write!(f, ")")
+            }
             Type::Con(name, args) => {
                 write!(f, "{}", name)?;
                 if !args.is_empty() {
@@ -101,6 +112,17 @@ pub fn render_type(ty: &Type) -> String {
                     c
                 });
                 out.push(c);
+            }
+            // タプルは (A, B) と正規化表示する。
+            Type::Con(name, args) if name == "Tuple" => {
+                out.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    go(a, names, next, out);
+                }
+                out.push(')');
             }
             Type::Con(name, args) => {
                 out.push_str(name);
