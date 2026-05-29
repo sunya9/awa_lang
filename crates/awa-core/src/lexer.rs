@@ -254,18 +254,65 @@ fn tokenize_collecting(
                 i += 1;
             }
             '|' => {
-                // |> はパイプ演算子。それ以外は or パターンの | 。
+                // |> はパイプ、|| は論理和、それ以外は or パターンの | 。
                 if chars.get(i + 1) == Some(&'>') {
                     tokens.push(Spanned::new(Token::PipeArrow, Span::new(start, start + 2)));
+                    i += 2;
+                } else if chars.get(i + 1) == Some(&'|') {
+                    tokens.push(Spanned::new(Token::OrOr, Span::new(start, start + 2)));
                     i += 2;
                 } else {
                     tokens.push(Spanned::new(Token::Pipe, Span::new(start, start + 1)));
                     i += 1;
                 }
             }
+            '&' if chars.get(i + 1) == Some(&'&') => {
+                tokens.push(Spanned::new(Token::AndAnd, Span::new(start, start + 2)));
+                i += 2;
+            }
             // 数値。整数部の数字を読み、`.`+数字なら Float、続く `L` なら Long、それ以外 Int。
             // （`5.method` は Int(5)・Dot・method に分かれる＝メソッド呼び出しと両立。）
             '0'..='9' => {
+                // 0x / 0o / 0b の基数付き整数リテラル（Int、末尾 L で Long、`_` 区切り可）。
+                let radix = if chars.get(i) == Some(&'0') {
+                    match chars.get(i + 1) {
+                        Some('x') | Some('X') => Some(16),
+                        Some('o') | Some('O') => Some(8),
+                        Some('b') | Some('B') => Some(2),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(radix) = radix {
+                    let digit_start = i + 2;
+                    let mut j = digit_start;
+                    while j < chars.len() && (chars[j].is_digit(radix) || chars[j] == '_') {
+                        j += 1;
+                    }
+                    if j == digit_start {
+                        let lit: String = chars[start..j].iter().collect();
+                        return Err(LocatedError::at(
+                            AwaError::InvalidNumber(lit),
+                            Span::new(start, j),
+                        ));
+                    }
+                    let digits: String = chars[digit_start..j].iter().filter(|c| **c != '_').collect();
+                    let n = i64::from_str_radix(&digits, radix).map_err(|_| {
+                        LocatedError::at(
+                            AwaError::InvalidNumber(chars[start..j].iter().collect()),
+                            Span::new(start, j),
+                        )
+                    })?;
+                    if chars.get(j) == Some(&'L') {
+                        j += 1;
+                        tokens.push(Spanned::new(Token::Long(n), Span::new(start, j)));
+                    } else {
+                        tokens.push(Spanned::new(Token::Int(n), Span::new(start, j)));
+                    }
+                    i = j;
+                    continue;
+                }
                 while i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
                 }

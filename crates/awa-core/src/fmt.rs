@@ -137,10 +137,12 @@ fn fmt_float(f: f64) -> String {
 
 fn binop_prec(t: &Token) -> u8 {
     match t {
-        Token::EqEq | Token::NotEq => 1,
-        Token::Lt | Token::Gt | Token::Le | Token::Ge | Token::Concat => 2,
-        Token::Plus | Token::Minus => 3,
-        Token::Star | Token::Slash => 4,
+        Token::OrOr => 1,
+        Token::AndAnd => 2,
+        Token::EqEq | Token::NotEq => 3,
+        Token::Lt | Token::Gt | Token::Le | Token::Ge | Token::Concat => 4,
+        Token::Plus | Token::Minus => 5,
+        Token::Star | Token::Slash => 6,
         _ => 0,
     }
 }
@@ -158,6 +160,8 @@ fn binop_str(t: &Token) -> &'static str {
         Token::Le => "<=",
         Token::Ge => ">=",
         Token::Concat => "<>",
+        Token::AndAnd => "&&",
+        Token::OrOr => "||",
         _ => "?",
     }
 }
@@ -661,6 +665,14 @@ mod tests {
         assert_eq!(fmt("(1 + 2) * 3"), "(1 + 2) * 3\n");
         // 1 + 2 * 3 は括弧不要。
         assert_eq!(fmt("1 + 2 * 3"), "1 + 2 * 3\n");
+    }
+
+    #[test]
+    fn 論理演算子の優先順位で括弧を保つ() {
+        // || は && より緩い → (a && b) || c は括弧不要。
+        assert_eq!(fmt("a && b || c"), "a && b || c\n");
+        // a && (b || c) は括弧が必要。
+        assert_eq!(fmt("a && (b || c)"), "a && (b || c)\n");
     }
 
     #[test]

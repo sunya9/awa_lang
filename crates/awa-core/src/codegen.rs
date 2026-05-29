@@ -756,6 +756,10 @@ impl Gen {
     }
 
     fn binop(&mut self, l: &TExpr, op: &Token, r: &TExpr, m: &mut Module) -> Result<String> {
+        // 論理積/和は短絡（右辺は分岐の中で評価する）。
+        if matches!(op, Token::AndAnd | Token::OrOr) {
+            return self.logical(l, op, r, m);
+        }
         let lv = self.expr(l, m)?;
         let rv = self.expr(r, m)?;
         // 文字列の連結と等価はランタイム関数（ptr 比較ではなく中身で比べる）。
@@ -870,6 +874,33 @@ impl Gen {
             }
             _ => unsupported(format!("組込関数 {}", name)),
         }
+    }
+
+    // 論理積/和の短絡評価。結果は i1。&& は左 false で 0、|| は左 true で 1 を短絡。
+    fn logical(&mut self, l: &TExpr, op: &Token, r: &TExpr, m: &mut Module) -> Result<String> {
+        let slot = format!("%v{}", self.fresh());
+        self.line(&format!("{} = alloca i1", slot));
+        let lv = self.expr(l, m)?;
+        let id = self.fresh();
+        let (rhs, short, end) = (format!("rhs{id}"), format!("short{id}"), format!("lend{id}"));
+        let is_and = matches!(op, Token::AndAnd);
+        // && は左が true のとき右へ、|| は左が false のとき右へ。
+        if is_and {
+            self.line(&format!("br i1 {}, label %{}, label %{}", lv, rhs, short));
+        } else {
+            self.line(&format!("br i1 {}, label %{}, label %{}", lv, short, rhs));
+        }
+        self.label(&short);
+        self.line(&format!("store i1 {}, ptr {}", if is_and { 0 } else { 1 }, slot));
+        self.line(&format!("br label %{}", end));
+        self.label(&rhs);
+        let rv = self.expr(r, m)?;
+        self.line(&format!("store i1 {}, ptr {}", rv, slot));
+        self.line(&format!("br label %{}", end));
+        self.label(&end);
+        let res = format!("%t{}", self.fresh());
+        self.line(&format!("{} = load i1, ptr {}", res, slot));
+        Ok(res)
     }
 
     // 構築子ブロックを malloc して tag と各フィールドを格納し、その ptr を返す。

@@ -624,10 +624,10 @@ impl Parser {
     // 関数適用（Call）として扱う。`x |> f(a)` は f(x, a)（Gleam 流に第一引数へ挿入）、
     // `x |> f` は f(x)。AST に新ノードは足さない。
     fn parse_pipe(&mut self) -> Result<Expr, LocatedError> {
-        let mut left = self.parse_equality()?;
+        let mut left = self.parse_or()?;
         while self.peek() == Some(&Token::PipeArrow) {
             self.next(); // '|>'
-            let rhs = self.parse_equality()?;
+            let rhs = self.parse_or()?;
             let span = Span::merge(left.span, rhs.span);
             // rhs が呼び出しなら左辺を第一引数に挿入、そうでなければ rhs(左辺)。
             let kind = match rhs.kind {
@@ -642,7 +642,37 @@ impl Parser {
         Ok(left)
     }
 
-    // == / != （最も緩い）。左結合。
+    // 論理和 `||`（短絡）。pipe より強く == より弱い。左結合。
+    fn parse_or(&mut self) -> Result<Expr, LocatedError> {
+        let mut left = self.parse_and()?;
+        while self.peek() == Some(&Token::OrOr) {
+            let op = self.next().unwrap();
+            let right = self.parse_and()?;
+            let span = Span::merge(left.span, right.span);
+            left = Expr {
+                kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)),
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    // 論理積 `&&`（短絡）。|| より強く == より弱い。左結合。
+    fn parse_and(&mut self) -> Result<Expr, LocatedError> {
+        let mut left = self.parse_equality()?;
+        while self.peek() == Some(&Token::AndAnd) {
+            let op = self.next().unwrap();
+            let right = self.parse_equality()?;
+            let span = Span::merge(left.span, right.span);
+            left = Expr {
+                kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)),
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    // == / != 。左結合。
     fn parse_equality(&mut self) -> Result<Expr, LocatedError> {
         let mut left = self.parse_comparison()?;
         while let Some(Token::EqEq | Token::NotEq) = self.peek() {

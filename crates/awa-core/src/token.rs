@@ -30,6 +30,8 @@ pub enum Token {
     Gt,            // >
     Le,            // <=
     Ge,            // >=
+    AndAnd,        // &&（論理積・短絡）
+    OrOr,          // ||（論理和・短絡）
     Plus,
     Minus,
     Star,

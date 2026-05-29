@@ -1055,6 +1055,12 @@ fn infer_binop(lt: &Type, op: &Token, rt: &Type, subst: &mut Subst) -> Result<Ty
             unify(subst, lt, rt)?;
             Ok(Type::Bool)
         }
+        // 論理積/和: 両辺 Bool、結果 Bool。
+        Token::AndAnd | Token::OrOr => {
+            unify(subst, lt, &Type::Bool)?;
+            unify(subst, rt, &Type::Bool)?;
+            Ok(Type::Bool)
+        }
         // パーサが BinOp に入れるのは上記の演算子トークンのみ。
         other => unreachable!("二項演算子でないトークン: {:?}", other),
     }

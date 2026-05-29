@@ -55,6 +55,17 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
             Value::Float(n) => Ok(Value::Float(-n)),
             _ => unreachable!("Neg のオペランドは数値（型検査済み）"),
         },
+        // 論理積/和は短絡評価（右辺は必要なときだけ評価する）。
+        TExprKind::BinOp(left, Token::AndAnd, right) => match eval_expr(left, env)? {
+            Value::Bool(true) => eval_expr(right, env),
+            Value::Bool(false) => Ok(Value::Bool(false)),
+            _ => unreachable!("&& の左辺は Bool（型検査済み）"),
+        },
+        TExprKind::BinOp(left, Token::OrOr, right) => match eval_expr(left, env)? {
+            Value::Bool(true) => Ok(Value::Bool(true)),
+            Value::Bool(false) => eval_expr(right, env),
+            _ => unreachable!("|| の左辺は Bool（型検査済み）"),
+        },
         TExprKind::BinOp(left, op, right) => {
             let l = eval_expr(left, env)?;
             let r = eval_expr(right, env)?;

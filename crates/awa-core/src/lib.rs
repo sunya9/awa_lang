@@ -487,6 +487,28 @@ mod tests {
     }
 
     #[test]
+    fn 基数付き整数リテラル() {
+        assert_eq!(eval("0xFF"), Ok(Value::Int(255)));
+        assert_eq!(eval("0o17"), Ok(Value::Int(15)));
+        assert_eq!(eval("0b1010"), Ok(Value::Int(10)));
+        assert_eq!(eval("0xDEAD_BEEF"), Ok(Value::Int(3735928559)));
+        assert_eq!(eval("0xffL"), Ok(Value::Long(255)));
+    }
+
+    #[test]
+    fn 論理演算子と短絡評価() {
+        assert_eq!(eval("true && false"), Ok(Value::Bool(false)));
+        assert_eq!(eval("false || true"), Ok(Value::Bool(true)));
+        // 短絡: 左で確定すれば右（0 除算）は評価されない。
+        assert_eq!(eval("false && 1 / 0 == 0"), Ok(Value::Bool(false)));
+        assert_eq!(eval("true || 1 / 0 == 0"), Ok(Value::Bool(true)));
+        // 優先順位: && / || は == より緩い。
+        assert_eq!(eval("1 == 1 && 2 == 2"), Ok(Value::Bool(true)));
+        // 型エラー: 論理演算子の引数は Bool。
+        assert!(eval("1 && true").is_err());
+    }
+
+    #[test]
     fn ゼロ除算はエラー() {
         assert_eq!(eval("1 / 0"), Err(AwaError::DivisionByZero));
     }
@@ -2168,6 +2190,24 @@ mod tests {
         // std/string と main の 2 モジュールが読めていること。
         assert!(modules.iter().any(|m| m.path == vec!["std".to_string(), "string".to_string()]));
         assert!(!typed.is_empty());
+    }
+
+    #[test]
+    fn codegen_論理演算子と基数リテラル() {
+        // 0xFF + 0b1 = 256、|| の短絡。
+        let (out, code) = compile_run_status(
+            "print(int_to_string(0xFF + 0b1))\nprint(\"${false || true}\")",
+        );
+        assert_eq!(out, "256\ntrue\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn codegen_短絡は右辺を評価しない() {
+        // false && (0除算) が走ると exit 1 になるが、短絡するので 0 で正常終了。
+        let (out, code) = compile_run_status("print(\"${false && 1 / 0 == 0}\")");
+        assert_eq!(out, "false\n");
+        assert_eq!(code, 0);
     }
 
     #[test]
