@@ -63,6 +63,8 @@ fn head_of(p: &Pattern) -> Option<Head> {
         Pattern::Ctor(name, _) => Some(Head::Ctor(name.clone())),
         Pattern::Array(subs) => Some(Head::Array(subs.len())),
         Pattern::Tuple(subs) => Some(Head::Tuple(subs.len())),
+        // レコードパターンは型検査前に Ctor へ脱糖済み。
+        Pattern::Record(..) => unreachable!("レコードパターンは脱糖済み"),
         // 行列・クエリは expand で or を除いてから組むので、ここに Or は来ない。
         Pattern::Or(_) => unreachable!("or パターンは expand 済みのはず"),
     }
@@ -319,6 +321,7 @@ fn render_pattern(p: &Pattern) -> String {
             let inner: Vec<String> = subs.iter().map(render_pattern).collect();
             format!("({})", inner.join(", "))
         }
+        Pattern::Record(..) => unreachable!("レコードパターンは脱糖済み"),
         Pattern::Or(alts) => alts
             .iter()
             .map(render_pattern)
@@ -426,6 +429,20 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
         ExprKind::Field(receiver, _) => check_expr(receiver, sigs),
         ExprKind::ArrayLit(elems) | ExprKind::TupleLit(elems) => {
             for e in elems {
+                check_expr(e, sigs)?;
+            }
+            Ok(())
+        }
+        // レコードリテラルは脱糖済み（ここには来ない）。更新は infer で脱糖されるので子だけ辿る。
+        ExprKind::RecordLit(_, inits) => {
+            for (_, e) in inits {
+                check_expr(e, sigs)?;
+            }
+            Ok(())
+        }
+        ExprKind::RecordUpdate(base, inits) => {
+            check_expr(base, sigs)?;
+            for (_, e) in inits {
                 check_expr(e, sigs)?;
             }
             Ok(())

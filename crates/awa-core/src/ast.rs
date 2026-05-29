@@ -45,6 +45,12 @@ pub enum ExprKind {
     // タプルリテラル (e1, e2, ...)。要素ごとに型が異なる固定長の組 Tuple(t1, ..., tn)。
     // 要素は 2 個以上（(e) は単なるグループ化）。
     TupleLit(Vec<Expr>),
+    // レコードリテラル Name { field = expr, ... }。型名（＝単一構築子名）と名前付き
+    // フィールド初期化。resolve が宣言順に並べ替えて Ctor 呼び出しへ脱糖する。
+    RecordLit(String, Vec<(String, Expr)>),
+    // レコード更新 { base | field = expr, ... }。base の一部フィールドを差し替えた新しい
+    // レコードを作る（不変）。infer が base の型からフィールド順を得て case 再構築へ脱糖する。
+    RecordUpdate(Box<Expr>, Vec<(String, Expr)>),
 }
 
 // ===== パターン（case の腕の左辺）=====
@@ -62,6 +68,9 @@ pub enum Pattern {
     Array(Vec<Pattern>),
     // タプルパターン (a, b, ...)。要素数は型で固定なので各位置を分解する（網羅的になり得る）。
     Tuple(Vec<Pattern>),
+    // レコードパターン Name { field = pat, ... }。resolve が宣言順に並べ替えて Ctor パターンへ
+    // 脱糖する。省略形 { x } は { x = x }（同名束縛）として parser が展開する。
+    Record(String, Vec<(String, Pattern)>),
     // or パターン A | B | ...。どれかに当たれば成立。各選択肢は同じ変数を束縛する必要がある。
     Or(Vec<Pattern>),
 }
@@ -90,6 +99,9 @@ pub struct TypeDef {
     pub params: Vec<String>,     // ["a"]（型パラメータ名）
     pub variants: Vec<Variant>,
     pub span: Span,              // フォーマッタのコメント再配置に使う
+    // レコード型なら Some(フィールド名の宣言順)。variants は単一（name=型名）で、その
+    // fields がフィールド型を宣言順で持つ。None なら通常の ADT（位置フィールド）。
+    pub record_fields: Option<Vec<String>>,
 }
 
 // ===== 型付き AST（型検査の出力 = elaboration の結果）=====

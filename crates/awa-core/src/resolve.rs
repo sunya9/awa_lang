@@ -349,6 +349,15 @@ impl Resolver<'_> {
                 let subs = subs.iter().map(|s| self.pattern(s)).collect::<Result<_, _>>()?;
                 Ok(Pattern::Tuple(subs))
             }
+            // レコードパターンは check_program で Ctor へ脱糖。resolve は型名修飾と子だけ。
+            Pattern::Record(name, fields) => {
+                let q = self.ctor_name(name)?;
+                let fields = fields
+                    .iter()
+                    .map(|(fname, p)| Ok((fname.clone(), self.pattern(p)?)))
+                    .collect::<Result<_, LocatedError>>()?;
+                Ok(Pattern::Record(q, fields))
+            }
             Pattern::Or(alts) => {
                 let alts = alts.iter().map(|a| self.pattern(a)).collect::<Result<_, _>>()?;
                 Ok(Pattern::Or(alts))
@@ -458,6 +467,24 @@ impl Resolver<'_> {
             }
             ExprKind::ArrayLit(elems) => ExprKind::ArrayLit(self.exprs(elems, locals)?),
             ExprKind::TupleLit(elems) => ExprKind::TupleLit(self.exprs(elems, locals)?),
+            // レコードは check_program（全パス共通）で脱糖する。resolve は型名の修飾と
+            // 子式の解決だけ行う（単一ファイル経路は resolve を通らないため脱糖はここでしない）。
+            ExprKind::RecordLit(name, inits) => {
+                let q = self.ctor_name(name)?;
+                let inits = inits
+                    .iter()
+                    .map(|(fname, e)| Ok((fname.clone(), self.expr(e, locals)?)))
+                    .collect::<Result<_, LocatedError>>()?;
+                ExprKind::RecordLit(q, inits)
+            }
+            ExprKind::RecordUpdate(base, inits) => {
+                let base = self.expr(base, locals)?;
+                let inits = inits
+                    .iter()
+                    .map(|(fname, e)| Ok((fname.clone(), self.expr(e, locals)?)))
+                    .collect::<Result<_, LocatedError>>()?;
+                ExprKind::RecordUpdate(Box::new(base), inits)
+            }
         };
         Ok(Expr { kind, span: self.at(e.span) })
     }
@@ -498,6 +525,11 @@ fn pattern_vars(p: &Pattern, out: &mut HashSet<String>) {
         Pattern::Ctor(_, subs) | Pattern::Or(subs) | Pattern::Array(subs) | Pattern::Tuple(subs) => {
             for s in subs {
                 pattern_vars(s, out);
+            }
+        }
+        Pattern::Record(_, fields) => {
+            for (_, p) in fields {
+                pattern_vars(p, out);
             }
         }
         _ => {}

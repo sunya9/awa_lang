@@ -859,6 +859,8 @@ impl Gen {
         m: &mut Module,
     ) -> Result<()> {
         match pat {
+            // レコードパターンは型検査前に Ctor へ脱糖済み。
+            Pattern::Record(..) => unsupported("レコードパターン（脱糖漏れ）"),
             Pattern::Wildcard => Ok(()),
             // 束縛は subject 内部への新たな所有参照 → retain（腕脱出で release される）。
             Pattern::Var(n) => {

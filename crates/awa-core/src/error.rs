@@ -38,6 +38,11 @@ pub enum AwaError {
     // ----- ADT / パターンマッチ（Phase 3） -----
     UnknownType(String),        // 型式が参照する型名が未定義
     UnknownConstructor(String), // パターン等が参照する構築子が未定義
+    // ----- レコード（名前付きフィールド） -----
+    NotARecord(String),                       // レコード構文を非レコード型に使った
+    UnknownField { ty: String, field: String }, // レコードに無いフィールド名を指定した
+    MissingFields { ty: String, fields: String }, // レコードリテラルでフィールドが足りない
+    DuplicateField(String),                   // 同じフィールドを 2 回指定した
     NoMatch,                    // 評価: どのパターンにも当たらなかった（網羅性が防ぐ穴の保険）
     // ----- 網羅性・到達不能（Phase 3b） -----
     NonExhaustiveMatch { witness: String }, // case に覆えない値がある（witness=足りない例）
@@ -97,6 +102,18 @@ impl fmt::Display for AwaError {
             }
             AwaError::UnknownType(name) => write!(f, "未定義の型です: {}", name),
             AwaError::UnknownConstructor(name) => write!(f, "未定義の構築子です: {}", name),
+            AwaError::NotARecord(name) => {
+                write!(f, "{} はレコード型ではありません（名前付きフィールド構文は使えません）", name)
+            }
+            AwaError::UnknownField { ty, field } => {
+                write!(f, "レコード {} にフィールド {} はありません", ty, field)
+            }
+            AwaError::MissingFields { ty, fields } => {
+                write!(f, "レコード {} のフィールドが足りません: {}", ty, fields)
+            }
+            AwaError::DuplicateField(name) => {
+                write!(f, "フィールド {} が複数回指定されています", name)
+            }
             AwaError::NoMatch => write!(f, "どのパターンにも一致しませんでした"),
             AwaError::NonExhaustiveMatch { witness } => {
                 write!(f, "case が網羅的でありません: {} に当たる腕がありません", witness)

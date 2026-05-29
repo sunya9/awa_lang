@@ -11,6 +11,19 @@ fn is_upper(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
+// 式が構築子パス（大文字 Var、または qual.Ctor の Field）ならその名前文字列を返す。
+// レコードリテラル `Name { .. }` / `mod.Name { .. }` の頭を識別するのに使う。
+fn ctor_path(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Var(n) if is_upper(n) => Some(n.clone()),
+        ExprKind::Field(recv, m) if is_upper(m) => match &recv.kind {
+            ExprKind::Var(q) => Some(format!("{}.{}", q, m)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 // トップレベル定義が束縛する名前（pub の公開記録に使う）。式文は名前を持たない。
 fn stmt_name(stmt: &Stmt) -> Option<&str> {
     match stmt {
@@ -70,6 +83,24 @@ impl Parser {
         let t = self.tokens.get(self.pos).map(|s| s.node.clone());
         self.pos += 1;
         t
+    }
+
+    // 現在の '{' の直後が `[終端]* 識別子 [終端]* =` の形か（レコードリテラル本体の判定）。
+    // これで `Name { x = .. }`（レコード）と `case Name { pat -> .. }`（case 本体）を区別する。
+    fn looks_like_record_body(&self) -> bool {
+        let tok = |i: usize| self.tokens.get(i).map(|s| &s.node);
+        let mut i = self.pos + 1; // '{' の次
+        while matches!(tok(i), Some(Token::Terminator)) {
+            i += 1;
+        }
+        if !matches!(tok(i), Some(Token::Ident(_))) {
+            return false;
+        }
+        i += 1;
+        while matches!(tok(i), Some(Token::Terminator)) {
+            i += 1;
+        }
+        matches!(tok(i), Some(Token::Equal))
     }
 
     // 現在位置のトークンの span。入力末尾なら最後のトークン末尾の幅 0 span。
@@ -388,8 +419,13 @@ impl Parser {
             Vec::new()
         };
         self.expect(Token::LBrace)?;
-        let mut variants = Vec::new();
         self.skip_terminators();
+        // 本体の先頭が小文字識別子（field: Type）ならレコード、大文字（Variant）なら ADT。
+        let is_record = matches!(self.peek(), Some(Token::Ident(n)) if !is_upper(n));
+        if is_record {
+            return self.parse_record_body(name, params, start);
+        }
+        let mut variants = Vec::new();
         while self.peek() != Some(&Token::RBrace) {
             if self.peek().is_none() {
                 return Err(self.eof());
@@ -435,6 +471,61 @@ impl Parser {
             params,
             variants,
             span: Span::new(start, self.last_span().end),
+            record_fields: None,
+        })
+    }
+
+    // レコード本体 `{ field: Type, ... }`（'{' と先頭の終端は消費済み）。単一構築子
+    // （名前 = 型名）の ADT として表し、フィールド名を record_fields に保持する。
+    fn parse_record_body(
+        &mut self,
+        name: String,
+        params: Vec<String>,
+        start: usize,
+    ) -> Result<TypeDef, LocatedError> {
+        let mut field_names = Vec::new();
+        let mut field_tys = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(self.eof());
+            }
+            let fname = match self.next() {
+                Some(Token::Ident(n)) if !is_upper(&n) => n,
+                Some(other) => return Err(self.unexpected(&other)),
+                None => return Err(self.eof()),
+            };
+            self.expect(Token::Colon)?;
+            field_tys.push(self.parse_type_expr()?);
+            field_names.push(fname);
+            match self.peek() {
+                Some(Token::Comma) => {
+                    self.next();
+                    self.skip_terminators();
+                }
+                Some(Token::Terminator) => self.skip_terminators(),
+                Some(Token::RBrace) => break,
+                None => return Err(self.eof()),
+                Some(other) => {
+                    let other = other.clone();
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedToken(format!("{:?}", other)),
+                        self.span_here(),
+                    ));
+                }
+            }
+        }
+        self.expect(Token::RBrace)?;
+        // 単一構築子（名前 = 型名）。fields は宣言順の型。
+        let variant = Variant {
+            name: name.clone(),
+            fields: field_tys,
+        };
+        Ok(TypeDef {
+            name,
+            params,
+            variants: vec![variant],
+            span: Span::new(start, self.last_span().end),
+            record_fields: Some(field_names),
         })
     }
 
@@ -630,19 +721,32 @@ impl Parser {
                 if name == "_" {
                     Ok(Pattern::Wildcard)
                 } else if is_upper(&name) {
-                    // 構築子パターン Some(x) / None。続く ( があれば部分パターン列。
-                    let subs = self.parse_ctor_subpatterns()?;
-                    Ok(Pattern::Ctor(name, subs))
+                    // 構築子パターン Some(x) / None、またはレコードパターン Name { field = pat }。
+                    if self.peek() == Some(&Token::LBrace) {
+                        self.next(); // '{'
+                        let fields = self.parse_record_pat_fields()?;
+                        Ok(Pattern::Record(name, fields))
+                    } else {
+                        let subs = self.parse_ctor_subpatterns()?;
+                        Ok(Pattern::Ctor(name, subs))
+                    }
                 } else if self.peek() == Some(&Token::Dot) {
-                    // 修飾された構築子パターン util.Some(x) / util.None。
+                    // 修飾された構築子パターン util.Some(x) / util.None、または util.Rec { .. }。
                     self.next(); // '.'
                     let ctor = match self.next() {
                         Some(Token::Ident(c)) if is_upper(&c) => c,
                         Some(other) => return Err(self.unexpected(&other)),
                         None => return Err(self.eof()),
                     };
-                    let subs = self.parse_ctor_subpatterns()?;
-                    Ok(Pattern::Ctor(format!("{}.{}", name, ctor), subs))
+                    let full = format!("{}.{}", name, ctor);
+                    if self.peek() == Some(&Token::LBrace) {
+                        self.next(); // '{'
+                        let fields = self.parse_record_pat_fields()?;
+                        Ok(Pattern::Record(full, fields))
+                    } else {
+                        let subs = self.parse_ctor_subpatterns()?;
+                        Ok(Pattern::Ctor(full, subs))
+                    }
                 } else {
                     Ok(Pattern::Var(name))
                 }
@@ -650,6 +754,41 @@ impl Parser {
             Some(other) => Err(self.unexpected(&other)),
             None => Err(self.eof()),
         }
+    }
+
+    // レコードパターンのフィールド列 `field = pat, ...` を '}' まで読む（'{' は消費済み）。
+    // 省略形 `field` は `field = field`（同名の変数束縛）に展開する。
+    fn parse_record_pat_fields(&mut self) -> Result<Vec<(String, Pattern)>, LocatedError> {
+        let mut fields = Vec::new();
+        self.skip_terminators();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(self.eof());
+            }
+            let fname = match self.next() {
+                Some(Token::Ident(n)) if !is_upper(&n) => n,
+                Some(other) => return Err(self.unexpected(&other)),
+                None => return Err(self.eof()),
+            };
+            // `field = pat`、または省略形 `field`（同名束縛）。
+            let pat = if self.peek() == Some(&Token::Equal) {
+                self.next(); // '='
+                self.parse_pattern()?
+            } else {
+                Pattern::Var(fname.clone())
+            };
+            fields.push((fname, pat));
+            match self.peek() {
+                Some(Token::Comma) => {
+                    self.next();
+                    self.skip_terminators();
+                }
+                Some(Token::Terminator) => self.skip_terminators(),
+                _ => break,
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(fields)
     }
 
     // 構築子パターンの部分パターン列 `( p, ... )`（無ければ空＝ヌル構築子）。
@@ -853,10 +992,77 @@ impl Parser {
                         };
                     }
                 }
+                // レコードリテラル Name { field = expr, ... }。直前が構築子パス（大文字 Var or
+                // 修飾 Field）かつ本体が `ident =` の形のときだけ（`case X { pat -> }` と区別）。
+                Some(Token::LBrace)
+                    if self.looks_like_record_body() && ctor_path(&expr).is_some() =>
+                {
+                    let name = ctor_path(&expr).unwrap();
+                    self.next(); // '{'
+                    let inits = self.parse_record_inits()?;
+                    let span = Span::new(expr.span.start, self.last_span().end);
+                    expr = Expr {
+                        kind: ExprKind::RecordLit(name, inits),
+                        span,
+                    };
+                }
                 _ => break,
             }
         }
         Ok(expr)
+    }
+
+    // レコード更新 `{ base | field = expr, ... }` を投機的にパース（'{' は消費済み）。
+    // base 式の直後に `|` が無ければ更新ではない（None を返し、呼び出し側がブロックへ戻す）。
+    fn try_record_update(&mut self, start: usize) -> Result<Option<Expr>, LocatedError> {
+        let save = self.pos;
+        let base = match self.parse_expr() {
+            Ok(e) => e,
+            Err(_) => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        if self.peek() != Some(&Token::Pipe) {
+            self.pos = save;
+            return Ok(None);
+        }
+        self.next(); // '|'
+        let inits = self.parse_record_inits()?;
+        let span = Span::new(start, self.last_span().end);
+        Ok(Some(Expr {
+            kind: ExprKind::RecordUpdate(Box::new(base), inits),
+            span,
+        }))
+    }
+
+    // レコードのフィールド初期化 `field = expr, ...` を '}' まで読む（'{' は消費済み）。
+    fn parse_record_inits(&mut self) -> Result<Vec<(String, Expr)>, LocatedError> {
+        let mut inits = Vec::new();
+        self.skip_terminators();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(self.eof());
+            }
+            let fname = match self.next() {
+                Some(Token::Ident(n)) => n,
+                Some(other) => return Err(self.unexpected(&other)),
+                None => return Err(self.eof()),
+            };
+            self.expect(Token::Equal)?;
+            let value = self.parse_expr()?;
+            inits.push((fname, value));
+            match self.peek() {
+                Some(Token::Comma) => {
+                    self.next();
+                    self.skip_terminators();
+                }
+                Some(Token::Terminator) => self.skip_terminators(),
+                _ => break,
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(inits)
     }
 
     // '(' の直後から引数列を読み ')' まで消費する。引数なし f() を許す。
@@ -972,8 +1178,17 @@ impl Parser {
             }
             // do 記法（モナド糖衣）。flatMap 連鎖へ脱糖する。
             Some(Token::Do) => self.parse_do(start),
-            // 単独のブロック式 { ... }。parse_block が span つきで返す。
-            Some(Token::LBrace) => self.parse_block(),
+            // `{` はレコード更新 { base | field = .. } かブロック { 文... }。
+            // 更新を投機的に試し（base 式の後に `|` があれば更新）、違えばブロックへ戻す。
+            Some(Token::LBrace) => {
+                let after_brace = self.pos;
+                if let Some(upd) = self.try_record_update(start)? {
+                    Ok(upd)
+                } else {
+                    self.pos = after_brace;
+                    self.parse_block()
+                }
+            }
             Some(Token::LParen) => {
                 let e = self.parse_expr()?;
                 // `,` が続けばタプル (e1, e2, ...)、無ければ単なるグループ化 (e)。

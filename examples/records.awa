@@ -1,0 +1,43 @@
+// レコード（名前付きフィールド）のデモ。
+// 宣言は `type Name { field: Type, ... }`、生成は `Name { field = value, ... }`、
+// アクセスは `p.field`、更新は `{ p | field = value }`（不変＝新しいレコードを返す）。
+// パターンマッチでも分解できる（省略形 { x } は { x = x } と同じ）。
+import std/io
+
+type Point {
+  x: Int
+  y: Int
+}
+
+// 多相レコード（フィールド型に型変数）。
+type Box(a) {
+  value: a
+}
+
+impl Point {
+  // メソッドのレシーバ self は型が分かる。他の引数は型注釈が要る（フィールドアクセスのため）。
+  fn add(self, o: Point) { Point { x = self.x + o.x, y = self.y + o.y } }
+}
+
+let main = fn() {
+  let p = Point { x = 3, y = 4 }
+  io.println("p = (${p.x}, ${p.y})")
+
+  // 不変更新: q は新しいレコード、p は変わらない。
+  let q = { p | y = 10 }
+  io.println("q = (${q.x}, ${q.y}), p still (${p.x}, ${p.y})")
+
+  // メソッド。
+  let r = p.add(Point { x = 1, y = 1 })
+  io.println("p + (1,1) = (${r.x}, ${r.y})")
+
+  // パターンで分解。
+  case r {
+    Point { x = a, y = b } -> io.println("sum = ${a + b}")
+  }
+
+  // 多相レコード。
+  let bi = Box { value = 42 }
+  let bs = Box { value = "boxed" }
+  io.println("box int = ${bi.value}, box str = ${bs.value}")
+}

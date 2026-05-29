@@ -330,6 +330,17 @@ impl Fmt {
         } else {
             concat(vec![text("("), text(d.params.join(", ")), text(")")])
         };
+        let header = concat(vec![text("type "), text(d.name.clone()), params]);
+        // レコード型は `type Name { field: Type, ... }` で表示する。
+        if let Some(field_names) = &d.record_fields {
+            let field_tys = &d.variants[0].fields;
+            let fields: Vec<D> = field_names
+                .iter()
+                .zip(field_tys.iter())
+                .map(|(n, t)| concat(vec![text(n.clone()), text(": "), type_doc(t)]))
+                .collect();
+            return braced(header, concat(vec![join(fields, hard())]));
+        }
         let variants: Vec<D> = d
             .variants
             .iter()
@@ -342,7 +353,6 @@ impl Fmt {
                 }
             })
             .collect();
-        let header = concat(vec![text("type "), text(d.name.clone()), params]);
         braced(header, concat(vec![join(variants, hard())]))
     }
 
@@ -464,6 +474,33 @@ impl Fmt {
             ExprKind::TupleLit(elems) => {
                 let docs: Vec<D> = elems.iter().map(|x| self.expr(x)).collect();
                 concat(vec![text("("), join(docs, text(", ")), text(")")])
+            }
+            // レコードリテラル Name { field = expr, ... }。
+            ExprKind::RecordLit(name, inits) => {
+                let parts: Vec<D> = inits
+                    .iter()
+                    .map(|(f, e)| concat(vec![text(f.clone()), text(" = "), self.expr(e)]))
+                    .collect();
+                concat(vec![
+                    text(name.clone()),
+                    text(" { "),
+                    join(parts, text(", ")),
+                    text(" }"),
+                ])
+            }
+            // レコード更新 { base | field = expr, ... }。
+            ExprKind::RecordUpdate(base, inits) => {
+                let parts: Vec<D> = inits
+                    .iter()
+                    .map(|(f, e)| concat(vec![text(f.clone()), text(" = "), self.expr(e)]))
+                    .collect();
+                concat(vec![
+                    text("{ "),
+                    self.expr(base),
+                    text(" | "),
+                    join(parts, text(", ")),
+                    text(" }"),
+                ])
             }
             ExprKind::Block(stmts) => self.block(stmts, e.span.end),
             ExprKind::Case(subj, arms) => {
@@ -728,6 +765,18 @@ fn pattern_doc(p: &Pattern) -> D {
         Pattern::Tuple(subs) => {
             let s: Vec<D> = subs.iter().map(pattern_doc).collect();
             concat(vec![text("("), join(s, text(", ")), text(")")])
+        }
+        Pattern::Record(name, fields) => {
+            let parts: Vec<D> = fields
+                .iter()
+                .map(|(f, p)| concat(vec![text(f.clone()), text(" = "), pattern_doc(p)]))
+                .collect();
+            concat(vec![
+                text(name.clone()),
+                text(" { "),
+                join(parts, text(", ")),
+                text(" }"),
+            ])
         }
         Pattern::Ctor(name, subs) => {
             if subs.is_empty() {

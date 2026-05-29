@@ -10,6 +10,170 @@ use crate::span::Span;
 use crate::token::Token;
 use crate::types::{Scheme, Subst, Type, VarGen, apply, ftv, instantiate, render_type, unify};
 
+use std::cell::RefCell;
+
+thread_local! {
+    // レコード型名（解決済み・prefix 付き）→ フィールド宣言順。check_program 開始時に全 record を
+    // 集めておき、infer_expr の `p.x` アクセスと `{ p | .. }` 更新の脱糖で参照する。
+    // 引数で全 infer 関数へ通すと配管が膨大なので thread_local にした（infer は単一スレッド実行）。
+    static RECORD_FIELDS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+}
+
+// レコード型名（解決済み）→ フィールド宣言順を引く。
+fn record_order(name: &str) -> Option<Vec<String>> {
+    RECORD_FIELDS.with(|r| r.borrow().get(name).cloned())
+}
+
+// 名前付きフィールド（field, T）を宣言順 order に並べ替える。重複・未知・不足を検査。
+fn reorder_named<T>(ty: &str, order: &[String], named: Vec<(String, T)>) -> Result<Vec<T>, LocatedError> {
+    let mut slots: Vec<Option<T>> = Vec::with_capacity(order.len());
+    for _ in 0..order.len() {
+        slots.push(None);
+    }
+    for (fname, val) in named {
+        match order.iter().position(|f| f == &fname) {
+            Some(i) => {
+                if slots[i].is_some() {
+                    return Err(LocatedError::from(AwaError::DuplicateField(fname)));
+                }
+                slots[i] = Some(val);
+            }
+            None => {
+                return Err(LocatedError::from(AwaError::UnknownField {
+                    ty: ty.to_string(),
+                    field: fname,
+                }));
+            }
+        }
+    }
+    let missing: Vec<String> = order
+        .iter()
+        .zip(slots.iter())
+        .filter(|(_, s)| s.is_none())
+        .map(|(f, _)| f.clone())
+        .collect();
+    if !missing.is_empty() {
+        return Err(LocatedError::from(AwaError::MissingFields {
+            ty: ty.to_string(),
+            fields: missing.join(", "),
+        }));
+    }
+    Ok(slots.into_iter().map(|s| s.unwrap()).collect())
+}
+
+// ===== レコード脱糖パス（全実行経路の check_program 冒頭で走る）=====
+// RecordLit Name { f = e } → 宣言順に並べた構築子呼び出し Call(Var(Name), [..])。
+// レコードパターン Name { f = p } → 構築子パターン Ctor(Name, [..])。
+// これで infer/match_check/eval/codegen はレコードリテラル/パターンを一切見ない。
+// `p.x` アクセスと `{ p | .. }` 更新は型が要るので infer_expr で別途脱糖する（ここでは子を辿るだけ）。
+fn desugar_records_stmts(stmts: &[Stmt]) -> Result<Vec<Stmt>, LocatedError> {
+    stmts.iter().map(dsr_stmt).collect()
+}
+
+fn dsr_stmt(s: &Stmt) -> Result<Stmt, LocatedError> {
+    Ok(match s {
+        Stmt::Let(n, ann, e) => Stmt::Let(n.clone(), ann.clone(), dsr_expr(e)?),
+        Stmt::Expr(e) => Stmt::Expr(dsr_expr(e)?),
+        Stmt::Type(d) => Stmt::Type(d.clone()),
+        Stmt::Impl(b) => {
+            let mut b = b.clone();
+            for m in &mut b.methods {
+                m.body = dsr_expr(&m.body)?;
+            }
+            Stmt::Impl(b)
+        }
+    })
+}
+
+fn dsr_pattern(p: &Pattern) -> Result<Pattern, LocatedError> {
+    Ok(match p {
+        Pattern::Ctor(name, subs) => {
+            Pattern::Ctor(name.clone(), subs.iter().map(dsr_pattern).collect::<Result<_, _>>()?)
+        }
+        Pattern::Or(alts) => Pattern::Or(alts.iter().map(dsr_pattern).collect::<Result<_, _>>()?),
+        Pattern::Array(subs) => {
+            Pattern::Array(subs.iter().map(dsr_pattern).collect::<Result<_, _>>()?)
+        }
+        Pattern::Tuple(subs) => {
+            Pattern::Tuple(subs.iter().map(dsr_pattern).collect::<Result<_, _>>()?)
+        }
+        Pattern::Record(name, fields) => {
+            let order = record_order(name)
+                .ok_or_else(|| LocatedError::from(AwaError::NotARecord(name.clone())))?;
+            let named: Vec<(String, Pattern)> = fields
+                .iter()
+                .map(|(f, p)| Ok::<_, LocatedError>((f.clone(), dsr_pattern(p)?)))
+                .collect::<Result<_, _>>()?;
+            Pattern::Ctor(name.clone(), reorder_named(name, &order, named)?)
+        }
+        other => other.clone(),
+    })
+}
+
+fn dsr_expr(e: &Expr) -> Result<Expr, LocatedError> {
+    let kind = match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Long(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Var(_) => e.kind.clone(),
+        ExprKind::Neg(x) => ExprKind::Neg(Box::new(dsr_expr(x)?)),
+        ExprKind::BinOp(l, op, r) => {
+            ExprKind::BinOp(Box::new(dsr_expr(l)?), op.clone(), Box::new(dsr_expr(r)?))
+        }
+        ExprKind::Lambda(ps, ret, body) => {
+            ExprKind::Lambda(ps.clone(), ret.clone(), Box::new(dsr_expr(body)?))
+        }
+        ExprKind::Call(c, args) => ExprKind::Call(
+            Box::new(dsr_expr(c)?),
+            args.iter().map(dsr_expr).collect::<Result<_, _>>()?,
+        ),
+        ExprKind::Block(stmts) => ExprKind::Block(desugar_records_stmts(stmts)?),
+        ExprKind::Case(subj, arms) => {
+            let subj = Box::new(dsr_expr(subj)?);
+            let arms = arms
+                .iter()
+                .map(|(p, b)| Ok::<_, LocatedError>((dsr_pattern(p)?, dsr_expr(b)?)))
+                .collect::<Result<_, _>>()?;
+            ExprKind::Case(subj, arms)
+        }
+        ExprKind::MethodCall(recv, m, args) => ExprKind::MethodCall(
+            Box::new(dsr_expr(recv)?),
+            m.clone(),
+            args.iter().map(dsr_expr).collect::<Result<_, _>>()?,
+        ),
+        ExprKind::Field(recv, m) => ExprKind::Field(Box::new(dsr_expr(recv)?), m.clone()),
+        ExprKind::ArrayLit(xs) => {
+            ExprKind::ArrayLit(xs.iter().map(dsr_expr).collect::<Result<_, _>>()?)
+        }
+        ExprKind::TupleLit(xs) => {
+            ExprKind::TupleLit(xs.iter().map(dsr_expr).collect::<Result<_, _>>()?)
+        }
+        // レコードリテラル → 構築子呼び出し（宣言順）。
+        ExprKind::RecordLit(name, inits) => {
+            let order = record_order(name)
+                .ok_or_else(|| LocatedError::from(AwaError::NotARecord(name.clone())))?;
+            let named: Vec<(String, Expr)> = inits
+                .iter()
+                .map(|(f, ie)| Ok::<_, LocatedError>((f.clone(), dsr_expr(ie)?)))
+                .collect::<Result<_, _>>()?;
+            let args = reorder_named(name, &order, named)?;
+            let callee = Expr { kind: ExprKind::Var(name.clone()), span: e.span };
+            ExprKind::Call(Box::new(callee), args)
+        }
+        // 更新は型が要るので infer_expr で脱糖。ここでは子だけ辿る。
+        ExprKind::RecordUpdate(base, inits) => ExprKind::RecordUpdate(
+            Box::new(dsr_expr(base)?),
+            inits
+                .iter()
+                .map(|(f, ie)| Ok::<_, LocatedError>((f.clone(), dsr_expr(ie)?)))
+                .collect::<Result<_, _>>()?,
+        ),
+    };
+    Ok(Expr { kind, span: e.span })
+}
+
 // 型名 → 型パラメータの個数（arity）。型式の解決時に「Option(a) の引数個数が
 // 宣言と合うか」を検査するのに使う。3b の網羅性チェックで variant 一覧へ拡張予定。
 type Arities = HashMap<String, usize>;
@@ -64,6 +228,9 @@ pub struct Checker {
     sigs: Sigs,
     // メソッド表（impl で登録）。REPL で行をまたいで持ち越す。
     methods: MethodEnv,
+    // レコード型名 → フィールド宣言順。REPL で行をまたいで持ち越す（脱糖に使う）。
+    // infer_expr など free 関数からは RECORD_FIELDS thread_local 経由で読む。
+    record_fields: HashMap<String, Vec<String>>,
 }
 
 impl Checker {
@@ -224,6 +391,20 @@ impl Checker {
     // eval_program はこの型付きプログラムを実行する。let の束縛・型宣言はトップレベルの
     // self に積まれ、次の行から参照できる。型宣言は値文を生まない（eval と整合）。
     pub fn check_program(&mut self, stmts: &[Stmt]) -> Result<Vec<TStmt>, LocatedError> {
+        // レコードのフィールド順を Checker に蓄積（REPL で行をまたいで持ち越す）。前方参照や
+        // 宣言前に使う関数のため、本体推論の前に今回の全 record を集める。
+        for stmt in stmts {
+            if let Stmt::Type(def) = stmt {
+                if let Some(fields) = &def.record_fields {
+                    self.record_fields.insert(def.name.clone(), fields.clone());
+                }
+            }
+        }
+        // この Checker の蓄積を thread_local へ反映（毎回入れ替え＝他検査の残留を排除）。
+        RECORD_FIELDS.with(|r| *r.borrow_mut() = self.record_fields.clone());
+        // レコードリテラル/パターンを構築子呼び出し/パターンへ脱糖（全実行経路で共通）。
+        let stmts = desugar_records_stmts(stmts)?;
+        let stmts = &stmts[..];
         let mut typed = Vec::new();
         // 相互再帰: トップレベルの関数 let を、本体を推論する前に一括で pre-declare する。
         // これで定義順に関係なく互いを参照できる（注釈があればその型、無ければ fresh）。
@@ -1017,14 +1198,93 @@ fn infer_expr(
             call_args.extend(targs);
             (TExprKind::Call(Box::new(callee), call_args), result_ty)
         }
-        // 修飾アクセス `x.member`（括弧なし）。モジュール解決で潰されているはずなので、
-        // ここに残っているのは未 import のモジュール参照か、レコードの無い単一ファイル＝エラー。
+        // 修飾アクセス `x.member`（括弧なし）。レコードのフィールドアクセスなら projection へ
+        // 脱糖する。そうでなければ未 import のモジュール参照＝エラー。
         ExprKind::Field(receiver, member) => {
+            let rt = infer_expr(receiver, env, subst, vargen, arities, methods)?;
+            let recv_ty = apply(subst, &rt.ty);
+            if let Type::Con(tyname, _) = &recv_ty {
+                if let Some(order) = record_order(tyname) {
+                    let idx = order.iter().position(|f| f == member).ok_or_else(|| {
+                        LocatedError::at(
+                            AwaError::UnknownField { ty: tyname.clone(), field: member.clone() },
+                            span,
+                        )
+                    })?;
+                    // case receiver { Name(_, .., $field, .., _) -> $field } へ脱糖して推論。
+                    let binder = "$field".to_string();
+                    let mut pats = vec![Pattern::Wildcard; order.len()];
+                    pats[idx] = Pattern::Var(binder.clone());
+                    let proj = Expr {
+                        kind: ExprKind::Case(
+                            Box::new((**receiver).clone()),
+                            vec![(
+                                Pattern::Ctor(tyname.clone(), pats),
+                                Expr { kind: ExprKind::Var(binder), span },
+                            )],
+                        ),
+                        span,
+                    };
+                    return infer_expr(&proj, env, subst, vargen, arities, methods);
+                }
+            }
             let qual = match &receiver.kind {
                 ExprKind::Var(q) => q.clone(),
                 _ => member.clone(),
             };
             return Err(LocatedError::at(AwaError::UnknownModule(qual), span));
+        }
+        // レコードリテラルは check_program の脱糖パスで Call へ変換済み。
+        ExprKind::RecordLit(..) => unreachable!("RecordLit は脱糖済み"),
+        // レコード更新 { base | f = e }: base の型からフィールド順を得て case 再構築へ脱糖。
+        ExprKind::RecordUpdate(base, inits) => {
+            let bt = infer_expr(base, env, subst, vargen, arities, methods)?;
+            let base_ty = apply(subst, &bt.ty);
+            let tyname = match &base_ty {
+                Type::Con(n, _) => n.clone(),
+                other => {
+                    return Err(LocatedError::at(AwaError::NotARecord(other.to_string()), span));
+                }
+            };
+            let order = record_order(&tyname)
+                .ok_or_else(|| LocatedError::at(AwaError::NotARecord(tyname.clone()), span))?;
+            let mut overrides: HashMap<String, Expr> = HashMap::new();
+            for (f, ie) in inits {
+                if !order.contains(f) {
+                    return Err(LocatedError::at(
+                        AwaError::UnknownField { ty: tyname.clone(), field: f.clone() },
+                        span,
+                    ));
+                }
+                if overrides.insert(f.clone(), ie.clone()).is_some() {
+                    return Err(LocatedError::at(AwaError::DuplicateField(f.clone()), span));
+                }
+            }
+            let binders: Vec<String> = (0..order.len()).map(|i| format!("$u{}", i)).collect();
+            let pat = Pattern::Ctor(
+                tyname.clone(),
+                binders.iter().map(|b| Pattern::Var(b.clone())).collect(),
+            );
+            let args: Vec<Expr> = order
+                .iter()
+                .enumerate()
+                .map(|(i, f)| match overrides.get(f) {
+                    Some(e) => e.clone(),
+                    None => Expr { kind: ExprKind::Var(binders[i].clone()), span },
+                })
+                .collect();
+            let rebuild = Expr {
+                kind: ExprKind::Call(
+                    Box::new(Expr { kind: ExprKind::Var(tyname.clone()), span }),
+                    args,
+                ),
+                span,
+            };
+            let case = Expr {
+                kind: ExprKind::Case(Box::new((**base).clone()), vec![(pat, rebuild)]),
+                span,
+            };
+            return infer_expr(&case, env, subst, vargen, arities, methods);
         }
     };
     Ok(TExpr {
@@ -1098,6 +1358,8 @@ fn infer_pattern(
             }
             Ok((Type::Con("Tuple".to_string(), tys), bindings))
         }
+        // レコードパターンは check_program の脱糖パスで Ctor へ変換済み。
+        Pattern::Record(..) => unreachable!("レコードパターンは脱糖済み"),
         // or パターン: 全選択肢を同じ型に unify し、束縛変数の集合が一致することを確かめる
         // （本体がどの選択肢でマッチしても同じ変数を参照できるように）。
         Pattern::Or(alts) => {

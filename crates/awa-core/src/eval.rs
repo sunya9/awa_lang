@@ -182,6 +182,8 @@ fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)
         },
         // or パターン: いずれかの選択肢に当たればその束縛を返す（束縛の整合性は型検査で保証済み）。
         Pattern::Or(alts) => alts.iter().find_map(|alt| match_pattern(alt, value)),
+        // レコードパターンは型検査前に Ctor へ脱糖済み。
+        Pattern::Record(..) => unreachable!("レコードパターンは脱糖済み"),
     }
 }
 

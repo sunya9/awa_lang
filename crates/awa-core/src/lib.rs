@@ -2291,6 +2291,68 @@ mod tests {
     }
 
     #[test]
+    fn レコード_interp() {
+        // 宣言・生成・フィールドアクセス。
+        assert_eq!(
+            eval("type P { x: Int\n y: Int }\nlet p = P { x = 3, y = 4 }\np.x + p.y"),
+            Ok(Value::Int(7))
+        );
+        // 更新（不変）: q.y は更新後、p.y は元のまま。
+        assert_eq!(
+            eval("type P { x: Int\n y: Int }\nlet p = P { x = 1, y = 2 }\nlet q = { p | y = 9 }\nq.y + p.y"),
+            Ok(Value::Int(11))
+        );
+        // パターン分解。
+        assert_eq!(
+            eval("type P { x: Int\n y: Int }\ncase P { x = 5, y = 6 } { P { x = a, y = b } -> a + b }"),
+            Ok(Value::Int(11))
+        );
+        // 省略形パターン { x, y }。
+        assert_eq!(
+            eval("type P { x: Int\n y: Int }\ncase P { x = 5, y = 6 } { P { x, y } -> x * y }"),
+            Ok(Value::Int(30))
+        );
+    }
+
+    #[test]
+    fn レコード_フィールドエラー() {
+        // 未知フィールド。
+        assert!(matches!(
+            eval("type P { x: Int }\nP { x = 1, z = 2 }"),
+            Err(AwaError::UnknownField { .. })
+        ));
+        // フィールド不足。
+        assert!(matches!(
+            eval("type P { x: Int\n y: Int }\nP { x = 1 }"),
+            Err(AwaError::MissingFields { .. })
+        ));
+        // 存在しないフィールドアクセス。
+        assert!(matches!(
+            eval("type P { x: Int }\nlet p = P { x = 1 }\np.z"),
+            Err(AwaError::UnknownField { .. })
+        ));
+    }
+
+    #[test]
+    fn レコード_native() {
+        // ネイティブでレコード（生成・アクセス・更新・パターン・String フィールド）。リーク 0。
+        let (out, code) = compile_run_status(
+            "type Point { x: Int\n y: Int }\n\
+             type Person { name: String\n age: Int }\n\
+             let p = Point { x = 3, y = 4 }\n\
+             print(\"${p.x} ${p.y}\")\n\
+             let q = { p | y = 10 }\n\
+             print(\"${q.y}\")\n\
+             case p { Point { x = a, y = b } -> print(\"${a + b}\") }\n\
+             let alice = Person { name = \"Alice\", age = 30 }\n\
+             let older = { alice | age = 31 }\n\
+             print(\"${older.name} ${older.age}\")\n",
+        );
+        assert_eq!(out, "3 4\n10\n7\nAlice 31\n");
+        assert_eq!(code, 0, "リーク検出（生存ヒープ {}）", code);
+    }
+
+    #[test]
     fn std_option_do記法() {
         // do は .flatMap 連鎖へ脱糖し、Option の pub impl メソッドで解決される。
         let out = std_build_run(
