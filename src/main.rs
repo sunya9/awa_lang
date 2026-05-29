@@ -471,4 +471,63 @@ mod tests {
             Ok(num(7.0))
         );
     }
+
+    // ===== 型注釈（let / 引数 / 戻り値）=====
+
+    #[test]
+    fn example_annotations() {
+        let src = include_str!("../examples/annotations.awa");
+        let mut env = Env::new();
+        let mut checker = Checker::new();
+        let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        // 末尾は first(None, 0) = 0。
+        assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(num(0.0)));
+    }
+
+    #[test]
+    fn let注釈が一致すれば通る() {
+        assert_eq!(eval("let x: Num = 5; x"), Ok(num(5.0)));
+    }
+
+    #[test]
+    fn let注釈の食い違いは型エラー() {
+        assert!(matches!(
+            eval("let x: Num = true"),
+            Err(AwaError::CannotUnify { .. })
+        ));
+    }
+
+    #[test]
+    fn 引数注釈が呼び出しを制約する() {
+        // n: Num と注釈したので Bool を渡すと型エラー。
+        assert!(matches!(
+            eval("let f = fn(n: Num) { n }; f(true)"),
+            Err(AwaError::CannotUnify { .. })
+        ));
+    }
+
+    #[test]
+    fn 戻り型注釈の食い違いは型エラー() {
+        assert!(matches!(
+            eval("let f = fn(n: Num) -> Bool { n + 1 }"),
+            Err(AwaError::CannotUnify { .. })
+        ));
+    }
+
+    #[test]
+    fn 注釈の型変数は多相を保つ() {
+        // fn(a) -> a と注釈しても多相のまま、Num と Bool 双方に使える。
+        assert_eq!(
+            eval("let id: fn(a) -> a = fn(x) { x }; id(1); id(true)"),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn 未定義の型を注釈に書くとエラー() {
+        assert_eq!(
+            eval("let x: Ghost = 1"),
+            Err(AwaError::UnknownType("Ghost".to_string()))
+        );
+    }
 }

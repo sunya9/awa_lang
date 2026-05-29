@@ -10,7 +10,7 @@ fn is_upper(name: &str) -> bool {
 // ===== 構文解析（Parser）=====
 // 再帰下降パーサ。優先順位を文法の階層で表現する（上ほど緩い＝後で結合）。
 //   program    = (stmt terminator)* stmt?
-//   stmt       = 'let' Ident '=' expr | typedef | expr
+//   stmt       = 'let' Ident (':' typeexpr)? '=' expr | typedef | expr
 //   typedef    = 'type' UIdent ('(' names ')')? '{' (variant terminator)* variant? '}'
 //   variant    = UIdent ('(' typeexpr (',' typeexpr)* ')')?
 //   typeexpr   = UIdent ('(' typeexpr,* ')')? | Ident | 'fn' '(' typeexpr,* ')' '->' typeexpr
@@ -27,9 +27,10 @@ fn is_upper(name: &str) -> bool {
 //   arm        = pattern '->' expr
 //   pattern    = '_' | Ident | Num | Bool | UIdent ('(' pattern,* ')')?
 //   if         = 'if' expr block 'else' block
-//   lambda     = 'fn' '(' params? ')' block
+//   lambda     = 'fn' '(' params? ')' ('->' typeexpr)? block
 //   block      = '{' (stmt terminator)* stmt? '}'
-//   params     = Ident (',' Ident)*
+//   params     = param (',' param)*
+//   param      = Ident (':' typeexpr)?
 // 文の区切り（terminator）は ; または改行（字句解析が自動挿入）。
 pub struct Parser {
     tokens: Vec<Token>,
@@ -113,9 +114,16 @@ impl Parser {
                     Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
                     None => return Err(AwaError::UnexpectedEof),
                 };
+                // 任意の型注釈 let x: T = ...
+                let annotation = if self.peek() == Some(&Token::Colon) {
+                    self.next(); // ':'
+                    Some(self.parse_type_expr()?)
+                } else {
+                    None
+                };
                 self.expect(Token::Equal)?;
                 let value = self.parse_expr()?;
-                Ok(Stmt::Let(name, value))
+                Ok(Stmt::Let(name, annotation, value))
             }
             Some(Token::Type) => Ok(Stmt::Type(self.parse_type_def()?)),
             _ => Ok(Stmt::Expr(self.parse_expr()?)),
@@ -402,19 +410,27 @@ impl Parser {
             Some(Token::Num(n)) => Ok(Expr::Num(n)),
             Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
             Some(Token::Ident(name)) => Ok(Expr::Var(name)),
-            // 無名関数 fn(引数, ...) { 本体ブロック }。
+            // 無名関数 fn(引数: 型?, ...) -> 戻り型? { 本体ブロック }。
             Some(Token::Fn) => {
                 self.expect(Token::LParen)?;
                 let mut params = Vec::new();
                 if self.peek() != Some(&Token::RParen) {
                     loop {
-                        match self.next() {
-                            Some(Token::Ident(name)) => params.push(name),
+                        let name = match self.next() {
+                            Some(Token::Ident(name)) => name,
                             Some(other) => {
                                 return Err(AwaError::UnexpectedToken(format!("{:?}", other)));
                             }
                             None => return Err(AwaError::UnexpectedEof),
-                        }
+                        };
+                        // 任意の引数型注釈 n: Num
+                        let annotation = if self.peek() == Some(&Token::Colon) {
+                            self.next(); // ':'
+                            Some(self.parse_type_expr()?)
+                        } else {
+                            None
+                        };
+                        params.push((name, annotation));
                         match self.peek() {
                             Some(Token::Comma) => {
                                 self.next();
@@ -424,9 +440,16 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RParen)?;
+                // 任意の戻り型注釈 -> T
+                let ret_annotation = if self.peek() == Some(&Token::Arrow) {
+                    self.next(); // '->'
+                    Some(self.parse_type_expr()?)
+                } else {
+                    None
+                };
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block()?;
-                Ok(Expr::Lambda(params, Box::new(body)))
+                Ok(Expr::Lambda(params, ret_annotation, Box::new(body)))
             }
             // if 条件 { ブロック } else { ブロック }。各腕はブロック式。
             Some(Token::If) => {

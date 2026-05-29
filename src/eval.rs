@@ -69,8 +69,9 @@ pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
         }
         // 無名関数を評価すると Closure（関数 + 現在の環境のコピー）になる。
         // env.clone() がキャプチャの実体。呼び出し時にこの env をベースに使う。
-        Expr::Lambda(params, body) => Ok(Value::Func(Rc::new(Closure {
-            params: params.clone(),
+        // 型注釈は実行時には無視し、引数名だけ取り出す。
+        Expr::Lambda(params, _ret, body) => Ok(Value::Func(Rc::new(Closure {
+            params: params.iter().map(|(name, _)| name.clone()).collect(),
             body: (**body).clone(),
             env: env.clone(),
             name: None, // 束縛時に let 側で名前を付け直す（再帰のため）
@@ -133,7 +134,7 @@ pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, AwaError> {
             let mut value = Value::Unit;
             for stmt in stmts {
                 value = match stmt {
-                    Stmt::Let(name, e) => {
+                    Stmt::Let(name, _, e) => {
                         let v = bind_name(eval_expr(e, &block_env)?, name);
                         block_env.insert(name.clone(), v);
                         Value::Unit // let 文はブロック値に寄与しない
@@ -255,7 +256,7 @@ pub fn eval_program(stmts: &[Stmt], env: &mut Env) -> Result<Vec<Value>, AwaErro
     let mut results = Vec::new();
     for stmt in stmts {
         match stmt {
-            Stmt::Let(name, expr) => {
+            Stmt::Let(name, _, expr) => {
                 let value = bind_name(eval_expr(expr, env)?, name);
                 env.insert(name.clone(), value.clone());
                 results.push(value);

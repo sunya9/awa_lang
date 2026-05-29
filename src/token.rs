@@ -11,6 +11,7 @@ pub enum Token {
     Type,          // キーワード type（ADT 宣言）
     Case,          // キーワード case（パターンマッチ）
     Comma,         // ,
+    Colon,         // :（型注釈）
     Arrow,         // ->（case の腕・関数型）
     Equal,         // =
     EqEq,          // ==

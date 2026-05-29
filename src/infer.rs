@@ -50,9 +50,10 @@ impl Checker {
         let mut types = Vec::new();
         for stmt in stmts {
             match stmt {
-                Stmt::Let(name, expr) => {
+                Stmt::Let(name, annotation, expr) => {
                     let t = infer_let(
                         name,
+                        annotation,
                         expr,
                         &mut self.env,
                         &mut self.subst,
@@ -129,8 +130,22 @@ fn register_type(
     Ok(())
 }
 
-// 型式（ユーザーが書いた構文）を意味論的な Type へ解決する。
-// 組込型 Num/Bool/Nil、宣言済みの型名（arity 検査つき）、型パラメータ、関数型を扱う。
+// 型構築子名（と解決済み引数）を意味論的な Type へ。組込型 Num/Bool/Nil と
+// 宣言済みの型名（arity 検査つき）を扱う。型定義・注釈の両方から使う共通部分。
+fn resolve_con(name: &str, args: Vec<Type>, arities: &Arities) -> Result<Type, AwaError> {
+    match name {
+        "Num" if args.is_empty() => Ok(Type::Num),
+        "Bool" if args.is_empty() => Ok(Type::Bool),
+        "Nil" if args.is_empty() => Ok(Type::Unit),
+        _ => match arities.get(name) {
+            Some(&arity) if arity == args.len() => Ok(Type::Con(name.to_string(), args)),
+            _ => Err(AwaError::UnknownType(name.to_string())),
+        },
+    }
+}
+
+// 型定義のフィールド型を解決する。型変数は宣言済みの param_map に限られる
+// （未宣言の型変数はエラー）。
 fn resolve_type_expr(
     texpr: &TypeExpr,
     param_map: &HashMap<String, Type>,
@@ -142,21 +157,11 @@ fn resolve_type_expr(
             .cloned()
             .ok_or_else(|| AwaError::UnknownType(name.clone())),
         TypeExpr::Con(name, args) => {
-            let resolved: Vec<Type> = args
+            let resolved = args
                 .iter()
                 .map(|a| resolve_type_expr(a, param_map, arities))
                 .collect::<Result<_, _>>()?;
-            match name.as_str() {
-                "Num" if resolved.is_empty() => Ok(Type::Num),
-                "Bool" if resolved.is_empty() => Ok(Type::Bool),
-                "Nil" if resolved.is_empty() => Ok(Type::Unit),
-                _ => match arities.get(name) {
-                    Some(&arity) if arity == resolved.len() => {
-                        Ok(Type::Con(name.clone(), resolved))
-                    }
-                    _ => Err(AwaError::UnknownType(name.clone())),
-                },
-            }
+            resolve_con(name, resolved, arities)
         }
         TypeExpr::Fun(params, ret) => {
             let params = params
@@ -164,6 +169,37 @@ fn resolve_type_expr(
                 .map(|p| resolve_type_expr(p, param_map, arities))
                 .collect::<Result<_, _>>()?;
             let ret = resolve_type_expr(ret, param_map, arities)?;
+            Ok(Type::Fun(params, Box::new(ret)))
+        }
+    }
+}
+
+// 型注釈（let/引数/戻り値）を解決する。型定義と違い、小文字の型変数は「その注釈
+// （or シグネチャ）内で fresh な統一変数」になる。vars に同名で覚えておくことで、
+// fn(x: a) -> a の 3 つの a が同じ変数を指す。推論結果と unify されて効く。
+fn resolve_annotation(
+    texpr: &TypeExpr,
+    vars: &mut HashMap<String, Type>,
+    vargen: &mut VarGen,
+    arities: &Arities,
+) -> Result<Type, AwaError> {
+    match texpr {
+        TypeExpr::Var(name) => {
+            Ok(vars.entry(name.clone()).or_insert_with(|| vargen.fresh()).clone())
+        }
+        TypeExpr::Con(name, args) => {
+            let resolved = args
+                .iter()
+                .map(|a| resolve_annotation(a, vars, vargen, arities))
+                .collect::<Result<_, _>>()?;
+            resolve_con(name, resolved, arities)
+        }
+        TypeExpr::Fun(params, ret) => {
+            let params = params
+                .iter()
+                .map(|p| resolve_annotation(p, vars, vargen, arities))
+                .collect::<Result<_, _>>()?;
+            let ret = resolve_annotation(ret, vars, vargen, arities)?;
             Ok(Type::Fun(params, Box::new(ret)))
         }
     }
@@ -206,6 +242,7 @@ fn generalize(env: &TypeEnv, subst: &Subst, ty: &Type) -> Scheme {
 // 最後に、自分自身の束縛を外した環境で generalize して多相スキームを env に積む。
 fn infer_let(
     name: &str,
+    annotation: &Option<TypeExpr>,
     expr: &Expr,
     env: &mut TypeEnv,
     subst: &mut Subst,
@@ -216,6 +253,12 @@ fn infer_let(
     env.insert(name.to_string(), Scheme::mono(placeholder.clone()));
     let t = infer_expr(expr, env, subst, vargen, arities)?;
     unify(subst, &placeholder, &t)?;
+    // 型注釈があれば、推論した型と突き合わせる（制約として unify）。
+    if let Some(ann) = annotation {
+        let mut vars = HashMap::new();
+        let ann_ty = resolve_annotation(ann, &mut vars, vargen, arities)?;
+        unify(subst, &placeholder, &ann_ty)?;
+    }
     // 自分自身の単相 placeholder を環境から外してから一般化する。
     // 外さないと placeholder が型変数を環境に縛り、何も量化されなくなる。
     env.remove(name);
@@ -263,18 +306,27 @@ fn infer_expr(
             unify(subst, &tt, &et)?;
             Ok(apply(subst, &tt))
         }
-        // 無名関数: 各引数に fresh 型変数を割り当て、その下で本体を推論する。
-        // 結果は fn(引数型...) -> 本体型。置換を反映した最終形にして返す。
-        Expr::Lambda(params, body) => {
+        // 無名関数: 各引数に型を割り当て（注釈があればその型、無ければ fresh）、
+        // その下で本体を推論する。戻り型注釈があれば本体型と unify する。
+        // 注釈中の型変数はこのシグネチャ内で共有する（sig_vars を引数・戻り型で使い回す）。
+        Expr::Lambda(params, ret_annotation, body) => {
             let mut body_env = env.clone();
+            let mut sig_vars = HashMap::new();
             let mut param_types = Vec::with_capacity(params.len());
-            for p in params {
-                let tv = vargen.fresh();
+            for (name, annotation) in params {
+                let ty = match annotation {
+                    Some(ann) => resolve_annotation(ann, &mut sig_vars, vargen, arities)?,
+                    None => vargen.fresh(),
+                };
                 // ラムダ引数は単相（多相化しない）。HM の多相境界は let だけ。
-                body_env.insert(p.clone(), Scheme::mono(tv.clone()));
-                param_types.push(tv);
+                body_env.insert(name.clone(), Scheme::mono(ty.clone()));
+                param_types.push(ty);
             }
             let ret = infer_expr(body, &body_env, subst, vargen, arities)?;
+            if let Some(ann) = ret_annotation {
+                let ann_ty = resolve_annotation(ann, &mut sig_vars, vargen, arities)?;
+                unify(subst, &ret, &ann_ty)?;
+            }
             let param_types = param_types.iter().map(|t| apply(subst, t)).collect();
             Ok(Type::Fun(param_types, Box::new(apply(subst, &ret))))
         }
@@ -375,8 +427,8 @@ fn infer_stmts(
     let mut last = Type::Unit;
     for stmt in stmts {
         last = match stmt {
-            Stmt::Let(name, expr) => {
-                infer_let(name, expr, env, subst, vargen, &local_arities)?;
+            Stmt::Let(name, annotation, expr) => {
+                infer_let(name, annotation, expr, env, subst, vargen, &local_arities)?;
                 Type::Unit // let 文はブロック値に寄与しない
             }
             Stmt::Type(def) => {

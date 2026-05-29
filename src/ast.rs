@@ -12,8 +12,9 @@ pub enum Expr {
     BinOp(Box<Expr>, Token, Box<Expr>),
     // if 条件 { ブロック } else { ブロック }。三項とも式。
     If(Box<Expr>, Box<Expr>, Box<Expr>),
-    // 無名関数 fn(引数,...) { 本体ブロック }。引数名のリストと本体の式。
-    Lambda(Vec<String>, Box<Expr>),
+    // 無名関数 fn(引数: 型?, ...) -> 戻り型? { 本体 }。
+    // 各引数は名前と任意の型注釈、加えて任意の戻り型注釈、そして本体の式。
+    Lambda(Vec<(String, Option<TypeExpr>)>, Option<TypeExpr>, Box<Expr>),
     // 関数呼び出し callee(引数,...)。callee も式（変数とは限らない）。
     Call(Box<Expr>, Vec<Expr>),
     // ブロック { 文; ...; 式 }。新しいスコープを作り、最後の文が式ならその値、
@@ -64,7 +65,8 @@ pub struct Variant {
 //   expr           → 式文（評価して結果を表示する）
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Let(String, Expr),
+    // let 束縛。任意の型注釈つき（let x: T = expr）。
+    Let(String, Option<TypeExpr>, Expr),
     Expr(Expr),
     // 型宣言。値は返さない（評価では構築子を環境に登録し、結果行は出さない）。
     Type(TypeDef),

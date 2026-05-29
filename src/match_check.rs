@@ -280,7 +280,7 @@ fn check_stmts(stmts: &[Stmt], sigs: &mut Sigs) -> Result<(), AwaError> {
     for stmt in stmts {
         match stmt {
             Stmt::Type(def) => sigs.add(def),
-            Stmt::Let(_, e) | Stmt::Expr(e) => check_expr(e, sigs)?,
+            Stmt::Let(_, _, e) | Stmt::Expr(e) => check_expr(e, sigs)?,
         }
     }
     Ok(())
@@ -299,7 +299,7 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), AwaError> {
             check_expr(t, sigs)?;
             check_expr(e, sigs)
         }
-        Expr::Lambda(_, body) => check_expr(body, sigs),
+        Expr::Lambda(_, _, body) => check_expr(body, sigs),
         Expr::Call(callee, args) => {
             check_expr(callee, sigs)?;
             for a in args {
