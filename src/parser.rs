@@ -1,6 +1,6 @@
 use crate::ast::{
     Expr, ExprKind, ImplBlock, Import, Method, ParsedModule, Pattern, Stmt, TypeDef, TypeExpr,
-    Variant,
+    TypeExprKind, Variant,
 };
 use crate::error::{AwaError, LocatedError};
 use crate::span::{Span, Spanned};
@@ -458,13 +458,14 @@ impl Parser {
     }
 
     // 型式: 大文字名→Con（任意の型引数）、小文字名→型変数、fn(...) -> ...→関数型。
+    // 各ノードに span を付けて型注釈エラーを位置つきで報告できるようにする。
     fn parse_type_expr(&mut self) -> Result<TypeExpr, LocatedError> {
-        match self.next() {
+        let start = self.span_here().start;
+        let kind = match self.next() {
             Some(Token::Ident(name)) => {
                 if is_upper(&name) {
                     // 型コンストラクタ Color / Opt(Int)。型引数は任意。
-                    let args = self.parse_type_args()?;
-                    Ok(TypeExpr::Con(name, args))
+                    TypeExprKind::Con(name, self.parse_type_args()?)
                 } else if self.peek() == Some(&Token::Dot) {
                     // 修飾された型 util.Color(args)。"util.Color" という 1 つの Con 名にする
                     //（リネームパスがエイリアス util. を実モジュール接頭辞へ写す）。
@@ -474,10 +475,9 @@ impl Parser {
                         Some(other) => return Err(self.unexpected(&other)),
                         None => return Err(self.eof()),
                     };
-                    let args = self.parse_type_args()?;
-                    Ok(TypeExpr::Con(format!("{}.{}", name, tyname), args))
+                    TypeExprKind::Con(format!("{}.{}", name, tyname), self.parse_type_args()?)
                 } else {
-                    Ok(TypeExpr::Var(name))
+                    TypeExprKind::Var(name)
                 }
             }
             // fn(引数型, ...) -> 戻り型。
@@ -498,11 +498,15 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 self.expect(Token::Arrow)?;
                 let ret = self.parse_type_expr()?;
-                Ok(TypeExpr::Fun(params, Box::new(ret)))
+                TypeExprKind::Fun(params, Box::new(ret))
             }
-            Some(other) => Err(self.unexpected(&other)),
-            None => Err(self.eof()),
-        }
+            Some(other) => return Err(self.unexpected(&other)),
+            None => return Err(self.eof()),
+        };
+        Ok(TypeExpr {
+            kind,
+            span: Span::new(start, self.last_span().end),
+        })
     }
 
     // 型コンストラクタの引数列 `( T, ... )`（無ければ空）。

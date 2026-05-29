@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     Expr, ExprKind, ImplBlock, Pattern, Stmt, TExpr, TExprKind, TMethod, TStmt, TypeDef, TypeExpr,
+    TypeExprKind,
 };
 use crate::error::{AwaError, LocatedError};
 use crate::match_check::{Sigs, check_matches};
@@ -280,7 +281,7 @@ fn register_type(
     subst: &mut Subst,
     vargen: &mut VarGen,
     arities: &mut Arities,
-) -> Result<(), AwaError> {
+) -> Result<(), LocatedError> {
     // 型パラメータ名 → fresh 型変数。全 variant で共有する。
     let mut param_map = HashMap::new();
     let mut param_tys = Vec::with_capacity(def.params.len());
@@ -410,20 +411,20 @@ fn resolve_type_expr(
     texpr: &TypeExpr,
     param_map: &HashMap<String, Type>,
     arities: &Arities,
-) -> Result<Type, AwaError> {
-    match texpr {
-        TypeExpr::Var(name) => param_map
+) -> Result<Type, LocatedError> {
+    match &texpr.kind {
+        TypeExprKind::Var(name) => param_map
             .get(name)
             .cloned()
-            .ok_or_else(|| AwaError::UnknownType(name.clone())),
-        TypeExpr::Con(name, args) => {
+            .ok_or_else(|| LocatedError::at(AwaError::UnknownType(name.clone()), texpr.span)),
+        TypeExprKind::Con(name, args) => {
             let resolved = args
                 .iter()
                 .map(|a| resolve_type_expr(a, param_map, arities))
                 .collect::<Result<_, _>>()?;
-            resolve_con(name, resolved, arities)
+            resolve_con(name, resolved, arities).map_err(|e| LocatedError::at(e, texpr.span))
         }
-        TypeExpr::Fun(params, ret) => {
+        TypeExprKind::Fun(params, ret) => {
             let params = params
                 .iter()
                 .map(|p| resolve_type_expr(p, param_map, arities))
@@ -442,19 +443,19 @@ fn resolve_annotation(
     vars: &mut HashMap<String, Type>,
     vargen: &mut VarGen,
     arities: &Arities,
-) -> Result<Type, AwaError> {
-    match texpr {
-        TypeExpr::Var(name) => {
+) -> Result<Type, LocatedError> {
+    match &texpr.kind {
+        TypeExprKind::Var(name) => {
             Ok(vars.entry(name.clone()).or_insert_with(|| vargen.fresh()).clone())
         }
-        TypeExpr::Con(name, args) => {
+        TypeExprKind::Con(name, args) => {
             let resolved = args
                 .iter()
                 .map(|a| resolve_annotation(a, vars, vargen, arities))
                 .collect::<Result<_, _>>()?;
-            resolve_con(name, resolved, arities)
+            resolve_con(name, resolved, arities).map_err(|e| LocatedError::at(e, texpr.span))
         }
-        TypeExpr::Fun(params, ret) => {
+        TypeExprKind::Fun(params, ret) => {
             let params = params
                 .iter()
                 .map(|p| resolve_annotation(p, vars, vargen, arities))
@@ -473,23 +474,23 @@ fn resolve_skolem(
     sk: &mut HashMap<String, Type>,
     vargen: &mut VarGen,
     arities: &Arities,
-) -> Result<Type, AwaError> {
-    match texpr {
-        TypeExpr::Var(name) => Ok(sk
+) -> Result<Type, LocatedError> {
+    match &texpr.kind {
+        TypeExprKind::Var(name) => Ok(sk
             .entry(name.clone())
             .or_insert_with(|| match vargen.fresh() {
                 Type::Var(id) => Type::Con(format!("#sk{}", id), Vec::new()),
                 _ => unreachable!(),
             })
             .clone()),
-        TypeExpr::Con(name, args) => {
+        TypeExprKind::Con(name, args) => {
             let resolved = args
                 .iter()
                 .map(|a| resolve_skolem(a, sk, vargen, arities))
                 .collect::<Result<_, _>>()?;
-            resolve_con(name, resolved, arities)
+            resolve_con(name, resolved, arities).map_err(|e| LocatedError::at(e, texpr.span))
         }
-        TypeExpr::Fun(params, ret) => {
+        TypeExprKind::Fun(params, ret) => {
             let params = params
                 .iter()
                 .map(|p| resolve_skolem(p, sk, vargen, arities))
@@ -557,7 +558,7 @@ fn infer_let(
     if let Some(ann) = annotation {
         // (1) 制約: 注釈型と推論型を unify。噛み合わない型（Num と Bool 等）はここで CannotUnify。
         let mut vars = HashMap::new();
-        let ann_ty = at(resolve_annotation(ann, &mut vars, vargen, arities), span)?;
+        let ann_ty = resolve_annotation(ann, &mut vars, vargen, arities)?;
         at(unify(subst, &placeholder, &ann_ty), span)?;
         // (2) subsumption: 注釈が推論された principal 型より一般的すぎないか。
         // principal を instantiate し、注釈を skolem 化して別 subst 上で unify する。
@@ -565,7 +566,7 @@ fn infer_let(
         let principal = generalize(env, subst, &placeholder);
         let inst = instantiate(&principal, vargen);
         let mut sk = HashMap::new();
-        let ann_skolem = at(resolve_skolem(ann, &mut sk, vargen, arities), span)?;
+        let ann_skolem = resolve_skolem(ann, &mut sk, vargen, arities)?;
         let mut scratch = subst.clone();
         if unify(&mut scratch, &inst, &ann_skolem).is_err() {
             return Err(LocatedError::at(
@@ -644,7 +645,7 @@ fn infer_expr(
             let mut param_names = Vec::with_capacity(params.len());
             for (name, annotation) in params {
                 let ty = match annotation {
-                    Some(ann) => at(resolve_annotation(ann, &mut sig_vars, vargen, arities), span)?,
+                    Some(ann) => resolve_annotation(ann, &mut sig_vars, vargen, arities)?,
                     None => vargen.fresh(),
                 };
                 // ラムダ引数は単相（多相化しない）。HM の多相境界は let だけ。
@@ -654,7 +655,7 @@ fn infer_expr(
             }
             let body_t = infer_expr(body, &body_env, subst, vargen, arities, methods)?;
             if let Some(ann) = ret_annotation {
-                let ann_ty = at(resolve_annotation(ann, &mut sig_vars, vargen, arities), span)?;
+                let ann_ty = resolve_annotation(ann, &mut sig_vars, vargen, arities)?;
                 at(unify(subst, &body_t.ty, &ann_ty), body_t.span)?;
             }
             let param_types = param_types.iter().map(|t| apply(subst, t)).collect();

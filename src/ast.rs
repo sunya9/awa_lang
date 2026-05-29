@@ -60,8 +60,15 @@ pub enum Pattern {
 // ===== 型式（ユーザーが書く型の構文表現）=====
 // type 宣言のフィールド型や（将来の）型注釈で使う。意味論的な types::Type とは別物で、
 // infer.rs の resolve_type_expr が型変数 ID へ解決する。
+// 型式は span を持つ（型注釈のエラーを位置つきで報告するため）。Expr と同じ kind+span 構造。
 #[derive(Debug, Clone)]
-pub enum TypeExpr {
+pub struct TypeExpr {
+    pub kind: TypeExprKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeExprKind {
     Con(String, Vec<TypeExpr>),               // Option(a), Num, List(a)
     Var(String),                              // a（小文字の型変数）
     Fun(Vec<TypeExpr>, Box<TypeExpr>),        // fn(a) -> b

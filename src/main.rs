@@ -826,6 +826,18 @@ mod tests {
     }
 
     #[test]
+    fn 型注釈の未定義型に位置がつく() {
+        // 注釈 `x: Nope` の Nope（型式 span）を指す。以前は位置なし（None）だった。
+        let src = "let f = fn(x: Nope) -> Int { 1 }\nf(0)";
+        let err = run_err(src);
+        assert!(matches!(err.error, AwaError::UnknownType(ref n) if n == "Nope"));
+        assert!(err.span.is_some(), "型注釈エラーに位置がない");
+        let msg = report(&err, src);
+        assert!(msg.contains("1:15"), "Nope の位置(1:15)を指していない: {}", msg);
+        assert!(msg.contains("^"));
+    }
+
+    #[test]
     fn 構文エラーに位置がつく() {
         let err = run_err("let y = )");
         assert!(err.span.is_some());

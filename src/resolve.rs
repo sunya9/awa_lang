@@ -9,7 +9,7 @@
 //   ＝「名前が util.double のような長い文字列になっただけ」と見なせる。
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, ExprKind, Import, Pattern, Stmt, TExpr, TExprKind, TStmt, TypeExpr};
+use crate::ast::{Expr, ExprKind, Import, Pattern, Stmt, TExpr, TExprKind, TStmt, TypeExpr, TypeExprKind};
 use crate::error::{AwaError, LocatedError};
 use crate::span::Span;
 
@@ -307,14 +307,15 @@ impl Resolver<'_> {
     }
 
     // 型式の名前を修飾する。`alias.Color` は対象モジュールへ、自モジュールの型は接頭辞付きへ。
+    // span もグローバル座標へずらす（型注釈エラーをファイル別に位置報告できるように）。
     fn type_expr(&self, t: &TypeExpr) -> Result<TypeExpr, LocatedError> {
-        match t {
-            TypeExpr::Var(v) => Ok(TypeExpr::Var(v.clone())),
-            TypeExpr::Fun(ps, r) => {
+        let kind = match &t.kind {
+            TypeExprKind::Var(v) => TypeExprKind::Var(v.clone()),
+            TypeExprKind::Fun(ps, r) => {
                 let ps = ps.iter().map(|p| self.type_expr(p)).collect::<Result<_, _>>()?;
-                Ok(TypeExpr::Fun(ps, Box::new(self.type_expr(r)?)))
+                TypeExprKind::Fun(ps, Box::new(self.type_expr(r)?))
             }
-            TypeExpr::Con(name, args) => {
+            TypeExprKind::Con(name, args) => {
                 let args = args.iter().map(|a| self.type_expr(a)).collect::<Result<_, _>>()?;
                 let newname = if let Some((alias, rest)) = name.split_once('.') {
                     self.resolve_qualified(alias, rest)?.unwrap_or_else(|| name.clone())
@@ -323,9 +324,13 @@ impl Resolver<'_> {
                 } else {
                     name.clone() // 組込型（Int/String など）・型変数 → そのまま
                 };
-                Ok(TypeExpr::Con(newname, args))
+                TypeExprKind::Con(newname, args)
             }
-        }
+        };
+        Ok(TypeExpr {
+            kind,
+            span: self.at(t.span),
+        })
     }
 
     // パターンの構築子名を修飾する。

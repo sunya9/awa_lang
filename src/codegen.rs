@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Pattern, TExpr, TExprKind, TStmt, TypeExpr};
+use crate::ast::{Pattern, TExpr, TExprKind, TStmt, TypeExpr, TypeExprKind};
 use crate::error::AwaError;
 use crate::token::Token;
 use crate::types::Type;
@@ -90,12 +90,12 @@ struct CtorInfo {
 
 // 型式＋param→具体型 の対応で、ADT フィールドの具体型を求める（単相前提）。
 fn resolve_field(texpr: &TypeExpr, param_map: &HashMap<String, Type>) -> Result<Type> {
-    match texpr {
-        TypeExpr::Var(p) => param_map
+    match &texpr.kind {
+        TypeExprKind::Var(p) => param_map
             .get(p)
             .cloned()
             .ok_or_else(|| AwaError::Unsupported(format!("型パラメータ {}", p))),
-        TypeExpr::Con(name, args) => {
+        TypeExprKind::Con(name, args) => {
             let resolved: Vec<Type> = args
                 .iter()
                 .map(|a| resolve_field(a, param_map))
@@ -110,7 +110,7 @@ fn resolve_field(texpr: &TypeExpr, param_map: &HashMap<String, Type>) -> Result<
                 _ => Type::Con(name.clone(), resolved),
             })
         }
-        TypeExpr::Fun(ps, r) => {
+        TypeExprKind::Fun(ps, r) => {
             let ps: Vec<Type> = ps
                 .iter()
                 .map(|p| resolve_field(p, param_map))
