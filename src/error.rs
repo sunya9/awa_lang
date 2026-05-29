@@ -35,7 +35,10 @@ pub enum AwaError {
     // ----- ADT / パターンマッチ（Phase 3） -----
     UnknownType(String),        // 型式が参照する型名が未定義
     UnknownConstructor(String), // パターン等が参照する構築子が未定義
-    NoMatch,                    // 評価: どのパターンにも当たらなかった
+    NoMatch,                    // 評価: どのパターンにも当たらなかった（網羅性が防ぐ穴の保険）
+    // ----- 網羅性・到達不能（Phase 3b） -----
+    NonExhaustiveMatch { witness: String }, // case に覆えない値がある（witness=足りない例）
+    UnreachablePattern(String),             // 上の腕に覆われて決して当たらない腕
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -70,6 +73,12 @@ impl fmt::Display for AwaError {
             AwaError::UnknownType(name) => write!(f, "未定義の型です: {}", name),
             AwaError::UnknownConstructor(name) => write!(f, "未定義の構築子です: {}", name),
             AwaError::NoMatch => write!(f, "どのパターンにも一致しませんでした"),
+            AwaError::NonExhaustiveMatch { witness } => {
+                write!(f, "case が網羅的でありません: {} に当たる腕がありません", witness)
+            }
+            AwaError::UnreachablePattern(pat) => {
+                write!(f, "決して当たらないパターンです: {}", pat)
+            }
         }
     }
 }

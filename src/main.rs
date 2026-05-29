@@ -6,6 +6,7 @@ mod error;
 mod eval;
 mod infer;
 mod lexer;
+mod match_check;
 mod parser;
 mod token;
 mod types;
@@ -377,9 +378,18 @@ mod tests {
     }
 
     #[test]
-    fn リテラルパターンが網羅されないとnomatch() {
-        // 型は通る（Num の主語に Num パターン）が、5 はどの腕にも当たらず実行時 NoMatch。
-        assert_eq!(eval("case 5 { 1 -> 10; 2 -> 20 }"), Err(AwaError::NoMatch));
+    fn リテラルパターンの網羅漏れは静的に弾く() {
+        // Phase 3b: Num は無限ドメインなので catch-all 無しは網羅的でない。
+        // 実行前に NonExhaustiveMatch（witness は _）。
+        assert!(matches!(
+            eval("case 5 { 1 -> 10; 2 -> 20 }"),
+            Err(AwaError::NonExhaustiveMatch { .. })
+        ));
+    }
+
+    #[test]
+    fn catch_allがあれば網羅的() {
+        assert_eq!(eval("case 5 { 1 -> 10; _ -> 0 }"), Ok(num(0.0)));
     }
 
     #[test]
@@ -404,6 +414,61 @@ mod tests {
         assert_eq!(
             eval("type Pair(a) { Two(a, a) }; Two(1)"),
             Err(AwaError::ArityMismatch { expected: 2, found: 1 })
+        );
+    }
+
+    // ===== 網羅性・到達不能（Phase 3b）=====
+
+    #[test]
+    fn adtの網羅漏れは反例つきで弾く() {
+        // None の腕が無い → witness は "None"。
+        assert_eq!(
+            eval("type Opt(a) { Some(a); None }; case Some(1) { Some(n) -> n }"),
+            Err(AwaError::NonExhaustiveMatch { witness: "None".to_string() })
+        );
+    }
+
+    #[test]
+    fn boolの網羅漏れ() {
+        assert_eq!(
+            eval("case true { true -> 1 }"),
+            Err(AwaError::NonExhaustiveMatch { witness: "false".to_string() })
+        );
+    }
+
+    #[test]
+    fn 入れ子の網羅漏れも検出する() {
+        // Some(Nil) の腕が無い → witness は "Some(Nil)"。
+        assert_eq!(
+            eval(
+                "type List(a) { Cons(a, List(a)); Nil }; type Opt(a) { Some(a); None }; \
+                 case Some(Nil) { Some(Cons(h, t)) -> h; None -> 0 }"
+            ),
+            Err(AwaError::NonExhaustiveMatch { witness: "Some(Nil)".to_string() })
+        );
+    }
+
+    #[test]
+    fn ワイルドカードの後ろは到達不能() {
+        assert_eq!(
+            eval("type Opt(a) { Some(a); None }; case Some(1) { _ -> 0; Some(n) -> n; None -> 1 }"),
+            Err(AwaError::UnreachablePattern("Some(n)".to_string()))
+        );
+    }
+
+    #[test]
+    fn 重複リテラルは到達不能() {
+        assert_eq!(
+            eval("case true { true -> 1; false -> 2; true -> 3 }"),
+            Err(AwaError::UnreachablePattern("true".to_string()))
+        );
+    }
+
+    #[test]
+    fn 全構築子を覆えば網羅的() {
+        assert_eq!(
+            eval("type Opt(a) { Some(a); None }; case Some(7) { Some(n) -> n; None -> 0 }"),
+            Ok(num(7.0))
         );
     }
 }

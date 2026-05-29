@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, Pattern, Stmt, TypeDef, TypeExpr};
 use crate::error::AwaError;
+use crate::match_check::{Sigs, check_matches};
 use crate::token::Token;
 use crate::types::{Scheme, Subst, Type, VarGen, apply, ftv, instantiate, unify};
 
@@ -32,6 +33,8 @@ pub struct Checker {
     env: TypeEnv,
     // 宣言済みの型名 → arity。構築子スキームは env に入るので別途は持たない。
     arities: Arities,
+    // 網羅性チェック用の構築子シグネチャ（型名↔構築子↔arity）。REPL で行をまたいで持ち越す。
+    sigs: Sigs,
 }
 
 impl Checker {
@@ -76,9 +79,13 @@ impl Checker {
                         &mut self.vargen,
                         &mut self.arities,
                     )?;
+                    // 網羅性チェック用のシグネチャも積む（トップレベル型は持ち越す）。
+                    self.sigs.add(def);
                 }
             }
         }
+        // 型検査が通ったら、全 case 式の網羅性・到達不能を静的に検査する。
+        check_matches(stmts, &self.sigs)?;
         Ok(types)
     }
 }
