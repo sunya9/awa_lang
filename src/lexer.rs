@@ -150,8 +150,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                 i += 1;
             }
             '|' => {
-                tokens.push(Spanned::new(Token::Pipe, Span::new(start, start + 1)));
-                i += 1;
+                // |> はパイプ演算子。それ以外は or パターンの | 。
+                if chars.get(i + 1) == Some(&'>') {
+                    tokens.push(Spanned::new(Token::PipeArrow, Span::new(start, start + 2)));
+                    i += 2;
+                } else {
+                    tokens.push(Spanned::new(Token::Pipe, Span::new(start, start + 1)));
+                    i += 1;
+                }
             }
             '0'..='9' | '.' => {
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {

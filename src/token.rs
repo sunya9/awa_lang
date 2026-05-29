@@ -13,6 +13,7 @@ pub enum Token {
     Comma,         // ,
     Colon,         // :（型注釈）
     Pipe,          // |（or パターン）
+    PipeArrow,     // |>（パイプ演算子）
     Arrow,         // ->（case の腕・関数型）
     Equal,         // =
     EqEq,          // ==

@@ -639,4 +639,49 @@ mod tests {
         assert_eq!(err.error, AwaError::DivisionByZero);
         assert!(err.span.is_some());
     }
+
+    // ===== パイプ演算子 |>（Phase 5）=====
+
+    #[test]
+    fn example_pipe() {
+        let src = include_str!("../examples/pipe.awa");
+        let mut env = Env::new();
+        let mut checker = Checker::new();
+        let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        // 末尾は double(add(1, 10)) = 22。
+        assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(num(22.0)));
+    }
+
+    #[test]
+    fn パイプは関数適用に展開される() {
+        assert_eq!(eval("let inc = fn(n) { n + 1 }; 5 |> inc"), Ok(num(6.0)));
+    }
+
+    #[test]
+    fn パイプは左辺を第一引数に挿入する() {
+        assert_eq!(eval("let add = fn(a, b) { a + b }; 1 |> add(2)"), Ok(num(3.0)));
+    }
+
+    #[test]
+    fn パイプは左結合で連鎖する() {
+        assert_eq!(
+            eval("let inc = fn(n) { n + 1 }; let add = fn(a, b) { a + b }; 1 |> add(2) |> inc"),
+            Ok(num(4.0))
+        );
+    }
+
+    #[test]
+    fn パイプは算術より緩い() {
+        // 1 + 2 |> inc は inc(1 + 2) = 4。
+        assert_eq!(eval("let inc = fn(n) { n + 1 }; 1 + 2 |> inc"), Ok(num(4.0)));
+    }
+
+    #[test]
+    fn パイプは多行で書ける() {
+        // 行末 |> で継続。
+        assert_eq!(
+            eval("let inc = fn(n) { n + 1 }; let double = fn(n) { n * 2 }; 1 |>\ninc |>\ndouble"),
+            Ok(num(4.0))
+        );
+    }
 }

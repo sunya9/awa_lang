@@ -15,7 +15,8 @@ fn is_upper(name: &str) -> bool {
 //   typedef    = 'type' UIdent ('(' names ')')? '{' (variant terminator)* variant? '}'
 //   variant    = UIdent ('(' typeexpr (',' typeexpr)* ')')?
 //   typeexpr   = UIdent ('(' typeexpr,* ')')? | Ident | 'fn' '(' typeexpr,* ')' '->' typeexpr
-//   expr       = equality
+//   expr       = pipe
+//   pipe       = equality ('|>' equality)*
 //   equality   = comparison (('==' | '!=') comparison)*
 //   comparison = additive  (('<' | '>' | '<=' | '>=') additive)*
 //   additive   = term      (('+' | '-') term)*
@@ -393,9 +394,31 @@ impl Parser {
         }
     }
 
-    // expr のエントリ。最も緩い等価比較から始める。
+    // expr のエントリ。最も緩いパイプから始める。
     fn parse_expr(&mut self) -> Result<Expr, LocatedError> {
-        self.parse_equality()
+        self.parse_pipe()
+    }
+
+    // パイプ `x |> f`。左結合・最も緩い優先順位。純粋な構文糖で、評価/型は通常の
+    // 関数適用（Call）として扱う。`x |> f(a)` は f(x, a)（Gleam 流に第一引数へ挿入）、
+    // `x |> f` は f(x)。AST に新ノードは足さない。
+    fn parse_pipe(&mut self) -> Result<Expr, LocatedError> {
+        let mut left = self.parse_equality()?;
+        while self.peek() == Some(&Token::PipeArrow) {
+            self.next(); // '|>'
+            let rhs = self.parse_equality()?;
+            let span = Span::merge(left.span, rhs.span);
+            // rhs が呼び出しなら左辺を第一引数に挿入、そうでなければ rhs(左辺)。
+            let kind = match rhs.kind {
+                ExprKind::Call(callee, mut args) => {
+                    args.insert(0, left);
+                    ExprKind::Call(callee, args)
+                }
+                _ => ExprKind::Call(Box::new(rhs), vec![left]),
+            };
+            left = Expr { kind, span };
+        }
+        Ok(left)
     }
 
     // == / != （最も緩い）。左結合。
