@@ -1,10 +1,11 @@
-use crate::error::AwaError;
+use crate::error::{AwaError, LocatedError};
+use crate::span::{Span, Spanned};
 use crate::token::{Token, ends_expr};
 
 // ===== 字句解析（Lexer）=====
-// 戻り値が Result になった。失敗時は panic! ではなく Err を返す。
-pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
-    let mut tokens = Vec::new();
+// 各トークンに span（ソース上の char 範囲）を添えて返す。失敗時は位置つきエラー。
+pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
+    let mut tokens: Vec<Spanned<Token>> = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
     // 丸括弧のネスト深さ。括弧の中では改行を終端にしない（複数行の関数呼び出し
@@ -13,20 +14,24 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
     let mut paren_depth: i32 = 0;
 
     while i < chars.len() {
+        // このトークンの開始位置。span は start..（消費後の i）。
+        let start = i;
+        // 1〜2 文字トークンを push するヘルパ的クロージャは借用が絡むので、
+        // 各アームで Spanned::new(..., Span::new(start, end)) を直接組む。
         let c = chars[i];
         match c {
             ' ' | '\t' | '\r' => i += 1,
             // 改行: 括弧の外で、直前のトークンが式を完結しうるなら終端を挿入する。
             // それ以外（演算子の直後、括弧内など）の改行はただの空白として無視。
             '\n' => {
-                if paren_depth == 0 && tokens.last().map(ends_expr).unwrap_or(false) {
-                    tokens.push(Token::Terminator);
+                if paren_depth == 0 && tokens.last().map(|t| ends_expr(&t.node)).unwrap_or(false) {
+                    tokens.push(Spanned::new(Token::Terminator, Span::new(start, start + 1)));
                 }
                 i += 1;
             }
             ';' => {
                 // 明示的な ; も終端（任意に書ける。一行に複数文を書くときに便利）。
-                tokens.push(Token::Terminator);
+                tokens.push(Spanned::new(Token::Terminator, Span::new(start, start + 1)));
                 i += 1;
             }
             // コメント or 除算。/ の次の文字で分岐する。
@@ -43,7 +48,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                     i += 2;
                     loop {
                         if i + 1 >= chars.len() {
-                            return Err(AwaError::UnterminatedComment);
+                            return Err(LocatedError::at(
+                                AwaError::UnterminatedComment,
+                                Span::new(start, chars.len()),
+                            ));
                         }
                         if chars[i] == '*' && chars[i + 1] == '/' {
                             i += 2;
@@ -53,7 +61,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                     }
                 }
                 _ => {
-                    tokens.push(Token::Slash);
+                    tokens.push(Spanned::new(Token::Slash, Span::new(start, start + 1)));
                     i += 1;
                 }
             },
@@ -61,100 +69,103 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
             // chars.get(i + 1) は範囲外でも None を返すので安全に先読みできる。
             '=' => {
                 if chars.get(i + 1) == Some(&'=') {
-                    tokens.push(Token::EqEq);
+                    tokens.push(Spanned::new(Token::EqEq, Span::new(start, start + 2)));
                     i += 2;
                 } else {
-                    tokens.push(Token::Equal);
+                    tokens.push(Spanned::new(Token::Equal, Span::new(start, start + 1)));
                     i += 1;
                 }
             }
             '!' => {
                 if chars.get(i + 1) == Some(&'=') {
-                    tokens.push(Token::NotEq);
+                    tokens.push(Spanned::new(Token::NotEq, Span::new(start, start + 2)));
                     i += 2;
                 } else {
-                    return Err(AwaError::UnexpectedChar('!'));
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedChar('!'),
+                        Span::new(start, start + 1),
+                    ));
                 }
             }
             '<' => {
                 if chars.get(i + 1) == Some(&'=') {
-                    tokens.push(Token::Le);
+                    tokens.push(Spanned::new(Token::Le, Span::new(start, start + 2)));
                     i += 2;
                 } else {
-                    tokens.push(Token::Lt);
+                    tokens.push(Spanned::new(Token::Lt, Span::new(start, start + 1)));
                     i += 1;
                 }
             }
             '>' => {
                 if chars.get(i + 1) == Some(&'=') {
-                    tokens.push(Token::Ge);
+                    tokens.push(Spanned::new(Token::Ge, Span::new(start, start + 2)));
                     i += 2;
                 } else {
-                    tokens.push(Token::Gt);
+                    tokens.push(Spanned::new(Token::Gt, Span::new(start, start + 1)));
                     i += 1;
                 }
             }
             '+' => {
-                tokens.push(Token::Plus);
+                tokens.push(Spanned::new(Token::Plus, Span::new(start, start + 1)));
                 i += 1;
             }
             '-' => {
                 // -> は case の腕・関数型の矢印。それ以外は減算/単項マイナス。
                 if chars.get(i + 1) == Some(&'>') {
-                    tokens.push(Token::Arrow);
+                    tokens.push(Spanned::new(Token::Arrow, Span::new(start, start + 2)));
                     i += 2;
                 } else {
-                    tokens.push(Token::Minus);
+                    tokens.push(Spanned::new(Token::Minus, Span::new(start, start + 1)));
                     i += 1;
                 }
             }
             '*' => {
-                tokens.push(Token::Star);
+                tokens.push(Spanned::new(Token::Star, Span::new(start, start + 1)));
                 i += 1;
             }
             '(' => {
-                tokens.push(Token::LParen);
+                tokens.push(Spanned::new(Token::LParen, Span::new(start, start + 1)));
                 paren_depth += 1;
                 i += 1;
             }
             ')' => {
-                tokens.push(Token::RParen);
+                tokens.push(Spanned::new(Token::RParen, Span::new(start, start + 1)));
                 paren_depth = (paren_depth - 1).max(0);
                 i += 1;
             }
             '{' => {
-                tokens.push(Token::LBrace);
+                tokens.push(Spanned::new(Token::LBrace, Span::new(start, start + 1)));
                 i += 1;
             }
             '}' => {
-                tokens.push(Token::RBrace);
+                tokens.push(Spanned::new(Token::RBrace, Span::new(start, start + 1)));
                 i += 1;
             }
             ',' => {
-                tokens.push(Token::Comma);
+                tokens.push(Spanned::new(Token::Comma, Span::new(start, start + 1)));
                 i += 1;
             }
             ':' => {
-                tokens.push(Token::Colon);
+                tokens.push(Spanned::new(Token::Colon, Span::new(start, start + 1)));
                 i += 1;
             }
             '|' => {
-                tokens.push(Token::Pipe);
+                tokens.push(Spanned::new(Token::Pipe, Span::new(start, start + 1)));
                 i += 1;
             }
             '0'..='9' | '.' => {
-                let start = i;
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                     i += 1;
                 }
                 let s: String = chars[start..i].iter().collect();
-                let n: f64 = s.parse().map_err(|_| AwaError::InvalidNumber(s.clone()))?;
-                tokens.push(Token::Num(n));
+                let n: f64 = s.parse().map_err(|_| {
+                    LocatedError::at(AwaError::InvalidNumber(s.clone()), Span::new(start, i))
+                })?;
+                tokens.push(Spanned::new(Token::Num(n), Span::new(start, i)));
             }
             // 識別子: 英字または _ で始まり、英数字または _ が続く。
             // 予約語だけは専用トークンに振り分ける（残りは変数名）。
             c if c.is_alphabetic() || c == '_' => {
-                let start = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                     i += 1;
                 }
@@ -170,9 +181,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                     "false" => Token::Bool(false),
                     _ => Token::Ident(word),
                 };
-                tokens.push(token);
+                tokens.push(Spanned::new(token, Span::new(start, i)));
             }
-            _ => return Err(AwaError::UnexpectedChar(c)),
+            _ => {
+                return Err(LocatedError::at(
+                    AwaError::UnexpectedChar(c),
+                    Span::new(start, start + 1),
+                ));
+            }
         }
     }
     Ok(tokens)

@@ -1,5 +1,6 @@
 use crate::ast::{Expr, Pattern, Stmt, TypeDef, TypeExpr, Variant};
-use crate::error::AwaError;
+use crate::error::{AwaError, LocatedError};
+use crate::span::{Span, Spanned};
 use crate::token::Token;
 
 // 先頭大文字なら型名／構築子、小文字なら変数／型変数（Gleam と同じ規約）。
@@ -33,32 +34,68 @@ fn is_upper(name: &str) -> bool {
 //   params     = param (',' param)*
 //   param      = Ident (':' typeexpr)?
 // 文の区切り（terminator）は ; または改行（字句解析が自動挿入）。
+// トークンは span つき（Spanned）で受け取り、構文エラーに位置を添える。
 pub struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<Spanned<Token>>,
     pos: usize,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<Spanned<Token>>) -> Self {
         Parser { tokens, pos: 0 }
     }
 
     fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)
+        self.tokens.get(self.pos).map(|s| &s.node)
     }
 
     fn next(&mut self) -> Option<Token> {
-        let t = self.tokens.get(self.pos).cloned();
+        let t = self.tokens.get(self.pos).map(|s| s.node.clone());
         self.pos += 1;
         t
     }
 
-    // 期待するトークンを 1 つ消費する。違っていればエラー。
-    fn expect(&mut self, expected: Token) -> Result<(), AwaError> {
+    // 現在位置のトークンの span。入力末尾なら最後のトークン末尾の幅 0 span。
+    fn span_here(&self) -> Span {
+        match self.tokens.get(self.pos) {
+            Some(s) => s.span,
+            None => {
+                let end = self.tokens.last().map(|s| s.span.end).unwrap_or(0);
+                Span::new(end, end)
+            }
+        }
+    }
+
+    // 直前に消費したトークンの span（消費した「予期しないトークン」を指すのに使う）。
+    fn last_span(&self) -> Span {
+        if self.pos == 0 {
+            self.span_here()
+        } else {
+            self.tokens
+                .get(self.pos - 1)
+                .map(|s| s.span)
+                .unwrap_or_else(|| self.span_here())
+        }
+    }
+
+    // 「予期しないトークン」エラー（直前に消費したトークンを指す）。
+    fn unexpected(&self, tok: &Token) -> LocatedError {
+        LocatedError::at(
+            AwaError::UnexpectedToken(format!("{:?}", tok)),
+            self.last_span(),
+        )
+    }
+
+    fn eof(&self) -> LocatedError {
+        LocatedError::at(AwaError::UnexpectedEof, self.span_here())
+    }
+
+    // 期待するトークンを 1 つ消費する。違っていれば位置つきエラー。
+    fn expect(&mut self, expected: Token) -> Result<(), LocatedError> {
         match self.next() {
             Some(t) if t == expected => Ok(()),
-            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-            None => Err(AwaError::UnexpectedEof),
+            Some(other) => Err(self.unexpected(&other)),
+            None => Err(self.eof()),
         }
     }
 
@@ -70,7 +107,7 @@ impl Parser {
     }
 
     // プログラム = 文の並び。文と文の間には終端が必要、末尾の終端は任意。
-    pub fn parse_program(&mut self) -> Result<Vec<Stmt>, AwaError> {
+    pub fn parse_program(&mut self) -> Result<Vec<Stmt>, LocatedError> {
         let mut stmts = Vec::new();
         self.skip_terminators();
         while self.peek().is_some() {
@@ -78,7 +115,13 @@ impl Parser {
             match self.peek() {
                 Some(Token::Terminator) => self.skip_terminators(),
                 None => break, // 末尾の終端は省略可
-                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                Some(other) => {
+                    let other = other.clone();
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedToken(format!("{:?}", other)),
+                        self.span_here(),
+                    ));
+                }
             }
         }
         Ok(stmts)
@@ -86,19 +129,25 @@ impl Parser {
 
     // ブロック { 文; ...; 式 }。'{' は呼び出し側が消費済みとして '}' まで読む。
     // プログラムと同じ「文 + 終端」の繰り返しだが、終わりが } になる。
-    fn parse_block(&mut self) -> Result<Expr, AwaError> {
+    fn parse_block(&mut self) -> Result<Expr, LocatedError> {
         let mut stmts = Vec::new();
         self.skip_terminators();
         while self.peek() != Some(&Token::RBrace) {
             if self.peek().is_none() {
-                return Err(AwaError::UnexpectedEof);
+                return Err(self.eof());
             }
             stmts.push(self.parse_stmt()?);
             match self.peek() {
                 Some(Token::Terminator) => self.skip_terminators(),
                 Some(Token::RBrace) => break, // } の直前の終端は省略可
-                None => return Err(AwaError::UnexpectedEof),
-                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                None => return Err(self.eof()),
+                Some(other) => {
+                    let other = other.clone();
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedToken(format!("{:?}", other)),
+                        self.span_here(),
+                    ));
+                }
             }
         }
         self.expect(Token::RBrace)?;
@@ -106,14 +155,14 @@ impl Parser {
     }
 
     // 文 = `let ident = expr`（束縛）/ `type ...`（型宣言）/ `expr`（式文）。
-    fn parse_stmt(&mut self) -> Result<Stmt, AwaError> {
+    fn parse_stmt(&mut self) -> Result<Stmt, LocatedError> {
         match self.peek() {
             Some(Token::Let) => {
                 self.next(); // 'let' を消費
                 let name = match self.next() {
                     Some(Token::Ident(name)) => name,
-                    Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-                    None => return Err(AwaError::UnexpectedEof),
+                    Some(other) => return Err(self.unexpected(&other)),
+                    None => return Err(self.eof()),
                 };
                 // 任意の型注釈 let x: T = ...
                 let annotation = if self.peek() == Some(&Token::Colon) {
@@ -133,7 +182,7 @@ impl Parser {
 
     // 型宣言 type Name(params) { Variant(fields) ... }。
     // params/variants は終端（改行 or ;）区切り、ブロックと同じ流儀で読む。
-    fn parse_type_def(&mut self) -> Result<TypeDef, AwaError> {
+    fn parse_type_def(&mut self) -> Result<TypeDef, LocatedError> {
         self.next(); // 'type' を消費
         let name = self.expect_upper_ident()?;
         let params = if self.peek() == Some(&Token::LParen) {
@@ -146,7 +195,7 @@ impl Parser {
         self.skip_terminators();
         while self.peek() != Some(&Token::RBrace) {
             if self.peek().is_none() {
-                return Err(AwaError::UnexpectedEof);
+                return Err(self.eof());
             }
             let vname = self.expect_upper_ident()?;
             // フィールドがあれば (型式, ...)。無ければヌル構築子。
@@ -173,8 +222,14 @@ impl Parser {
             match self.peek() {
                 Some(Token::Terminator) => self.skip_terminators(),
                 Some(Token::RBrace) => break,
-                None => return Err(AwaError::UnexpectedEof),
-                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                None => return Err(self.eof()),
+                Some(other) => {
+                    let other = other.clone();
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedToken(format!("{:?}", other)),
+                        self.span_here(),
+                    ));
+                }
             }
         }
         self.expect(Token::RBrace)?;
@@ -186,24 +241,24 @@ impl Parser {
     }
 
     // 大文字始まりの識別子を 1 つ消費する（型名・構築子名）。
-    fn expect_upper_ident(&mut self) -> Result<String, AwaError> {
+    fn expect_upper_ident(&mut self) -> Result<String, LocatedError> {
         match self.next() {
             Some(Token::Ident(name)) if is_upper(&name) => Ok(name),
-            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-            None => Err(AwaError::UnexpectedEof),
+            Some(other) => Err(self.unexpected(&other)),
+            None => Err(self.eof()),
         }
     }
 
     // '(' name (',' name)* ')' の小文字名リスト（型パラメータ）。'(' から読む。
-    fn parse_name_list(&mut self) -> Result<Vec<String>, AwaError> {
+    fn parse_name_list(&mut self) -> Result<Vec<String>, LocatedError> {
         self.expect(Token::LParen)?;
         let mut names = Vec::new();
         if self.peek() != Some(&Token::RParen) {
             loop {
                 match self.next() {
                     Some(Token::Ident(name)) => names.push(name),
-                    Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-                    None => return Err(AwaError::UnexpectedEof),
+                    Some(other) => return Err(self.unexpected(&other)),
+                    None => return Err(self.eof()),
                 }
                 match self.peek() {
                     Some(Token::Comma) => {
@@ -218,7 +273,7 @@ impl Parser {
     }
 
     // 型式: 大文字名→Con（任意の型引数）、小文字名→型変数、fn(...) -> ...→関数型。
-    fn parse_type_expr(&mut self) -> Result<TypeExpr, AwaError> {
+    fn parse_type_expr(&mut self) -> Result<TypeExpr, LocatedError> {
         match self.next() {
             Some(Token::Ident(name)) => {
                 if is_upper(&name) {
@@ -267,15 +322,15 @@ impl Parser {
                 let ret = self.parse_type_expr()?;
                 Ok(TypeExpr::Fun(params, Box::new(ret)))
             }
-            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-            None => Err(AwaError::UnexpectedEof),
+            Some(other) => Err(self.unexpected(&other)),
+            None => Err(self.eof()),
         }
     }
 
     // パターン。`|` で複数の選択肢を 1 つにまとめられる（A | B | ...）。
     // 各選択肢は parse_pattern_primary が読む。構築子の部分パターンも parse_pattern を
     // 通るので Some(A | B) のような入れ子の or も書ける。
-    fn parse_pattern(&mut self) -> Result<Pattern, AwaError> {
+    fn parse_pattern(&mut self) -> Result<Pattern, LocatedError> {
         let first = self.parse_pattern_primary()?;
         if self.peek() != Some(&Token::Pipe) {
             return Ok(first);
@@ -290,7 +345,7 @@ impl Parser {
 
     // 単一パターン: _ →ワイルドカード、小文字名→束縛変数、大文字名→構築子（任意の部分パターン列）、
     // リテラル Num/Bool。構築子は入れ子の部分パターンを持てる（Some(Cons(x, _)) など）。
-    fn parse_pattern_primary(&mut self) -> Result<Pattern, AwaError> {
+    fn parse_pattern_primary(&mut self) -> Result<Pattern, LocatedError> {
         match self.next() {
             Some(Token::Num(n)) => Ok(Pattern::Num(n)),
             Some(Token::Bool(b)) => Ok(Pattern::Bool(b)),
@@ -323,18 +378,18 @@ impl Parser {
                     Ok(Pattern::Var(name))
                 }
             }
-            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-            None => Err(AwaError::UnexpectedEof),
+            Some(other) => Err(self.unexpected(&other)),
+            None => Err(self.eof()),
         }
     }
 
     // expr のエントリ。最も緩い等価比較から始める。
-    fn parse_expr(&mut self) -> Result<Expr, AwaError> {
+    fn parse_expr(&mut self) -> Result<Expr, LocatedError> {
         self.parse_equality()
     }
 
     // == / != （最も緩い）。左結合。
-    fn parse_equality(&mut self) -> Result<Expr, AwaError> {
+    fn parse_equality(&mut self) -> Result<Expr, LocatedError> {
         let mut left = self.parse_comparison()?;
         while let Some(Token::EqEq | Token::NotEq) = self.peek() {
             let op = self.next().unwrap();
@@ -345,7 +400,7 @@ impl Parser {
     }
 
     // < / > / <= / >= 。== より強く、+ - より弱い。左結合。
-    fn parse_comparison(&mut self) -> Result<Expr, AwaError> {
+    fn parse_comparison(&mut self) -> Result<Expr, LocatedError> {
         let mut left = self.parse_additive()?;
         while let Some(Token::Lt | Token::Gt | Token::Le | Token::Ge) = self.peek() {
             let op = self.next().unwrap();
@@ -355,7 +410,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_additive(&mut self) -> Result<Expr, AwaError> {
+    fn parse_additive(&mut self) -> Result<Expr, LocatedError> {
         let mut left = self.parse_term()?;
         while let Some(op) = self.peek() {
             match op {
@@ -370,7 +425,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_term(&mut self) -> Result<Expr, AwaError> {
+    fn parse_term(&mut self) -> Result<Expr, LocatedError> {
         let mut left = self.parse_unary()?;
         while let Some(op) = self.peek() {
             match op {
@@ -387,7 +442,7 @@ impl Parser {
 
     // 単項マイナス。右再帰なので `--3`（= 3）のような連続適用も自然に扱える。
     // factor より高い優先順位: `-3 * 2` は `(-3) * 2`、`-2 + 1` は `(-2) + 1`。
-    fn parse_unary(&mut self) -> Result<Expr, AwaError> {
+    fn parse_unary(&mut self) -> Result<Expr, LocatedError> {
         if let Some(Token::Minus) = self.peek() {
             self.next(); // '-' を消費
             let operand = self.parse_unary()?;
@@ -399,7 +454,7 @@ impl Parser {
 
     // 呼び出し層。factor を読んだ後、続く ( ... ) を貪欲に呼び出しとして畳む。
     // f(1)(2) のような連鎖（高階関数の戻り値を即呼び出す）も自然に扱える。
-    fn parse_call(&mut self) -> Result<Expr, AwaError> {
+    fn parse_call(&mut self) -> Result<Expr, LocatedError> {
         let mut expr = self.parse_factor()?;
         while let Some(Token::LParen) = self.peek() {
             self.next(); // '(' を消費
@@ -422,7 +477,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_factor(&mut self) -> Result<Expr, AwaError> {
+    fn parse_factor(&mut self) -> Result<Expr, LocatedError> {
         match self.next() {
             Some(Token::Num(n)) => Ok(Expr::Num(n)),
             Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
@@ -435,10 +490,8 @@ impl Parser {
                     loop {
                         let name = match self.next() {
                             Some(Token::Ident(name)) => name,
-                            Some(other) => {
-                                return Err(AwaError::UnexpectedToken(format!("{:?}", other)));
-                            }
-                            None => return Err(AwaError::UnexpectedEof),
+                            Some(other) => return Err(self.unexpected(&other)),
+                            None => return Err(self.eof()),
                         };
                         // 任意の引数型注釈 n: Num
                         let annotation = if self.peek() == Some(&Token::Colon) {
@@ -490,7 +543,7 @@ impl Parser {
                 self.skip_terminators();
                 while self.peek() != Some(&Token::RBrace) {
                     if self.peek().is_none() {
-                        return Err(AwaError::UnexpectedEof);
+                        return Err(self.eof());
                     }
                     let pat = self.parse_pattern()?;
                     self.expect(Token::Arrow)?;
@@ -499,9 +552,13 @@ impl Parser {
                     match self.peek() {
                         Some(Token::Terminator) => self.skip_terminators(),
                         Some(Token::RBrace) => break,
-                        None => return Err(AwaError::UnexpectedEof),
+                        None => return Err(self.eof()),
                         Some(other) => {
-                            return Err(AwaError::UnexpectedToken(format!("{:?}", other)));
+                            let other = other.clone();
+                            return Err(LocatedError::at(
+                                AwaError::UnexpectedToken(format!("{:?}", other)),
+                                self.span_here(),
+                            ));
                         }
                     }
                 }
@@ -515,8 +572,8 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(e)
             }
-            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
-            None => Err(AwaError::UnexpectedEof),
+            Some(other) => Err(self.unexpected(&other)),
+            None => Err(self.eof()),
         }
     }
 }

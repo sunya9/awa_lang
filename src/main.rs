@@ -8,12 +8,13 @@ mod infer;
 mod lexer;
 mod match_check;
 mod parser;
+mod span;
 mod token;
 mod types;
 mod value;
 
 use ast::TStmt;
-use error::AwaError;
+use error::{LocatedError, report};
 use eval::eval_program;
 use infer::Checker;
 use parser::Parser;
@@ -28,7 +29,11 @@ use value::{Env, Value};
 // REPL（行をまたいで持ち越す）もこの 1 つの関数で賄える。
 // 各文の (値, 型) を順に返す。型検査は型付き AST（TStmt）を返し、eval はそれを実行する。
 // 型宣言は値文を生まないので、値と型はどちらも Let/Expr 文だけから同順で取れる。
-fn run(source: &str, env: &mut Env, checker: &mut Checker) -> Result<Vec<(Value, Type)>, AwaError> {
+fn run(
+    source: &str,
+    env: &mut Env,
+    checker: &mut Checker,
+) -> Result<Vec<(Value, Type)>, LocatedError> {
     let tokens = lexer::tokenize(source)?;
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
@@ -62,7 +67,7 @@ fn run_file(path: &str) {
             }
         }
         Err(e) => {
-            eprintln!("error: {}", e);
+            eprintln!("{}", report(&e, &source));
             std::process::exit(1);
         }
     }
@@ -91,7 +96,7 @@ fn repl() -> std::io::Result<()> {
                     println!("{} : {}", v, render_type(&t));
                 }
             }
-            Err(e) => eprintln!("エラー: {}", e),
+            Err(e) => eprintln!("{}", report(&e, &line)),
         }
     }
     Ok(())
@@ -115,12 +120,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use error::AwaError;
 
+    // テストは従来どおり AwaError（種類）と比較したいので、位置（span）は捨てて射影する。
     fn eval(src: &str) -> Result<Value, AwaError> {
         let mut env = Env::new();
         let mut checker = Checker::new();
         run(src, &mut env, &mut checker)
             .map(|rows| rows.last().map(|(v, _)| v.clone()).unwrap_or(Value::Unit))
+            .map_err(|e| e.error)
     }
 
     // 値だけを取り出すヘルパ（run は (値, 型) を返すようになったため）。
@@ -129,7 +137,9 @@ mod tests {
         env: &mut Env,
         checker: &mut Checker,
     ) -> Result<Vec<Value>, AwaError> {
-        run(src, env, checker).map(|rows| rows.into_iter().map(|(v, _)| v).collect())
+        run(src, env, checker)
+            .map(|rows| rows.into_iter().map(|(v, _)| v).collect())
+            .map_err(|e| e.error)
     }
 
     fn num(n: f64) -> Value {

@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::span::Span;
+
 // ===== エラー型 =====
 // 言語全体で使うエラーを 1 つの enum にまとめる。
 // これ自体が ADT（代数的データ型）の練習であり、Phase 3 で本格化する
@@ -96,4 +98,59 @@ impl fmt::Display for AwaError {
             ),
         }
     }
+}
+
+// ===== 位置つきエラー =====
+// AwaError（エラーの「種類」）に、発生したソース上の位置（span）を添えたもの。
+// パイプライン（tokenize/parse/check/eval）はこれを返す。span は不明なら None。
+#[derive(Debug, PartialEq)]
+pub struct LocatedError {
+    pub error: AwaError,
+    pub span: Option<Span>,
+}
+
+impl LocatedError {
+    pub fn at(error: AwaError, span: Span) -> Self {
+        LocatedError {
+            error,
+            span: Some(span),
+        }
+    }
+}
+
+// span を持たない AwaError は ? で自動的に位置なし LocatedError に昇格する。
+impl From<AwaError> for LocatedError {
+    fn from(error: AwaError) -> Self {
+        LocatedError { error, span: None }
+    }
+}
+
+// エラーを人間向けに整形する。span があれば「行:列」とソース該当行＋キャレットを付ける。
+pub fn report(err: &LocatedError, source: &str) -> String {
+    let Some(span) = err.span else {
+        return format!("error: {}", err.error);
+    };
+    // char オフセットから行・列を求める（行は 1 始まり、列も 1 始まり）。
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, c) in source.chars().enumerate() {
+        if i >= span.start {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    // 該当行のテキストを取り出す。
+    let line_text = source.lines().nth(line - 1).unwrap_or("");
+    // キャレット行: 列まで空白を詰めて span の長さ分 ^ を引く。
+    let width = span.end.saturating_sub(span.start).max(1);
+    let caret = format!("{}{}", " ".repeat(col - 1), "^".repeat(width));
+    format!(
+        "error: {}\n --> {}:{}\n  |\n  | {}\n  | {}",
+        err.error, line, col, line_text, caret
+    )
 }
