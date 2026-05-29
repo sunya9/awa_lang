@@ -44,9 +44,13 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
         TExprKind::Str(s) => Ok(Value::Str(s.clone())),
         TExprKind::Bool(b) => Ok(Value::Bool(*b)),
         // 値はもう Copy ではないので .cloned() で複製する。
+        // レキシカル env を引き、無ければトップレベル GLOBALS にフォールバックする。
+        // クロージャは定義時点の env スナップショットを捕獲するので、後で定義された
+        // 兄弟トップレベル関数を捕獲できない。GLOBALS 経由で相互再帰を解決する。
         TExprKind::Var(name) => env
             .get(name)
             .cloned()
+            .or_else(|| GLOBALS.with(|g| g.borrow().get(name).cloned()))
             .ok_or_else(|| LocatedError::at(AwaError::UndefinedVariable(name.clone()), span)),
         // 単項マイナス。型検査済みなので数値のはず。
         TExprKind::Neg(operand) => match eval_expr(operand, env)? {
@@ -442,11 +446,19 @@ impl EventLoop {
 
 thread_local! {
     static LOOP: RefCell<EventLoop> = RefCell::new(EventLoop::new());
+    // トップレベル束縛のスコープ。Var 解決のフォールバック先（相互再帰のため）。
+    static GLOBALS: RefCell<Env> = RefCell::new(Env::new());
 }
 
-// プログラム実行の冒頭でループを初期化する（テスト/REPL が状態を持ち越さないように）。
+// プログラム実行の冒頭でループとトップレベルスコープを初期化する（状態を持ち越さない）。
 fn loop_reset() {
     LOOP.with(|l| *l.borrow_mut() = EventLoop::new());
+    GLOBALS.with(|g| g.borrow_mut().clear());
+}
+
+// GLOBALS にトップレベル束縛を 1 つ登録する（eval_program が定義ごとに呼ぶ）。
+fn global_define(name: &str, value: &Value) {
+    GLOBALS.with(|g| g.borrow_mut().insert(name.to_string(), value.clone()));
 }
 
 fn fut_pure(v: Value) -> usize {
@@ -832,6 +844,7 @@ pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, Locate
             TStmt::Let(name, expr) => {
                 let value = bind_name(eval_expr(expr, env)?, name);
                 env.insert(name.clone(), value.clone());
+                global_define(name, &value); // 相互再帰のフォールバック用に登録
                 results.push(value);
             }
             TStmt::Expr(expr) => results.push(eval_expr(expr, env)?),

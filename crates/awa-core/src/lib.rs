@@ -634,6 +634,31 @@ mod tests {
     }
 
     #[test]
+    fn 相互再帰_トップレベルで前方参照できる() {
+        // is_even が後で定義される is_odd を前方参照する（相互再帰）。
+        let src = "let is_even = fn(n: Int) -> Bool { case n == 0 { true -> true; false -> is_odd(n - 1) } }\n\
+                   let is_odd = fn(n: Int) -> Bool { case n == 0 { true -> false; false -> is_even(n - 1) } }\n\
+                   is_even(10)";
+        assert_eq!(eval(src), Ok(Value::Bool(true)));
+        let src2 = "let is_even = fn(n: Int) -> Bool { case n == 0 { true -> true; false -> is_odd(n - 1) } }\n\
+                    let is_odd = fn(n: Int) -> Bool { case n == 0 { true -> false; false -> is_even(n - 1) } }\n\
+                    is_odd(10)";
+        assert_eq!(eval(src2), Ok(Value::Bool(false)));
+    }
+
+    #[test]
+    fn codegen_相互再帰がネイティブ実行される() {
+        let (out, code) = compile_run_status(
+            "let is_even = fn(n: Int) -> Bool { case n == 0 { true -> true; false -> is_odd(n - 1) } }\n\
+             let is_odd = fn(n: Int) -> Bool { case n == 0 { true -> false; false -> is_even(n - 1) } }\n\
+             print(\"${is_even(10)}\")\n\
+             print(\"${is_odd(10)}\")",
+        );
+        assert_eq!(out, "true\nfalse\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn 末尾再帰はtcoで定数スタック() {
         // 20 万段。TCO（トランポリン）が無ければテストスレッドのスタックを溢れさせる深さ。
         let src = "let c = fn(n: Int, a: Int) -> Int { case n == 0 { true -> a; false -> c(n - 1, a + 1) } }; c(200000, 0)";

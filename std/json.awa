@@ -1,9 +1,8 @@
 // 標準ライブラリ: JSON。値は ADT で表現し、パーサ/シリアライザは純 awa で書く。
 // 土台: 文字列プリミティブ（string_char_at/char_to_string/string_to_float）と std/string。
 //
-// awa は相互再帰を持たないので、値↔配列↔オブジェクトの相互再帰は
-// 「値パーサ自身を高階引数 pv として要素ループに渡す」ことで自己再帰だけで表現する。
-// 同様に stringify は list.map に自分自身を渡して入れ子をたどる。
+// 値↔配列↔オブジェクトは parse_value/parse_elems/parse_members の相互再帰で表現する
+// （awa はトップレベルの相互再帰に対応）。stringify は list.map に自分自身を渡して入れ子をたどる。
 import std/list
 import std/result
 import std/string
@@ -133,17 +132,18 @@ let parse_lit = fn(s, i, word, val) {
 
 // 配列要素ループ。pv = 値パーサ（parse_value 自身を受け取る＝相互再帰の回避）。
 // acc は逆順に積む（呼び元が reverse する）。i は要素 or ']' の位置。
-let parse_elems = fn(s, i, acc, pv) {
+// parse_value と相互再帰する（awa はトップレベルの相互再帰に対応）。
+let parse_elems = fn(s, i, acc) {
   let j = skip_ws(s, i)
   case string_char_at(s, j) == 93 {
     true -> result.Ok(Parsed(acc, j + 1))
-    false -> case pv(s, j) {
+    false -> case parse_value(s, j) {
       result.Err(e) -> result.Err(e)
       result.Ok(Parsed(v, k)) -> {
         let m = skip_ws(s, k)
         let cc = string_char_at(s, m)
         case cc == 44 {
-          true -> parse_elems(s, m + 1, list.Cons(v, acc), pv)
+          true -> parse_elems(s, m + 1, list.Cons(v, acc))
           false -> case cc == 93 {
             true -> result.Ok(Parsed(list.Cons(v, acc), m + 1))
             false -> result.Err("expected , or ] in array")
@@ -154,8 +154,8 @@ let parse_elems = fn(s, i, acc, pv) {
   }
 }
 
-// オブジェクトメンバループ。pv = 値パーサ。i は "key" or '}' の位置。
-let parse_members = fn(s, i, acc, pv) {
+// オブジェクトメンバループ。i は "key" or '}' の位置。parse_value と相互再帰。
+let parse_members = fn(s, i, acc) {
   let j = skip_ws(s, i)
   case string_char_at(s, j) == 125 {
     true -> result.Ok(Parsed(acc, j + 1))
@@ -164,13 +164,13 @@ let parse_members = fn(s, i, acc, pv) {
       result.Ok(Parsed(key, k)) -> {
         let colon = skip_ws(s, k)
         case string_char_at(s, colon) == 58 {
-          true -> case pv(s, colon + 1) {
+          true -> case parse_value(s, colon + 1) {
             result.Err(e) -> result.Err(e)
             result.Ok(Parsed(v, m)) -> {
               let n = skip_ws(s, m)
               let cc = string_char_at(s, n)
               case cc == 44 {
-                true -> parse_members(s, n + 1, list.Cons(pair.Pair(key, v), acc), pv)
+                true -> parse_members(s, n + 1, list.Cons(pair.Pair(key, v), acc))
                 false -> case cc == 125 {
                   true -> result.Ok(Parsed(list.Cons(pair.Pair(key, v), acc), n + 1))
                   false -> result.Err("expected , or } in object")
@@ -185,7 +185,7 @@ let parse_members = fn(s, i, acc, pv) {
   }
 }
 
-// 1 つの JSON 値をパース。配列/オブジェクトは自分自身を pv として渡す（自己再帰）。
+// 1 つの JSON 値をパース。配列/オブジェクトは parse_elems/parse_members と相互再帰する。
 let parse_value = fn(s, i) {
   let j = skip_ws(s, i)
   let c = string_char_at(s, j)
@@ -195,12 +195,12 @@ let parse_value = fn(s, i) {
       result.Ok(Parsed(str, k)) -> result.Ok(Parsed(JStr(str), k))
     }
     false -> case c == 123 {
-      true -> case parse_members(s, j + 1, list.Nil, parse_value) {
+      true -> case parse_members(s, j + 1, list.Nil) {
         result.Err(e) -> result.Err(e)
         result.Ok(Parsed(fields, k)) -> result.Ok(Parsed(JObj(list.reverse(fields)), k))
       }
       false -> case c == 91 {
-        true -> case parse_elems(s, j + 1, list.Nil, parse_value) {
+        true -> case parse_elems(s, j + 1, list.Nil) {
           result.Err(e) -> result.Err(e)
           result.Ok(Parsed(items, k)) -> result.Ok(Parsed(JArr(list.reverse(items)), k))
         }

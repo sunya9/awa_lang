@@ -169,6 +169,20 @@ impl Checker {
     // self に積まれ、次の行から参照できる。型宣言は値文を生まない（eval と整合）。
     pub fn check_program(&mut self, stmts: &[Stmt]) -> Result<Vec<TStmt>, LocatedError> {
         let mut typed = Vec::new();
+        // 相互再帰: トップレベルの関数 let を、本体を推論する前に一括で pre-declare する。
+        // これで定義順に関係なく互いを参照できる（注釈があればその型、無ければ fresh）。
+        // プレースホルダは fresh 変数のみ（注釈はまだ解決しない＝この時点では型未登録なため）。
+        // 注釈との突き合わせは infer_let が本体推論時に行い、この fresh var と unify する。
+        let mut prebound: HashMap<String, Type> = HashMap::new();
+        for stmt in stmts {
+            if let Stmt::Let(name, _, expr) = stmt {
+                if matches!(expr.kind, ExprKind::Lambda(..)) {
+                    let ph = self.vargen.fresh();
+                    self.env.insert(name.clone(), Scheme::mono(ph.clone()));
+                    prebound.insert(name.clone(), ph);
+                }
+            }
+        }
         for stmt in stmts {
             match stmt {
                 Stmt::Let(name, annotation, expr) => {
@@ -181,6 +195,7 @@ impl Checker {
                         &mut self.vargen,
                         &self.arities,
                         &self.methods,
+                        prebound.get(name).cloned(),
                     )?;
                     typed.push(TStmt::Let(name.clone(), te));
                 }
@@ -605,6 +620,7 @@ fn generalize(env: &TypeEnv, subst: &Subst, ty: &Type) -> Scheme {
 // 「先に置いた型変数」と「本体から推論した型」を unify して辻褄を合わせる。
 // eval 側の「名前を刻んで自己注入」と対になる仕組み。
 // 最後に、自分自身の束縛を外した環境で generalize して多相スキームを env に積む。
+#[allow(clippy::too_many_arguments)]
 fn infer_let(
     name: &str,
     annotation: &Option<TypeExpr>,
@@ -614,6 +630,8 @@ fn infer_let(
     vargen: &mut VarGen,
     arities: &Arities,
     methods: &MethodEnv,
+    // 相互再帰グループで事前宣言済みのプレースホルダ型（あればそれを再帰束縛に使う）。
+    prebound: Option<Type>,
 ) -> Result<TExpr, LocatedError> {
     // 軽量な双方向推論: `let f: fn(A)->B = fn(x){..}` のとき、注釈の引数/戻り型を
     // ラムダへ事前注入する（未注釈の引数のみ）。これで本体推論の時点で引数型が確定し、
@@ -647,7 +665,20 @@ fn infer_let(
         }
         None => None,
     };
-    let placeholder = ann_ty.clone().unwrap_or_else(|| vargen.fresh());
+    // プレースホルダ（再帰呼び出しが見る自分の型）の決定。
+    //  - 事前宣言の fresh var（prebound）があれば、他のトップレベル関数が既にそれへ制約を
+    //    付けているので「同一性」を保つ必要がある。注釈型があればその fresh var と unify して
+    //    両者を結びつけ、注釈型をプレースホルダに使う（再帰呼び出しが宣言型を持てる利点を維持）。
+    //  - prebound が無ければ従来どおり 注釈型 or fresh。
+    let placeholder = match (&prebound, &ann_ty) {
+        (Some(p), Some(a)) => {
+            at(unify(subst, p, a), expr.span)?;
+            a.clone()
+        }
+        (Some(p), None) => p.clone(),
+        (None, Some(a)) => a.clone(),
+        (None, None) => vargen.fresh(),
+    };
     env.insert(name.to_string(), Scheme::mono(placeholder.clone()));
     let te = infer_expr(expr, env, subst, vargen, arities, methods)?;
     let span = te.span;
@@ -1004,6 +1035,7 @@ fn infer_stmts(
                     vargen,
                     &local_arities,
                     &local_methods,
+                    None, // ブロック内 let は逐次（相互再帰はトップレベルのみ）
                 )?;
                 tstmts.push(TStmt::Let(name.clone(), te));
                 last = Type::Unit; // let 文はブロック値に寄与しない
