@@ -771,6 +771,63 @@ fn infer_expr(
         // unify が「callee が関数か」「引数の個数と型が合うか」を一括で検査する。
         // 戻り型は fresh 型変数で置き、unify 後に確定したものを返す。
         ExprKind::Call(callee, args) => {
+            // 文字列補間 `${e}` の脱糖。lexer は `${e}` を `__interp(e)` というトークン列に
+            // 落とすので、ここで型を見て文字列化に置換する（型クラスなしの type-directed 変換）。
+            // 置換後は通常の Call/If/Str ノードなので eval/codegen は __interp を一切見ない。
+            if let ExprKind::Var(name) = &callee.kind {
+                if name == "__interp" && args.len() == 1 {
+                    let arg = infer_expr(&args[0], env, subst, vargen, arities, methods)?;
+                    let arg_ty = apply(subst, &arg.ty);
+                    // f(inner) の Call ノードを組み立てる小道具（f は inner.ty -> ret の組込）。
+                    let conv = |fname: &str, inner: TExpr, ret: Type| TExpr {
+                        ty: ret.clone(),
+                        span,
+                        kind: TExprKind::Call(
+                            Box::new(TExpr {
+                                ty: Type::Fun(vec![inner.ty.clone()], Box::new(ret)),
+                                span: callee.span,
+                                kind: TExprKind::Var(fname.to_string()),
+                            }),
+                            vec![inner],
+                        ),
+                    };
+                    let lit = |s: &str| TExpr {
+                        ty: Type::Str,
+                        span,
+                        kind: TExprKind::Str(s.to_string()),
+                    };
+                    let result = match arg_ty {
+                        Type::Str => arg,
+                        Type::Int => conv("int_to_string", arg, Type::Str),
+                        Type::Float => conv("float_to_string", arg, Type::Str),
+                        // Long は long_to_int で Int に落としてから文字列化。
+                        Type::Long => conv(
+                            "int_to_string",
+                            conv("long_to_int", arg, Type::Int),
+                            Type::Str,
+                        ),
+                        // Bool は専用組込を持たないので if で分岐（評価は 1 回）。
+                        Type::Bool => TExpr {
+                            ty: Type::Str,
+                            span,
+                            kind: TExprKind::If(
+                                Box::new(arg),
+                                Box::new(lit("true")),
+                                Box::new(lit("false")),
+                            ),
+                        },
+                        other => {
+                            return Err(LocatedError::at(
+                                AwaError::Unsupported(format!(
+                                    "${{}} で文字列化できない型です: {other}（Int/Long/Float/Bool/String のみ）"
+                                )),
+                                args[0].span,
+                            ));
+                        }
+                    };
+                    return Ok(result);
+                }
+            }
             let callee_t = infer_expr(callee, env, subst, vargen, arities, methods)?;
             let mut targs = Vec::with_capacity(args.len());
             for a in args {

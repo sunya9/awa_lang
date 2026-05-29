@@ -1050,6 +1050,47 @@ mod tests {
     }
 
     #[test]
+    fn 文字列補間は型駆動で文字列化する() {
+        // String はそのまま、Int/Float/Bool は自動で文字列化。
+        assert_eq!(
+            eval(r#"let name = "awa"; "hi ${name}!""#),
+            Ok(Value::Str("hi awa!".to_string()))
+        );
+        assert_eq!(
+            eval(r#"let n = 40; "n=${n + 2}""#),
+            Ok(Value::Str("n=42".to_string()))
+        );
+        assert_eq!(
+            eval(r#""f=${3.5}""#),
+            Ok(Value::Str("f=3.5".to_string()))
+        );
+        assert_eq!(
+            eval(r#""b=${1 < 2}""#),
+            Ok(Value::Str("b=true".to_string()))
+        );
+        // 複数の補間と前後リテラル。
+        assert_eq!(
+            eval(r#"let x = 1; let y = 2; "${x}+${y}=${x + y}""#),
+            Ok(Value::Str("1+2=3".to_string()))
+        );
+        // 補間が無ければ従来どおり単一の文字列。
+        assert_eq!(eval(r#""plain""#), Ok(Value::Str("plain".to_string())));
+        // \$ で $ をリテラルに。
+        assert_eq!(
+            eval(r#""price \${10}""#),
+            Ok(Value::Str("price ${10}".to_string()))
+        );
+    }
+
+    #[test]
+    fn 三連引用符でも補間できる() {
+        assert_eq!(
+            eval("let n = 7;\n\"\"\"val=${n}\nend\"\"\""),
+            Ok(Value::Str("val=7\nend".to_string()))
+        );
+    }
+
+    #[test]
     fn 数値変換の組込関数() {
         assert_eq!(eval("int_to_float(3)"), Ok(Value::Float(3.0)));
         assert_eq!(eval("int_to_string(5)"), Ok(Value::Str("5".to_string())));

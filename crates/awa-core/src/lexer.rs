@@ -2,6 +2,58 @@ use crate::error::{AwaError, LocatedError};
 use crate::span::{Span, Spanned};
 use crate::token::{Token, ends_expr};
 
+// 文字列リテラルの構成要素。Lit=そのままの文字、Code=`${ }` 内の式（とソース上の開始 char 位置）。
+enum StrPart {
+    Lit(String),
+    Code(String, usize),
+}
+
+// 文字列の構成要素列をトークンへ。補間が無ければ単一の Str。
+// あれば `( "lit" <> __interp( <式> ) <> "lit" ... )` という連結式へ脱糖する
+// （__interp はチェッカが型駆動で int_to_string 等へ展開する）。
+fn emit_string(
+    parts: Vec<StrPart>,
+    start: usize,
+    end: usize,
+    tokens: &mut Vec<Spanned<Token>>,
+) -> Result<(), LocatedError> {
+    let sp = Span::new(start, end);
+    if !parts.iter().any(|p| matches!(p, StrPart::Code(..))) {
+        // 補間なし: リテラルを連結して 1 つの Str トークン。
+        let mut s = String::new();
+        for p in parts {
+            if let StrPart::Lit(l) = p {
+                s.push_str(&l);
+            }
+        }
+        tokens.push(Spanned::new(Token::Str(s), sp));
+        return Ok(());
+    }
+    tokens.push(Spanned::new(Token::LParen, sp));
+    let mut first = true;
+    for part in parts {
+        if !first {
+            tokens.push(Spanned::new(Token::Concat, sp));
+        }
+        first = false;
+        match part {
+            StrPart::Lit(l) => tokens.push(Spanned::new(Token::Str(l), sp)),
+            StrPart::Code(code, off) => {
+                tokens.push(Spanned::new(Token::Ident("__interp".to_string()), sp));
+                tokens.push(Spanned::new(Token::LParen, sp));
+                // 内側の式を再帰的に字句解析し、span を元ソース上の位置へずらして差し込む。
+                for mut t in tokenize(&code)? {
+                    t.span = Span::new(t.span.start + off, t.span.end + off);
+                    tokens.push(t);
+                }
+                tokens.push(Spanned::new(Token::RParen, sp));
+            }
+        }
+    }
+    tokens.push(Spanned::new(Token::RParen, sp));
+    Ok(())
+}
+
 // ===== 字句解析（Lexer）=====
 // 各トークンに span（ソース上の char 範囲）を添えて返す。失敗時は位置つきエラー。
 pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
@@ -213,7 +265,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
             // 三連引用符 """..."""：生（エスケープ解釈なし）・改行保持の複数行文字列。
             '"' if chars.get(i + 1) == Some(&'"') && chars.get(i + 2) == Some(&'"') => {
                 i += 3; // 開き """
-                let mut s = String::new();
+                let mut parts: Vec<StrPart> = Vec::new();
+                let mut lit = String::new();
                 loop {
                     if chars.get(i).is_none() {
                         return Err(LocatedError::at(
@@ -228,14 +281,48 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                         i += 3; // 閉じ """
                         break;
                     }
-                    s.push(chars[i]); // 中身はそのまま（改行も含めて）
+                    // 生文字列でも ${ } 補間は解釈する。
+                    if chars.get(i) == Some(&'$') && chars.get(i + 1) == Some(&'{') {
+                        parts.push(StrPart::Lit(std::mem::take(&mut lit)));
+                        i += 2; // ${
+                        let code_start = i;
+                        let mut depth = 1;
+                        loop {
+                            match chars.get(i) {
+                                None => {
+                                    return Err(LocatedError::at(
+                                        AwaError::UnterminatedString,
+                                        Span::new(start, i),
+                                    ));
+                                }
+                                Some('{') => {
+                                    depth += 1;
+                                    i += 1;
+                                }
+                                Some('}') => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                    i += 1;
+                                }
+                                Some(_) => i += 1,
+                            }
+                        }
+                        parts.push(StrPart::Code(chars[code_start..i].iter().collect(), code_start));
+                        i += 1; // 閉じ }
+                        continue;
+                    }
+                    lit.push(chars[i]); // 中身はそのまま（改行も含めて）
                     i += 1;
                 }
-                tokens.push(Spanned::new(Token::Str(s), Span::new(start, i)));
+                parts.push(StrPart::Lit(lit));
+                emit_string(parts, start, i, &mut tokens)?;
             }
             '"' => {
                 i += 1; // 開き "
-                let mut s = String::new();
+                let mut parts: Vec<StrPart> = Vec::new();
+                let mut lit = String::new();
                 loop {
                     match chars.get(i) {
                         None => {
@@ -248,35 +335,74 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                             i += 1; // 閉じ "
                             break;
                         }
+                        // ${ 式 } 補間。`\$` でリテラルの $ をエスケープできる。
+                        Some('$') if chars.get(i + 1) == Some(&'{') => {
+                            parts.push(StrPart::Lit(std::mem::take(&mut lit)));
+                            i += 2; // ${
+                            let code_start = i;
+                            let mut depth = 1;
+                            loop {
+                                match chars.get(i) {
+                                    None => {
+                                        return Err(LocatedError::at(
+                                            AwaError::UnterminatedString,
+                                            Span::new(start, i),
+                                        ));
+                                    }
+                                    Some('{') => {
+                                        depth += 1;
+                                        i += 1;
+                                    }
+                                    Some('}') => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                        i += 1;
+                                    }
+                                    Some(_) => i += 1,
+                                }
+                            }
+                            parts.push(StrPart::Code(
+                                chars[code_start..i].iter().collect(),
+                                code_start,
+                            ));
+                            i += 1; // 閉じ }
+                        }
                         Some('\\') => match chars.get(i + 1) {
                             Some('n') => {
-                                s.push('\n');
+                                lit.push('\n');
                                 i += 2;
                             }
                             Some('t') => {
-                                s.push('\t');
+                                lit.push('\t');
                                 i += 2;
                             }
                             Some('\\') => {
-                                s.push('\\');
+                                lit.push('\\');
                                 i += 2;
                             }
                             Some('"') => {
-                                s.push('"');
+                                lit.push('"');
+                                i += 2;
+                            }
+                            Some('$') => {
+                                lit.push('$');
                                 i += 2;
                             }
                             _ => {
-                                s.push('\\');
+                                lit.push('\\');
                                 i += 1;
                             }
                         },
                         Some(&c) => {
-                            s.push(c);
+                            lit.push(c);
                             i += 1;
                         }
                     }
                 }
-                tokens.push(Spanned::new(Token::Str(s), Span::new(start, i)));
+                parts.push(StrPart::Lit(lit));
+                emit_string(parts, start, i, &mut tokens)?;
             }
             // 単独の '.' はメソッド呼び出しのドット（小数点は数値アームで処理済み）。
             '.' => {
