@@ -68,3 +68,15 @@ let split_from = fn(s, sep, i, cur) {
   }
 }
 pub let split = fn(s: String, sep: Int) -> list.List(String) { split_from(s, sep, 0, "") }
+
+// 文字列のリストを sep で連結。
+let join_from = fn(xs, sep, first) {
+  case xs {
+    list.Nil -> ""
+    list.Cons(h, t) -> {
+      let pre = if first { "" } else { sep };
+      pre <> h <> join_from(t, sep, false)
+    }
+  }
+}
+pub let join = fn(xs: list.List(String), sep: String) -> String { join_from(xs, sep, true) }

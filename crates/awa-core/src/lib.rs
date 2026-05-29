@@ -2060,6 +2060,36 @@ mod tests {
     }
 
     #[test]
+    fn std_json_parse_stringify_roundtrip() {
+        // パース→再シリアライズが入力と一致（数値/配列/入れ子/true/null）。
+        let out = std_build_run(
+            "import std/io\n\
+             import std/json\n\
+             import std/result\n\
+             let src = \"[1,2,[3,true],null]\"\n\
+             let r = case json.parse(src) {\n\
+               result.Ok(j) -> json.stringify(j)\n\
+               result.Err(e) -> e\n\
+             }\n\
+             io.println(r)\n",
+        );
+        assert_eq!(out, "[1,2,[3,true],null]\n");
+    }
+
+    #[test]
+    fn std_json_object_と_エラー() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/json\n\
+             import std/result\n\
+             io.println(case json.parse(\"{}\") { result.Ok(j) -> json.stringify(j); result.Err(e) -> e })\n\
+             io.println(case json.parse(\"[1,\") { result.Ok(j) -> \"ok\"; result.Err(e) -> \"err\" })\n",
+        );
+        // 空オブジェクトは {} に往復、途中で切れた配列はエラー。
+        assert_eq!(out, "{}\nerr\n");
+    }
+
+    #[test]
     fn 焼き込み標準ライブラリは_stdlibパスなしで解決できる() {
         // stdlib=None でも `import std/...` がバイナリ焼き込みソースから解決される
         // （cwd・環境変数に非依存）。エントリは std/ を持たない一時ディレクトリに置く。

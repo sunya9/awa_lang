@@ -1,0 +1,13 @@
+// JSON: パース（String -> Result(Json, String)）とシリアライズ（Json -> String）。
+// パーサは相互再帰を持たない awa で、値パーサ自身を高階引数として要素ループに渡して書いている。
+import std/io
+import std/json
+import std/result
+
+let main = fn() {
+  let src = "{\"lang\":\"awa\",\"version\":1,\"tags\":[\"fp\",\"ml\"],\"stable\":false}";
+  case json.parse(src) {
+    result.Ok(j) -> io.println(json.stringify(j))   // 往復して同じ JSON
+    result.Err(e) -> io.println("parse error: ${e}")
+  }
+}
