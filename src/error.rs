@@ -59,7 +59,9 @@ pub enum AwaError {
     UnknownModule(String),                        // 修飾アクセスの左がモジュールでない（未 import 等）
     PrivateMethod { ty: String, method: String }, // 非公開メソッドを他モジュールから呼んだ
     // ----- 非同期（Phase 11） -----
-    Deadlock, // イベントループが空なのに run の Future が未解決
+    Deadlock,    // イベントループが空なのに run の Future が未解決
+    // ----- OS 連携（Phase 12） -----
+    Io(String),  // ファイル等の入出力エラー
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -143,6 +145,7 @@ impl fmt::Display for AwaError {
                 f,
                 "イベントループがデッドロックしました（待機中の Future が解決されません）"
             ),
+            AwaError::Io(msg) => write!(f, "入出力エラー: {}", msg),
         }
     }
 }

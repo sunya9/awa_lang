@@ -1680,6 +1680,9 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
 // インタプリタ版（eval.rs）と同じ意味モデルを C で実装したもの。
 pub const ASYNC_RUNTIME_C: &str = r#"
 #include <stdlib.h>
+#include <time.h>
+static long now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
+static void sleep_ms(long ms) { if (ms <= 0) return; struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (ms%1000)*1000000; nanosleep(&ts, 0); }
 typedef long long Word;
 typedef Word (*ContFn)(void* state, Word x);
 typedef struct Waiter { int kind; long g; ContFn fn; void* state; struct Waiter* next; } Waiter;
@@ -1687,7 +1690,7 @@ typedef struct { int resolved; Word value; Waiter* waiters; } Future;
 static Future* futs = 0; static long futs_cap = 0, futs_len = 0;
 typedef struct { long tick; long seq; long id; Word value; } Timer;
 static Timer* timers = 0; static long timers_cap = 0, timers_len = 0;
-static long now_tick = 0, seq_ctr = 0;
+static long seq_ctr = 0;
 static long new_future(int resolved, Word v) {
   if (futs_len == futs_cap) { futs_cap = futs_cap ? futs_cap*2 : 16; futs = (Future*)realloc(futs, futs_cap*sizeof(Future)); }
   long id = futs_len++; futs[id].resolved = resolved; futs[id].value = v; futs[id].waiters = 0; return id;
@@ -1696,7 +1699,7 @@ long awa_future_pure(Word v) { return new_future(1, v); }
 long awa_future_delay(Word ms, Word v) {
   long id = new_future(0, 0);
   if (timers_len == timers_cap) { timers_cap = timers_cap ? timers_cap*2 : 16; timers = (Timer*)realloc(timers, timers_cap*sizeof(Timer)); }
-  timers[timers_len].tick = now_tick + ms; timers[timers_len].seq = seq_ctr++; timers[timers_len].id = id; timers[timers_len].value = v; timers_len++;
+  timers[timers_len].tick = now_ms() + ms; timers[timers_len].seq = seq_ctr++; timers[timers_len].id = id; timers[timers_len].value = v; timers_len++;
   return id;
 }
 static void resolve(long id, Word v);
@@ -1733,7 +1736,8 @@ Word awa_future_run(long f) {
     long mi = 0;
     for (long i = 1; i < timers_len; i++)
       if (timers[i].tick < timers[mi].tick || (timers[i].tick==timers[mi].tick && timers[i].seq<timers[mi].seq)) mi = i;
-    Timer t = timers[mi]; timers[mi] = timers[timers_len-1]; timers_len--; now_tick = t.tick;
+    Timer t = timers[mi]; timers[mi] = timers[timers_len-1]; timers_len--;
+    sleep_ms(t.tick - now_ms()); /* 締切まで実時間で待つ */
     resolve(t.id, t.value);
   }
   return futs[f].value;

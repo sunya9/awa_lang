@@ -114,6 +114,10 @@ fn run_file(path: &str) {
     let rows: Vec<(Value, Type)> = values.into_iter().zip(types).collect();
     let start = rows.len().saturating_sub(entry_rows);
     for (v, t) in &rows[start..] {
+        // Unit（Nil）の結果行は表示しない（print/write_file 等の副作用文のノイズを抑える）。
+        if matches!(v, Value::Unit) {
+            continue;
+        }
         println!("{} : {}", v, render_type(t));
     }
 }
@@ -410,6 +414,40 @@ mod tests {
         let vals = run_values(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
         assert_eq!(vals.first(), Some(&Value::Int(3)));
         assert_eq!(vals.last(), Some(&Value::Int(12)));
+    }
+
+    // ===== OS 連携: 同期 I/O・時間（Phase 12 / Stage 1）=====
+
+    #[test]
+    fn io_ファイル書き込みと読み出し() {
+        let id = std::process::id();
+        let path = std::env::temp_dir().join(format!("awa_io_{}.txt", id));
+        let p = path.to_string_lossy().replace('\\', "/");
+        let src = format!("let _ = write_file(\"{p}\", \"hi os\")\nread_file(\"{p}\")");
+        let got = eval(&src);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, Ok(Value::Str("hi os".to_string())));
+    }
+
+    #[test]
+    fn io_printはunitを返す() {
+        assert_eq!(eval("print(\"x\")"), Ok(Value::Unit));
+    }
+
+    #[test]
+    fn io_nowは正のintを返す() {
+        match eval("now()") {
+            Ok(Value::Int(n)) => assert!(n > 0, "now() は正のはず: {}", n),
+            other => panic!("Int を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn io_読めないファイルはエラー() {
+        assert!(matches!(
+            eval("read_file(\"/no/such/awa/file/xyz\")"),
+            Err(AwaError::Io(_))
+        ));
     }
 
     #[test]

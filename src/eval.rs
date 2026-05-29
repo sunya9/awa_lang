@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Write;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::ast::{Pattern, TExpr, TExprKind, TMethod, TStmt, TypeDef};
 use crate::error::{AwaError, LocatedError};
@@ -350,7 +352,7 @@ struct Timer {
 struct EventLoop {
     next_id: usize,
     seq: u64,
-    now: u64,
+    start: Instant, // 実時間の基点。タイマー tick はここからの経過ミリ秒。
     futures: HashMap<usize, FutureState>,
     timers: Vec<Timer>,
 }
@@ -360,10 +362,13 @@ impl EventLoop {
         EventLoop {
             next_id: 0,
             seq: 0,
-            now: 0,
+            start: Instant::now(),
             futures: HashMap::new(),
             timers: Vec::new(),
         }
+    }
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
     }
 }
 
@@ -402,7 +407,7 @@ fn fut_delay(ms: u64, v: Value) -> usize {
         let id = l.next_id;
         l.next_id += 1;
         l.futures.insert(id, FutureState::Pending(Vec::new()));
-        let tick = l.now + ms;
+        let tick = l.elapsed_ms() + ms; // 実時間の締切（経過ミリ秒）
         let seq = l.seq;
         l.seq += 1;
         l.timers.push(Timer { tick, seq, id, value: v });
@@ -507,10 +512,10 @@ fn fut_run(f: usize, span: Span) -> Result<Value, LocatedError> {
         if let Some(v) = fut_resolved(f) {
             return Ok(v);
         }
-        let timer = LOOP.with(|l| {
+        let (timer, start) = LOOP.with(|l| {
             let mut l = l.borrow_mut();
             if l.timers.is_empty() {
-                return None;
+                return (None, l.start);
             }
             // 最早 (tick, seq) のタイマーを選ぶ。
             let mut mi = 0;
@@ -519,12 +524,17 @@ fn fut_run(f: usize, span: Span) -> Result<Value, LocatedError> {
                     mi = i;
                 }
             }
-            let t = l.timers.swap_remove(mi);
-            l.now = t.tick;
-            Some(t)
+            (Some(l.timers.swap_remove(mi)), l.start)
         });
         match timer {
-            Some(t) => fut_resolve(t.id, t.value)?,
+            Some(t) => {
+                // 締切まで実時間で待つ（借用を手放してから sleep）。
+                let elapsed = start.elapsed().as_millis() as u64;
+                if t.tick > elapsed {
+                    std::thread::sleep(std::time::Duration::from_millis(t.tick - elapsed));
+                }
+                fut_resolve(t.id, t.value)?;
+            }
             None => return Err(LocatedError::at(AwaError::Deadlock, span)),
         }
     }
@@ -564,6 +574,53 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
             let k = it.next().expect("map の関数");
             return Ok(Value::Future(fut_map(f, k)?));
         }
+        // OS 連携: 同期 I/O・時間（副作用はランタイム＝ここに隔離）。
+        "print" => {
+            if let Some(Value::Str(s)) = args.into_iter().next() {
+                println!("{}", s);
+                let _ = std::io::stdout().flush();
+            }
+            return Ok(Value::Unit);
+        }
+        "read_line" => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| LocatedError::at(AwaError::Io(e.to_string()), span))?;
+            // 末尾の改行を除く。
+            let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
+            return Ok(Value::Str(trimmed));
+        }
+        "read_file" => {
+            if let Some(Value::Str(path)) = args.into_iter().next() {
+                let s = std::fs::read_to_string(&path)
+                    .map_err(|e| LocatedError::at(AwaError::Io(format!("{}: {}", path, e)), span))?;
+                return Ok(Value::Str(s));
+            }
+            unreachable!("read_file の引数は String");
+        }
+        "write_file" => {
+            let mut it = args.into_iter();
+            let path = match it.next() {
+                Some(Value::Str(p)) => p,
+                _ => unreachable!("write_file の第1引数は String"),
+            };
+            let content = match it.next() {
+                Some(Value::Str(c)) => c,
+                _ => unreachable!("write_file の第2引数は String"),
+            };
+            std::fs::write(&path, content)
+                .map_err(|e| LocatedError::at(AwaError::Io(format!("{}: {}", path, e)), span))?;
+            return Ok(Value::Unit);
+        }
+        "now" => {
+            // UNIX エポックからのミリ秒。
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            return Ok(Value::Int(ms));
+        }
         _ => {}
     }
     // 型変換の組込（単項）。
@@ -597,6 +654,12 @@ pub fn builtins_env() -> Env {
         "run",
         "Future#flatMap",
         "Future#map",
+        // OS 連携（同期 I/O・時間）。
+        "print",
+        "read_line",
+        "read_file",
+        "write_file",
+        "now",
     ] {
         env.insert(name.to_string(), Value::Native(name.to_string()));
     }

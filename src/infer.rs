@@ -133,6 +133,14 @@ impl Checker {
             ("Future".to_string(), "map".to_string()),
             scheme(vec![a, b], vec![future(Type::Var(a)), k], future(Type::Var(b))),
         );
+
+        // OS 連携（同期 I/O・時間）。すべて単相。
+        let mono = |params: Vec<Type>, ret: Type| Scheme::mono(Type::Fun(params, Box::new(ret)));
+        self.env.insert("print".to_string(), mono(vec![Type::Str], Type::Unit));
+        self.env.insert("read_line".to_string(), mono(vec![], Type::Str));
+        self.env.insert("read_file".to_string(), mono(vec![Type::Str], Type::Str));
+        self.env.insert("write_file".to_string(), mono(vec![Type::Str, Type::Str], Type::Unit));
+        self.env.insert("now".to_string(), mono(vec![], Type::Int));
     }
 
     // プログラム（トップレベルの文の並び）を型検査し、型付き AST（elaboration の結果）を返す。
