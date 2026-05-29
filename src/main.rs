@@ -462,8 +462,9 @@ mod tests {
         // awa 自身で書いた汎用・再帰の all（List(Future(a)) -> Future(List(a))）。
         // Future は構築時にスケジュール済みなので、順に await しても実時間は並行。
         // 注釈付き再帰関数なので all(rest) の戻り型（Future）が確定しメソッド解決できる。
+        // let の関数型注釈だけで引数型もラムダへ流れる（軽量双方向推論）。
         let src = "type List(a) { Cons(a, List(a)); Nil }\n\
-                   let all: fn(List(Future(a))) -> Future(List(a)) = fn(fs: List(Future(a))) -> Future(List(a)) { \
+                   let all: fn(List(Future(a))) -> Future(List(a)) = fn(fs) { \
                      case fs { Nil -> pure(Nil); Cons(f, rest) -> do { x <- f; xs <- all(rest); pure(Cons(x, xs)) } } }\n\
                    let sum = fn(xs: List(Int)) -> Int { case xs { Nil -> 0; Cons(h, t) -> h + sum(t) } }\n\
                    sum(run(all(Cons(delay(10, 1), Cons(delay(5, 2), Cons(pure(3), Nil))))))";
@@ -935,6 +936,17 @@ mod tests {
         let mut env = eval::builtins_env();
         let mut checker = Checker::new();
         run(src, &mut env, &mut checker).unwrap_err()
+    }
+
+    #[test]
+    fn let注釈の引数型がラムダへ流れる() {
+        // let に関数型注釈があれば、ラムダ引数に注釈が無くても型が決まる（軽量双方向推論）。
+        assert_eq!(eval("let double: fn(Int) -> Int = fn(x) { x * 2 }\ndouble(21)"), Ok(Value::Int(42)));
+        // 引数が複数でも流れる。
+        assert_eq!(
+            eval("let add: fn(Int, Int) -> Int = fn(a, b) { a + b }\nadd(20, 22)"),
+            Ok(Value::Int(42))
+        );
     }
 
     #[test]

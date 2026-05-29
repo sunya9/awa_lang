@@ -3,11 +3,11 @@
 // なので「先に全部の Future を作ってから all で待つ」と、順に await しても実時間は並行
 // （合計 = 最も遅い Future ≒ max、逐次の sum ではない）。
 // all は型クラス不要・awa 自身で書ける汎用コンビネータ（flatMap/do で合成）。
-//   注: 再帰関数が自分の戻り値をメソッドレシーバに使うので、let とラムダの両方に型注釈が要る
-//       （awa は双方向型推論を持たないため）。
+//   注: let に関数型注釈を付ければ引数型はラムダへ流れる（軽量な双方向推論）。
+//       再帰関数なので let 注釈は必須（再帰呼び出しの戻り型を確定させメソッド解決するため）。
 type List(a) { Cons(a, List(a)); Nil }
 
-let all: fn(List(Future(a))) -> Future(List(a)) = fn(fs: List(Future(a))) -> Future(List(a)) {
+let all: fn(List(Future(a))) -> Future(List(a)) = fn(fs) {
   case fs {
     Nil -> pure(Nil)
     Cons(f, rest) -> do { x <- f; xs <- all(rest); pure(Cons(x, xs)) }

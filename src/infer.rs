@@ -619,6 +619,28 @@ fn infer_let(
     arities: &Arities,
     methods: &MethodEnv,
 ) -> Result<TExpr, LocatedError> {
+    // 軽量な双方向推論: `let f: fn(A)->B = fn(x){..}` のとき、注釈の引数/戻り型を
+    // ラムダへ事前注入する（未注釈の引数のみ）。これで本体推論の時点で引数型が確定し、
+    // `f.flatMap(..)` のようにメソッドのレシーバ型が分かる（let 注釈だけで済む）。
+    let expr_owned: Expr = match (annotation, &expr.kind) {
+        (Some(TypeExpr { kind: TypeExprKind::Fun(ptys, rty), .. }), ExprKind::Lambda(params, lret, body))
+            if params.len() == ptys.len() =>
+        {
+            let new_params = params
+                .iter()
+                .zip(ptys.iter())
+                .map(|((n, a), pty)| (n.clone(), a.clone().or_else(|| Some(pty.clone()))))
+                .collect();
+            let new_ret = lret.clone().or_else(|| Some((**rty).clone()));
+            Expr {
+                kind: ExprKind::Lambda(new_params, new_ret, body.clone()),
+                span: expr.span,
+            }
+        }
+        _ => expr.clone(),
+    };
+    let expr = &expr_owned;
+
     // 再帰の placeholder。注釈があればその型を使う（再帰呼び出しが宣言された型＝戻り型を
     // 持てるので、`all(rest).flatMap(..)` のようにメソッドのレシーバ型が確定する）。
     // 注釈が無ければ従来どおり fresh 型変数（単相 placeholder）。
