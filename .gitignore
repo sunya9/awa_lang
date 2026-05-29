@@ -16,3 +16,5 @@ editors/vscode/*.vsix
 
 # awa build 出力
 build/
+awa_packages/
+awa.lock

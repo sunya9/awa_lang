@@ -260,10 +260,23 @@ struct BuildConfig {
     bin: Option<String>,
 }
 
-// 依存の指定。今は path 依存のみ（`name = { path = "../foo" }`）。
+// 依存の指定。path 依存（`{ path = "../foo" }`）または git 依存
+// （`{ git = "URL", rev/tag/branch?, subdir? }`）。
 #[derive(Deserialize)]
 struct Dependency {
-    path: String,
+    path: Option<String>,
+    git: Option<String>,
+    rev: Option<String>,
+    tag: Option<String>,
+    branch: Option<String>,
+    subdir: Option<String>,
+}
+
+// awa.lock: 依存名 → 解決済みコミット SHA（再現性のため固定）。
+#[derive(Deserialize, Default)]
+struct Lock {
+    #[serde(default)]
+    dependencies: std::collections::BTreeMap<String, String>,
 }
 
 // ビルド/実行の確定ターゲット。
@@ -286,18 +299,106 @@ fn load_manifest() -> Option<Manifest> {
     }
 }
 
-// [dependencies] を「依存名 → ソースディレクトリ（awa.toml のある場所からの相対）」へ。
-fn manifest_deps(m: &Manifest) -> HashMap<String, PathBuf> {
-    m.dependencies
-        .iter()
-        .map(|(name, dep)| (name.clone(), PathBuf::from(&dep.path)))
-        .collect()
+const DEPS_DIR: &str = "awa_packages"; // git 依存のチェックアウト先
+
+fn git(args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("git を起動できません: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+fn git_fail(name: &str, e: String) -> ! {
+    eprintln!("依存 {name} の取得に失敗: {e}");
+    std::process::exit(1);
+}
+
+// git 依存をローカル（awa_packages/<name>）に用意し、commit を固定してその場所を返す。
+// locked にロック済み commit があればそれを、無ければ rev>tag>branch を checkout する。
+fn ensure_git_dep(
+    name: &str,
+    url: &str,
+    dep: &Dependency,
+    locked: Option<&String>,
+    new_lock: &mut std::collections::BTreeMap<String, String>,
+) -> PathBuf {
+    let dir = PathBuf::from(DEPS_DIR).join(name);
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(DEPS_DIR);
+        eprintln!("取得中: {name} ({url})");
+        if let Err(e) = git(&["clone", "--quiet", url, &dir.to_string_lossy()]) {
+            git_fail(name, e);
+        }
+    }
+    let d = dir.to_string_lossy().to_string();
+    // チェックアウトする ref: ロック commit > rev > tag > branch（無ければ既定 HEAD）。
+    let target = locked
+        .cloned()
+        .or_else(|| dep.rev.clone())
+        .or_else(|| dep.tag.clone())
+        .or_else(|| dep.branch.clone());
+    if let Some(r) = target {
+        // 手元に無い ref のために一度 fetch（失敗は致命としない＝オフライン/既存でも続行）。
+        let _ = git(&["-C", &d, "fetch", "--quiet", "--all", "--tags"]);
+        if let Err(e) = git(&["-C", &d, "checkout", "--quiet", &r]) {
+            git_fail(name, e);
+        }
+    }
+    // 実際の commit を解決してロックに記録。
+    match git(&["-C", &d, "rev-parse", "HEAD"]) {
+        Ok(commit) => {
+            new_lock.insert(name.to_string(), commit);
+        }
+        Err(e) => git_fail(name, e),
+    }
+    dir
+}
+
+// [dependencies] を「依存名 → ソースディレクトリ」へ解決する（git 依存は取得・固定）。
+// awa.lock を読み（再現性）、解決後に書き戻す。
+fn resolve_deps(m: &Manifest) -> HashMap<String, PathBuf> {
+    let locked: std::collections::BTreeMap<String, String> = std::fs::read_to_string("awa.lock")
+        .ok()
+        .and_then(|s| toml::from_str::<Lock>(&s).ok())
+        .map(|l| l.dependencies)
+        .unwrap_or_default();
+    let mut new_lock = std::collections::BTreeMap::new();
+    let mut map = HashMap::new();
+    for (name, dep) in &m.dependencies {
+        let dir = match (&dep.path, &dep.git) {
+            (Some(p), _) => PathBuf::from(p),
+            (None, Some(url)) => ensure_git_dep(name, url, dep, locked.get(name), &mut new_lock),
+            (None, None) => {
+                eprintln!("依存 {name}: path か git のどちらかが必要です");
+                std::process::exit(1);
+            }
+        };
+        let root = match &dep.subdir {
+            Some(s) => dir.join(s),
+            None => dir,
+        };
+        map.insert(name.clone(), root);
+    }
+    // git 依存があれば awa.lock を書き戻す。
+    if !new_lock.is_empty() {
+        let mut s = String::from("# awa.lock（自動生成）。依存の解決済みコミットを固定する。\n[dependencies]\n");
+        for (k, v) in &new_lock {
+            s.push_str(&format!("{k} = \"{v}\"\n"));
+        }
+        let _ = std::fs::write("awa.lock", s);
+    }
+    map
 }
 
 // build/emit/run の対象を、明示パスや awa.toml から確定する。
 fn resolve_target(explicit: Option<&str>) -> BuildTarget {
     let manifest = load_manifest();
-    let deps = manifest.as_ref().map(manifest_deps).unwrap_or_default();
+    let deps = manifest.as_ref().map(resolve_deps).unwrap_or_default();
     let out_dir = manifest
         .as_ref()
         .and_then(|m| m.build.out_dir.clone())
@@ -350,7 +451,8 @@ fn init_project(name: Option<&str>) {
          out-dir = \"build\"\n\
          \n\
          [dependencies]\n\
-         # mylib = {{ path = \"../mylib\" }}\n"
+         # mylib = {{ path = \"../mylib\" }}\n\
+         # netlib = {{ git = \"https://example.com/netlib\", tag = \"v1\" }}\n"
     );
     if let Err(e) = std::fs::write("awa.toml", manifest) {
         eprintln!("awa.toml を書けません: {e}");
@@ -363,6 +465,9 @@ fn init_project(name: Option<&str>) {
             eprintln!("src/main.awa を書けません: {e}");
             std::process::exit(1);
         }
+    }
+    if !std::path::Path::new(".gitignore").exists() {
+        let _ = std::fs::write(".gitignore", "/build\n/awa_packages\n");
     }
     println!("created awa.toml and src/main.awa");
     println!("  awa         # インタプリタ実行");
@@ -401,14 +506,14 @@ fn run_cli() {
         }
         Some(path) => {
             // 明示ファイルでも awa.toml があれば依存を使う。
-            let deps = load_manifest().as_ref().map(manifest_deps).unwrap_or_default();
+            let deps = load_manifest().as_ref().map(resolve_deps).unwrap_or_default();
             run_file(path, &deps);
         }
         None => {
             // 引数なし: awa.toml の entry を実行、無ければ REPL。
             if let Some(m) = load_manifest() {
                 if let Some(entry) = m.entry.clone() {
-                    run_file(&entry, &manifest_deps(&m));
+                    run_file(&entry, &resolve_deps(&m));
                     return;
                 }
             }
@@ -428,13 +533,18 @@ mod tests {
     fn manifest_のtomlパース() {
         let src = "name = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.awa\"\n\
                    [build]\nout-dir = \"dist\"\nbin = \"demoapp\"\n\
-                   [dependencies]\nmylib = { path = \"../mylib\" }\n";
+                   [dependencies]\n\
+                   mylib = { path = \"../mylib\" }\n\
+                   netlib = { git = \"https://example.com/netlib\", tag = \"v1\" }\n";
         let m: Manifest = toml::from_str(src).unwrap();
         assert_eq!(m.name.as_deref(), Some("demo"));
         assert_eq!(m.entry.as_deref(), Some("src/main.awa"));
         assert_eq!(m.build.out_dir.as_deref(), Some("dist"));
         assert_eq!(m.build.bin.as_deref(), Some("demoapp"));
-        assert_eq!(m.dependencies.get("mylib").map(|d| d.path.as_str()), Some("../mylib"));
+        assert_eq!(m.dependencies.get("mylib").and_then(|d| d.path.as_deref()), Some("../mylib"));
+        let net = m.dependencies.get("netlib").unwrap();
+        assert_eq!(net.git.as_deref(), Some("https://example.com/netlib"));
+        assert_eq!(net.tag.as_deref(), Some("v1"));
     }
 
     #[test]
