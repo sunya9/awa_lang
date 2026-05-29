@@ -1230,6 +1230,42 @@ mod tests {
     }
 
     #[test]
+    fn module_越境do記法() {
+        // 別モジュールの Opt とその flatMap を import して do を書く（成功と短絡の両方）。
+        let opt = "pub type Opt(a) { Some(a); None }\n\
+                   impl Opt(a) { fn flatMap(self, f: fn(a) -> Opt(b)) -> Opt(b) { case self { Some(x) -> f(x); None -> None } } }\n";
+        let (ok, code1) = compile_modules_status(
+            &[
+                ("opt.awa", opt),
+                (
+                    "main.awa",
+                    "import opt\n\
+                     let r = do { x <- opt.Some(10); y <- opt.Some(20); opt.Some(x + y) }\n\
+                     case r { opt.Some(n) -> n; opt.None -> 0 }\n",
+                ),
+            ],
+            "main",
+        );
+        assert_eq!(ok, "30\n");
+        assert_eq!(code1, 0);
+        // 途中 None で短絡。
+        let (sc, code2) = compile_modules_status(
+            &[
+                ("opt.awa", opt),
+                (
+                    "main.awa",
+                    "import opt\n\
+                     let r = do { x <- opt.Some(10); y <- opt.None; opt.Some(x + y) }\n\
+                     case r { opt.Some(n) -> n; opt.None -> 0 }\n",
+                ),
+            ],
+            "main",
+        );
+        assert_eq!(sc, "0\n");
+        assert_eq!(code2, 0);
+    }
+
+    #[test]
     fn module_越境メソッド呼び出し() {
         // 別モジュールの型 + impl メソッドを import して recv.method() で呼ぶ。
         let (out, code) = compile_modules_status(

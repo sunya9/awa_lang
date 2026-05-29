@@ -152,6 +152,11 @@ impl Resolver<'_> {
                 for meth in &mut b.methods {
                     let locals: HashSet<String> =
                         meth.params.iter().map(|(n, _)| n.clone()).collect();
+                    // 引数・戻り型の注釈も修飾（`fn(a) -> Opt(b)` の Opt 等）。
+                    for (_, ann) in &mut meth.params {
+                        *ann = self.opt_type(ann)?;
+                    }
+                    meth.ret = self.opt_type(&meth.ret)?;
                     meth.body = self.expr(&meth.body, &locals)?;
                 }
                 Ok(Stmt::Impl(b))
