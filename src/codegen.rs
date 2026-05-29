@@ -378,6 +378,12 @@ impl Gen {
         let dp = format!("%t{}", self.fresh());
         self.line(&format!("{} = getelementptr i8, ptr {}, i64 8", dp, obj));
         self.line(&format!("store ptr null, ptr {}", dp));
+        // 生存数 ++（リーク検出）。
+        let lv = format!("%t{}", self.fresh());
+        self.line(&format!("{} = load i64, ptr @.live", lv));
+        let lv1 = format!("%t{}", self.fresh());
+        self.line(&format!("{} = add i64 {}, 1", lv1, lv));
+        self.line(&format!("store i64 {}, ptr @.live", lv1));
         Ok(())
     }
 
@@ -387,6 +393,22 @@ impl Gen {
         let r = format!("%t{}", self.fresh());
         self.line(&format!("{} = getelementptr i8, ptr {}, i64 {}", r, obj, HDR_SIZE));
         r
+    }
+
+    // 値の所有権を 1 増やす（owning convention の「変数を読む＝新たな所有参照を作る」）。
+    // ヒープ型のみ対象。スカラ（Int/Bool 等）は何もしない。
+    // M2a は文字列のみ。ADT は M2b、クロージャ(env) は M2c で追加する。
+    fn retain(&mut self, val: &str, ty: &Type) {
+        if matches!(ty, Type::Str) {
+            self.line(&format!("call void @awa_retain(ptr {})", val));
+        }
+    }
+
+    // 値の所有権を 1 減らす（スコープ脱出・値の破棄）。0 で解放。
+    fn release(&mut self, val: &str, ty: &Type) {
+        if matches!(ty, Type::Str) {
+            self.line(&format!("call void @awa_release(ptr {})", val));
+        }
     }
 
     fn bind_local(&mut self, name: &str, operand: &str, ty: &Type) -> Result<()> {
@@ -453,6 +475,9 @@ impl Gen {
             self.match_pattern_ir(pat, &sv, &sty, &next, m)?;
             let bv = self.expr(body, m)?;
             self.line(&format!("store {} {}, ptr {}", res_ty, bv, res));
+            // この腕が成立 → パターン束縛と subject を release（結果値は別の +1）。
+            self.release_scope_since(&saved)?;
+            self.release(&sv, &sty);
             self.line(&format!("br label %{}", end));
             self.scope = saved;
             self.label(&next);
@@ -476,7 +501,11 @@ impl Gen {
     ) -> Result<()> {
         match pat {
             Pattern::Wildcard => Ok(()),
-            Pattern::Var(n) => self.bind_local(n, value, value_ty),
+            // 束縛は subject 内部への新たな所有参照 → retain（腕脱出で release される）。
+            Pattern::Var(n) => {
+                self.retain(value, value_ty);
+                self.bind_local(n, value, value_ty)
+            }
             Pattern::Bool(b) => {
                 self.eq_or_fail("i1", value, if *b { "1" } else { "0" }, fail);
                 Ok(())
@@ -566,12 +595,15 @@ impl Gen {
             let llty = llvm_ty(&vty)?;
             let r = format!("%t{}", self.fresh());
             self.line(&format!("{} = load {}, ptr {}", r, llty, slot));
+            // 読み出した値は新たな所有参照（スロットは所有を保持し続ける）。
+            self.retain(&r, &vty);
             Ok(r)
         } else if let Some(vty) = m.value_globals.get(name).cloned() {
             // トップレベル値 → グローバル変数 @name から load。
             let llty = llvm_ty(&vty)?;
             let r = format!("%t{}", self.fresh());
             self.line(&format!("{} = load {}, ptr @{}", r, llty, name));
+            self.retain(&r, &vty);
             Ok(r)
         } else if let Some(ci) = m.ctors.get(name).cloned() {
             if ci.arity == 0 {
@@ -605,8 +637,12 @@ impl Gen {
         let lv = self.expr(l, m)?;
         let rv = self.expr(r, m)?;
         // 文字列の連結と等価はランタイム関数（ptr 比較ではなく中身で比べる）。
+        // 演算子は両オペランドを consume する（結果を作った後に release）。
         if matches!(l.ty, Type::Str) {
-            return self.str_binop(op, &lv, &rv);
+            let res = self.str_binop(op, &lv, &rv)?;
+            self.release(&lv, &Type::Str);
+            self.release(&rv, &Type::Str);
+            return Ok(res);
         }
         let llty = llvm_ty(&l.ty)?;
         let float = is_float(&l.ty);
@@ -846,24 +882,49 @@ impl Gen {
 
     fn block(&mut self, stmts: &[TStmt], m: &mut Module) -> Result<String> {
         let saved = self.scope.clone();
-        let mut last = String::new();
+        // 直前の Expr 文の値は、新しい文が来た時点で破棄される → release する。
+        let mut last: Option<(String, Type)> = None;
         for s in stmts {
+            if let Some((v, ty)) = last.take() {
+                self.release(&v, &ty); // 捨てられる中間値
+            }
             match s {
                 TStmt::Let(name, rhs) => {
                     let v = self.expr(rhs, m)?;
-                    self.bind_local(name, &v, &rhs.ty)?;
-                    last = String::new();
+                    self.bind_local(name, &v, &rhs.ty)?; // スロットが所有（retain しない）
                 }
-                TStmt::Expr(e) => last = self.expr(e, m)?,
+                TStmt::Expr(e) => last = Some((self.expr(e, m)?, e.ty.clone())),
                 TStmt::Type(_) | TStmt::Impl(_) => return unsupported("ブロック内の type/impl"),
             }
         }
+        // このブロックで束縛したローカルを release（結果値は別の +1 所有なので保持される）。
+        self.release_scope_since(&saved)?;
         self.scope = saved;
-        if last.is_empty() {
-            unsupported("値を持たないブロック")
-        } else {
-            Ok(last)
+        match last {
+            Some((v, _)) => Ok(v),
+            None => unsupported("値を持たないブロック"),
         }
+    }
+
+    // saved 以降にこのスコープへ追加された束縛を release する（スコープ脱出処理）。
+    fn release_scope_since(&mut self, saved: &HashMap<String, (String, Type)>) -> Result<()> {
+        let mut locals: Vec<(String, Type)> = Vec::new();
+        for (name, (slot, ty)) in &self.scope {
+            if !saved.contains_key(name) {
+                locals.push((slot.clone(), ty.clone()));
+            }
+        }
+        // 決定的な順序で（名前順でなくスロット順は問わないが安定させる）。
+        locals.sort_by(|a, b| a.0.cmp(&b.0));
+        for (slot, ty) in locals {
+            if matches!(ty, Type::Str | Type::Con(..) | Type::Fun(..)) {
+                let llty = llvm_ty(&ty)?;
+                let v = format!("%t{}", self.fresh());
+                self.line(&format!("{} = load {}, ptr {}", v, llty, slot));
+                self.release(&v, &ty);
+            }
+        }
+        Ok(())
     }
 
     // ネスト lambda: キャプチャを env(malloc)に詰めてクロージャ値 {@fnN, env} を作る。
@@ -976,6 +1037,8 @@ fn gen_function(
         g.bind_local(pname, &format!("%arg{}", i), pty)?;
     }
     let result = g.expr(body, m)?;
+    // 関数は引数・キャプチャを consume する → 戻り値を作った後に release（戻り値は別の +1）。
+    g.release_scope_since(&HashMap::new())?;
     g.line(&format!("ret {} {}", ret_ll, result));
     m.funcs.push_str(&format!(
         "define {} @{}({}) {{\n{}}}\n\n",
@@ -1163,6 +1226,9 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i32 @strcmp(ptr, ptr)\n");
     module.push_str("declare i32 @snprintf(ptr, i64, ptr, ...)\n");
     module.push_str("declare void @exit(i32)\n");
+    module.push_str("declare void @free(ptr)\n");
+    // 生存ヒープオブジェクト数（リーク検出用）。init_header で ++、awa_release の解放で --。
+    module.push_str("@.live = internal global i64 0\n");
     // 書式・定数文字列。
     module.push_str("@.di = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n");
     module.push_str("@.df = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"\n");
@@ -1179,6 +1245,58 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     for (name, ty) in vg {
         module.push_str(&format!("@{} = global {} zeroinitializer\n", name, llvm_ty(ty)?));
     }
+    // 参照カウントのランタイム。
+    // retain: rc++（null と rc<0 の不滅オブジェクトは無視）。
+    module.push_str(
+        "\ndefine void @awa_retain(ptr %o) {\n\
+         entry:\n\
+         \x20 %isn = icmp eq ptr %o, null\n\
+         \x20 br i1 %isn, label %done, label %live\n\
+         live:\n\
+         \x20 %rc = load i64, ptr %o\n\
+         \x20 %imm = icmp slt i64 %rc, 0\n\
+         \x20 br i1 %imm, label %done, label %inc\n\
+         inc:\n\
+         \x20 %rc1 = add i64 %rc, 1\n\
+         \x20 store i64 %rc1, ptr %o\n\
+         \x20 br label %done\n\
+         done:\n\
+         \x20 ret void\n\
+         }\n\n",
+    );
+    // release: rc--。0 になったら drop_fn（あれば子を release）を呼び、@.live を減らして free。
+    module.push_str(
+        "\ndefine void @awa_release(ptr %o) {\n\
+         entry:\n\
+         \x20 %isn = icmp eq ptr %o, null\n\
+         \x20 br i1 %isn, label %done, label %live\n\
+         live:\n\
+         \x20 %rc = load i64, ptr %o\n\
+         \x20 %imm = icmp slt i64 %rc, 0\n\
+         \x20 br i1 %imm, label %done, label %dec\n\
+         dec:\n\
+         \x20 %rc1 = sub i64 %rc, 1\n\
+         \x20 store i64 %rc1, ptr %o\n\
+         \x20 %dead = icmp eq i64 %rc1, 0\n\
+         \x20 br i1 %dead, label %dofree, label %done\n\
+         dofree:\n\
+         \x20 %lv = load i64, ptr @.live\n\
+         \x20 %lv1 = sub i64 %lv, 1\n\
+         \x20 store i64 %lv1, ptr @.live\n\
+         \x20 %dp = getelementptr i8, ptr %o, i64 8\n\
+         \x20 %drop = load ptr, ptr %dp\n\
+         \x20 %dn = icmp eq ptr %drop, null\n\
+         \x20 br i1 %dn, label %fr, label %cd\n\
+         cd:\n\
+         \x20 call void %drop(ptr %o)\n\
+         \x20 br label %fr\n\
+         fr:\n\
+         \x20 call void @free(ptr %o)\n\
+         \x20 br label %done\n\
+         done:\n\
+         \x20 ret void\n\
+         }\n\n",
+    );
     // 文字列連結ランタイム。引数は文字列オブジェクト ptr、本体は obj+16。
     // 結果もヘッダ込みで確保し rc=1/drop=null を設定して返す。
     module.push_str(
@@ -1194,6 +1312,9 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
          \x20 store i64 1, ptr %obj\n\
          \x20 %dp = getelementptr i8, ptr %obj, i64 8\n\
          \x20 store ptr null, ptr %dp\n\
+         \x20 %lv = load i64, ptr @.live\n\
+         \x20 %lv1 = add i64 %lv, 1\n\
+         \x20 store i64 %lv1, ptr @.live\n\
          \x20 %buf = getelementptr i8, ptr %obj, i64 16\n\
          \x20 %c1 = call ptr @memcpy(ptr %buf, ptr %ab, i64 %la)\n\
          \x20 %tail = getelementptr i8, ptr %buf, i64 %la\n\
@@ -1220,11 +1341,32 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
             TStmt::Expr(e) => {
                 let v = g.expr(e, m)?;
                 emit_print(&mut g, &v, &e.ty)?;
+                g.release(&v, &e.ty); // 表示したら値は破棄
             }
             TStmt::Type(_) | TStmt::Impl(_) => {}
         }
     }
-    g.line("ret i32 0");
+    // プログラム終了前に、トップレベル値（グローバル変数が保持する +1）を release。
+    // これで RC が正しければ生存数 @.live は 0 になる。
+    let mut vg: Vec<(String, Type)> = m
+        .value_globals
+        .iter()
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
+    vg.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, ty) in vg {
+        if matches!(ty, Type::Str | Type::Con(..) | Type::Fun(..)) {
+            let v = format!("%t{}", g.fresh());
+            g.line(&format!("{} = load {}, ptr @{}", v, llvm_ty(&ty)?, name));
+            g.release(&v, &ty);
+        }
+    }
+    // 終了コード = 残存ヒープ数（リーク検出: 正常時 0）。
+    let lc = format!("%t{}", g.fresh());
+    g.line(&format!("{} = load i64, ptr @.live", lc));
+    let ec = format!("%t{}", g.fresh());
+    g.line(&format!("{} = trunc i64 {} to i32", ec, lc));
+    g.line(&format!("ret i32 {}", ec));
     Ok(format!("define i32 @main() {{\n{}}}\n", g.out))
 }
 

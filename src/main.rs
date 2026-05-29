@@ -947,6 +947,38 @@ mod tests {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    // stdout と終了コードの両方を返す（終了コード = 残存ヒープ数 = リーク数）。
+    fn compile_run_status(src: &str) -> (String, i32) {
+        let ir = compile_to_llvm(src).expect("コンパイルが通るはず");
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        let ll = dir.join(format!("awa_cg_{}.ll", id));
+        let exe = dir.join(format!("awa_cg_{}", id));
+        std::fs::write(&ll, &ir).unwrap();
+        let st = std::process::Command::new("clang")
+            .arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+        assert!(st.success(), "clang が失敗");
+        let out = std::process::Command::new(&exe).output().expect("実行できる");
+        let _ = std::fs::remove_file(&ll);
+        let _ = std::fs::remove_file(&exe);
+        (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap_or(-1))
+    }
+
+    #[test]
+    fn gc_文字列がリークしない() {
+        // 文字列の生成・連結・比較・グローバル束縛を行い、終了コード（残存数）が 0 になること。
+        let (out, code) = compile_run_status(
+            "let a = \"foo\" <> \"bar\"\n\
+             let b = int_to_string(42)\n\
+             a <> b\n\
+             b == \"42\"\n\
+             \"hello\"",
+        );
+        assert_eq!(out, "foobar42\ntrue\nhello\n");
+        assert_eq!(code, 0, "文字列がリークしている（残存ヒープ数 {}）", code);
+    }
+
     #[test]
     fn codegen_再帰factがネイティブ実行される() {
         let out = compile_and_run(
