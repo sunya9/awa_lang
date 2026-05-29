@@ -25,6 +25,13 @@ pub enum AwaError {
         expected: usize,
         found: usize,
     },
+    // ----- 型推論（Phase 2） -----
+    InfiniteType,          // occurs check 失敗: a = a -> b のような無限型
+    CannotUnify {
+        // 単一化失敗: 噛み合わない2つの型（Num と Bool など）
+        left: String,
+        right: String,
+    },
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -51,6 +58,10 @@ impl fmt::Display for AwaError {
                     "引数の個数が違います: {} 個必要ですが {} 個でした",
                     expected, found
                 )
+            }
+            AwaError::InfiniteType => write!(f, "型エラー: 無限型は作れません"),
+            AwaError::CannotUnify { left, right } => {
+                write!(f, "型エラー: {} と {} は一致しません", left, right)
             }
         }
     }

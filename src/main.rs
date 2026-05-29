@@ -7,6 +7,7 @@ mod eval;
 mod lexer;
 mod parser;
 mod token;
+mod types;
 mod value;
 
 use error::AwaError;
