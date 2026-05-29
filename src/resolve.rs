@@ -11,6 +11,16 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, ExprKind, Import, Pattern, Stmt, TypeExpr};
 use crate::error::{AwaError, LocatedError};
+use crate::span::Span;
+
+// 連結後の「グローバル座標」での各モジュールの開始位置（文字単位）。
+// モジュール i は [base, base + 文字数) を占める。エラー整形側が span からファイルを逆引きする。
+pub fn module_base(modules: &[LoadedModule], index: usize) -> usize {
+    modules[..index]
+        .iter()
+        .map(|m| m.source.chars().count() + 1) // +1 は境界の衝突回避
+        .sum()
+}
 
 // ローダが用意する、解決前の 1 モジュール。
 #[derive(Debug)]
@@ -48,7 +58,8 @@ pub fn resolve(modules: &[LoadedModule]) -> Result<Vec<Stmt>, LocatedError> {
     }
 
     let mut out = Vec::new();
-    for m in modules {
+    for (index, m) in modules.iter().enumerate() {
+        let base = module_base(modules, index);
         // import 修飾子 → (対象接頭辞, 対象公開名集合)。
         let mut imap: HashMap<String, (String, HashSet<String>)> = HashMap::new();
         for imp in &m.imports {
@@ -77,6 +88,7 @@ pub fn resolve(modules: &[LoadedModule]) -> Result<Vec<Stmt>, LocatedError> {
             }
         }
         let r = Resolver {
+            base,
             prefix: &m.prefix,
             topdefs: &topdefs,
             types: &types,
@@ -91,6 +103,7 @@ pub fn resolve(modules: &[LoadedModule]) -> Result<Vec<Stmt>, LocatedError> {
 }
 
 struct Resolver<'a> {
+    base: usize,                  // span をグローバル座標へずらす量（このモジュールの開始位置）
     prefix: &'a str,
     topdefs: &'a HashSet<String>, // 値 let 名
     types: &'a HashSet<String>,   // 型名
@@ -102,6 +115,11 @@ impl Resolver<'_> {
     // 自モジュールのトップレベル名に接頭辞を付ける。
     fn qualify(&self, name: &str) -> String {
         format!("{}{}", self.prefix, name)
+    }
+
+    // span をグローバル座標へずらす（エラー整形側がどのファイルかを逆引きできるように）。
+    fn at(&self, span: Span) -> Span {
+        Span::new(span.start + self.base, span.end + self.base)
     }
 
     // "alias.Name" を対象モジュールの完全修飾名へ。alias が import 済みなら公開検査も行う。
@@ -281,11 +299,11 @@ impl Resolver<'_> {
                         if let Some(qname) = self.resolve_qualified(q, method)? {
                             let callee = Expr {
                                 kind: ExprKind::Var(qname),
-                                span: recv.span,
+                                span: self.at(recv.span),
                             };
                             return Ok(Expr {
                                 kind: ExprKind::Call(Box::new(callee), self.exprs(args, locals)?),
-                                span: e.span,
+                                span: self.at(e.span),
                             });
                         }
                     }
@@ -304,7 +322,7 @@ impl Resolver<'_> {
                         if let Some(qname) = self.resolve_qualified(q, member)? {
                             return Ok(Expr {
                                 kind: ExprKind::Var(qname),
-                                span: e.span,
+                                span: self.at(e.span),
                             });
                         }
                     }
@@ -313,7 +331,7 @@ impl Resolver<'_> {
                 ExprKind::Field(Box::new(self.expr(recv, locals)?), member.clone())
             }
         };
-        Ok(Expr { kind, span: e.span })
+        Ok(Expr { kind, span: self.at(e.span) })
     }
 
     fn exprs(&self, args: &[Expr], locals: &HashSet<String>) -> Result<Vec<Expr>, LocatedError> {

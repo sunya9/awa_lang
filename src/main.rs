@@ -234,13 +234,27 @@ fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, String>
         .map_err(|e| format_error(&e, modules))
 }
 
-// エラー整形: モジュールが 1 つなら位置つきの report、複数なら（span が連結で曖昧なので）簡易表示。
+// エラー整形: 連結後の span がどのモジュールの座標かを逆引きし、そのファイルのソース＋
+// ローカル位置で報告する（複数モジュールでもファイル名つきで「行:列」とキャレットを出せる）。
 fn format_error(e: &LocatedError, modules: &[LoadedModule]) -> String {
-    if modules.len() == 1 {
-        report(e, &modules[0].source)
-    } else {
-        format!("error: {}", e.error)
+    let Some(span) = e.span else {
+        return format!("error: {}", e.error);
+    };
+    for (i, m) in modules.iter().enumerate() {
+        let base = resolve::module_base(modules, i);
+        let len = m.source.chars().count();
+        if span.start >= base && span.start <= base + len {
+            let local = span::Span::new(span.start - base, span.end.saturating_sub(base));
+            // 単一モジュールならファイル名は省略（従来の見た目）、複数ならパスを出す。
+            let filename = if modules.len() > 1 {
+                Some(m.path.join("/"))
+            } else {
+                None
+            };
+            return error::report_at(&e.error, Some(local), &m.source, filename.as_deref());
+        }
     }
+    format!("error: {}", e.error)
 }
 
 // 全モジュールを名前解決・型検査し、LLVM IR テキストへコンパイルする。
@@ -1286,6 +1300,24 @@ mod tests {
         );
         assert_eq!(out, "100\n16\n");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn module_エラー位置が元ファイルを指す() {
+        // import 先のモジュールで起きた型エラーが、そのファイル名・行・列で報告される。
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_mod_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("util.awa"), "pub let bad = fn(n: Int) -> Int { n + true }\n").unwrap();
+        std::fs::write(dir.join("main.awa"), "import util\nutil.bad(1)\n").unwrap();
+        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let err = check_program_modules(&modules).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        // ファイル名 util と該当ソース行＋キャレットが含まれること。
+        assert!(err.contains("util:1:"), "ファイル位置が出ていない: {}", err);
+        assert!(err.contains("n + true"), "ソース行が出ていない: {}", err);
+        assert!(err.contains('^'), "キャレットが出ていない: {}", err);
     }
 
     #[test]

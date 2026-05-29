@@ -162,8 +162,19 @@ impl From<AwaError> for LocatedError {
 
 // エラーを人間向けに整形する。span があれば「行:列」とソース該当行＋キャレットを付ける。
 pub fn report(err: &LocatedError, source: &str) -> String {
-    let Some(span) = err.span else {
-        return format!("error: {}", err.error);
+    report_at(&err.error, err.span, source, None)
+}
+
+// report の本体。エラー・位置・ソースを別々に受け取り、任意で `-->` 行にファイル名を出す。
+// モジュール対応で「連結後の span を元ファイルのローカル span に直して報告する」用途に使う。
+pub fn report_at(
+    error: &AwaError,
+    span: Option<Span>,
+    source: &str,
+    filename: Option<&str>,
+) -> String {
+    let Some(span) = span else {
+        return format!("error: {}", error);
     };
     // char オフセットから行・列を求める（行は 1 始まり、列も 1 始まり）。
     let mut line = 1usize;
@@ -184,8 +195,12 @@ pub fn report(err: &LocatedError, source: &str) -> String {
     // キャレット行: 列まで空白を詰めて span の長さ分 ^ を引く。
     let width = span.end.saturating_sub(span.start).max(1);
     let caret = format!("{}{}", " ".repeat(col - 1), "^".repeat(width));
+    let loc = match filename {
+        Some(f) => format!("{}:{}:{}", f, line, col),
+        None => format!("{}:{}", line, col),
+    };
     format!(
-        "error: {}\n --> {}:{}\n  |\n  | {}\n  | {}",
-        err.error, line, col, line_text, caret
+        "error: {}\n --> {}\n  |\n  | {}\n  | {}",
+        error, loc, line_text, caret
     )
 }
