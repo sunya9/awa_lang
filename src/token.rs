@@ -10,7 +10,9 @@ pub enum Token {
     Fn,            // キーワード fn
     Type,          // キーワード type（ADT 宣言）
     Case,          // キーワード case（パターンマッチ）
+    Impl,          // キーワード impl（メソッド定義）
     Comma,         // ,
+    Dot,           // .（メソッド呼び出し）
     Colon,         // :（型注釈）
     Pipe,          // |（or パターン）
     PipeArrow,     // |>（パイプ演算子）

@@ -45,6 +45,9 @@ pub enum AwaError {
     OrPatternBindings,
     // 型注釈が推論された型より一般的すぎる（実際に持っていない型を主張している）
     AnnotationTooGeneral { inferred: String, annotation: String },
+    // ----- メソッド（Phase 6） -----
+    UnknownMethod { ty: String, method: String }, // その型に該当メソッドが無い
+    MethodReceiverUnknown,                         // レシーバの型が未確定で解決できない
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -95,6 +98,13 @@ impl fmt::Display for AwaError {
                 f,
                 "型注釈が一般的すぎます: {} と注釈されていますが、実際の型は {} です",
                 annotation, inferred
+            ),
+            AwaError::UnknownMethod { ty, method } => {
+                write!(f, "型 {} にメソッド {} はありません", ty, method)
+            }
+            AwaError::MethodReceiverUnknown => write!(
+                f,
+                "レシーバの型が定まらずメソッドを解決できません（型注釈を付けてください）"
             ),
         }
     }

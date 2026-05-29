@@ -159,15 +159,29 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     i += 1;
                 }
             }
-            '0'..='9' | '.' => {
-                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            // 数値。整数部の数字を読み、`.` の直後が数字の時だけ小数部を読む
+            // （`5.method` は Num(5)・Dot・method に分かれる＝メソッド呼び出しと両立）。
+            '0'..='9' => {
+                while i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
+                }
+                if chars.get(i) == Some(&'.') && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
+                {
+                    i += 1; // '.'
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
                 }
                 let s: String = chars[start..i].iter().collect();
                 let n: f64 = s.parse().map_err(|_| {
                     LocatedError::at(AwaError::InvalidNumber(s.clone()), Span::new(start, i))
                 })?;
                 tokens.push(Spanned::new(Token::Num(n), Span::new(start, i)));
+            }
+            // 単独の '.' はメソッド呼び出しのドット（小数点は数値アームで処理済み）。
+            '.' => {
+                tokens.push(Spanned::new(Token::Dot, Span::new(start, start + 1)));
+                i += 1;
             }
             // 識別子: 英字または _ で始まり、英数字または _ が続く。
             // 予約語だけは専用トークンに振り分ける（残りは変数名）。
@@ -183,6 +197,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     "fn" => Token::Fn,
                     "type" => Token::Type,
                     "case" => Token::Case,
+                    "impl" => Token::Impl,
                     "true" => Token::Bool(true),
                     "false" => Token::Bool(false),
                     _ => Token::Ident(word),

@@ -334,6 +334,12 @@ fn check_stmts(stmts: &[Stmt], sigs: &mut Sigs) -> Result<(), LocatedError> {
         match stmt {
             Stmt::Type(def) => sigs.add(def),
             Stmt::Let(_, _, e) | Stmt::Expr(e) => check_expr(e, sigs)?,
+            // impl の各メソッド本体も case を含みうるので走査する。
+            Stmt::Impl(def) => {
+                for m in &def.methods {
+                    check_expr(&m.body, sigs)?;
+                }
+            }
         }
     }
     Ok(())
@@ -371,6 +377,13 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
                 check_expr(body, sigs)?;
             }
             check_case(arms, sigs, expr.span)
+        }
+        ExprKind::MethodCall(receiver, _, args) => {
+            check_expr(receiver, sigs)?;
+            for a in args {
+                check_expr(a, sigs)?;
+            }
+            Ok(())
         }
     }
 }

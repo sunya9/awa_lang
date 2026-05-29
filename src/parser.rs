@@ -1,4 +1,6 @@
-use crate::ast::{Expr, ExprKind, Pattern, Stmt, TypeDef, TypeExpr, Variant};
+use crate::ast::{
+    Expr, ExprKind, ImplBlock, Method, Pattern, Stmt, TypeDef, TypeExpr, Variant,
+};
 use crate::error::{AwaError, LocatedError};
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -11,7 +13,9 @@ fn is_upper(name: &str) -> bool {
 // ===== 構文解析（Parser）=====
 // 再帰下降パーサ。優先順位を文法の階層で表現する（上ほど緩い＝後で結合）。
 //   program    = (stmt terminator)* stmt?
-//   stmt       = 'let' Ident (':' typeexpr)? '=' expr | typedef | expr
+//   stmt       = 'let' Ident (':' typeexpr)? '=' expr | typedef | impl | expr
+//   impl       = 'impl' UIdent ('(' names ')')? '{' (method terminator)* method? '}'
+//   method     = 'fn' Ident '(' params? ')' ('->' typeexpr)? block
 //   typedef    = 'type' UIdent ('(' names ')')? '{' (variant terminator)* variant? '}'
 //   variant    = UIdent ('(' typeexpr (',' typeexpr)* ')')?
 //   typeexpr   = UIdent ('(' typeexpr,* ')')? | Ident | 'fn' '(' typeexpr,* ')' '->' typeexpr
@@ -22,7 +26,7 @@ fn is_upper(name: &str) -> bool {
 //   additive   = term      (('+' | '-') term)*
 //   term       = unary     (('*' | '/') unary)*
 //   unary      = '-' unary | call
-//   call       = factor ('(' args? ')')*
+//   call       = factor ('(' args? ')' | '.' Ident '(' args? ')')*
 //   args       = expr (',' expr)*
 //   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block | case
 //   case       = 'case' expr '{' (arm terminator)* arm? '}'
@@ -187,8 +191,96 @@ impl Parser {
                 Ok(Stmt::Let(name, annotation, value))
             }
             Some(Token::Type) => Ok(Stmt::Type(self.parse_type_def()?)),
+            Some(Token::Impl) => Ok(Stmt::Impl(self.parse_impl()?)),
             _ => Ok(Stmt::Expr(self.parse_expr()?)),
         }
+    }
+
+    // メソッド定義 impl Name(params)? { (method terminator)* }。
+    fn parse_impl(&mut self) -> Result<ImplBlock, LocatedError> {
+        self.next(); // 'impl' を消費
+        let type_name = self.expect_upper_ident()?;
+        let params = if self.peek() == Some(&Token::LParen) {
+            self.parse_name_list()?
+        } else {
+            Vec::new()
+        };
+        self.expect(Token::LBrace)?;
+        let mut methods = Vec::new();
+        self.skip_terminators();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(self.eof());
+            }
+            methods.push(self.parse_method()?);
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                Some(Token::RBrace) => break,
+                None => return Err(self.eof()),
+                Some(other) => {
+                    let other = other.clone();
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedToken(format!("{:?}", other)),
+                        self.span_here(),
+                    ));
+                }
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(ImplBlock {
+            type_name,
+            params,
+            methods,
+        })
+    }
+
+    // 1 メソッド: fn name(self, 引数: 型?, ...) -> 戻り型? { 本体 }。先頭引数が self。
+    fn parse_method(&mut self) -> Result<Method, LocatedError> {
+        self.expect(Token::Fn)?;
+        let name = match self.next() {
+            Some(Token::Ident(name)) => name,
+            Some(other) => return Err(self.unexpected(&other)),
+            None => return Err(self.eof()),
+        };
+        self.expect(Token::LParen)?;
+        let mut params = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                let pname = match self.next() {
+                    Some(Token::Ident(n)) => n,
+                    Some(other) => return Err(self.unexpected(&other)),
+                    None => return Err(self.eof()),
+                };
+                let annotation = if self.peek() == Some(&Token::Colon) {
+                    self.next(); // ':'
+                    Some(self.parse_type_expr()?)
+                } else {
+                    None
+                };
+                params.push((pname, annotation));
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.next();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect(Token::RParen)?;
+        let ret = if self.peek() == Some(&Token::Arrow) {
+            self.next(); // '->'
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        self.expect(Token::LBrace)?;
+        let body = self.parse_block()?;
+        Ok(Method {
+            name,
+            params,
+            ret,
+            body,
+        })
     }
 
     // 型宣言 type Name(params) { Variant(fields) ... }。
@@ -506,29 +598,56 @@ impl Parser {
     // f(1)(2) のような連鎖（高階関数の戻り値を即呼び出す）も自然に扱える。
     fn parse_call(&mut self) -> Result<Expr, LocatedError> {
         let mut expr = self.parse_factor()?;
-        while let Some(Token::LParen) = self.peek() {
-            self.next(); // '(' を消費
-            let mut args = Vec::new();
-            // 引数が無い呼び出し f() を許す。次が ')' でなければ引数列を読む。
-            if self.peek() != Some(&Token::RParen) {
-                loop {
-                    args.push(self.parse_expr()?);
-                    match self.peek() {
-                        Some(Token::Comma) => {
-                            self.next(); // ',' を消費して次の引数へ
-                        }
-                        _ => break,
-                    }
+        loop {
+            match self.peek() {
+                // 関数呼び出し f(...)。
+                Some(Token::LParen) => {
+                    self.next(); // '('
+                    let args = self.parse_arg_list()?;
+                    let span = Span::new(expr.span.start, self.last_span().end);
+                    expr = Expr {
+                        kind: ExprKind::Call(Box::new(expr), args),
+                        span,
+                    };
                 }
+                // メソッド呼び出し recv.method(...)。
+                Some(Token::Dot) => {
+                    self.next(); // '.'
+                    let method = match self.next() {
+                        Some(Token::Ident(name)) => name,
+                        Some(other) => return Err(self.unexpected(&other)),
+                        None => return Err(self.eof()),
+                    };
+                    self.expect(Token::LParen)?;
+                    let args = self.parse_arg_list()?;
+                    let span = Span::new(expr.span.start, self.last_span().end);
+                    expr = Expr {
+                        kind: ExprKind::MethodCall(Box::new(expr), method, args),
+                        span,
+                    };
+                }
+                _ => break,
             }
-            self.expect(Token::RParen)?;
-            let span = Span::new(expr.span.start, self.last_span().end);
-            expr = Expr {
-                kind: ExprKind::Call(Box::new(expr), args),
-                span,
-            };
         }
         Ok(expr)
+    }
+
+    // '(' の直後から引数列を読み ')' まで消費する。引数なし f() を許す。
+    fn parse_arg_list(&mut self) -> Result<Vec<Expr>, LocatedError> {
+        let mut args = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.next();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok(args)
     }
 
     fn parse_factor(&mut self) -> Result<Expr, LocatedError> {

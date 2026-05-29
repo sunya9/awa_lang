@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::ast::{Pattern, TExpr, TExprKind, TStmt, TypeDef};
+use crate::ast::{Pattern, TExpr, TExprKind, TMethod, TStmt, TypeDef};
 use crate::error::{AwaError, LocatedError};
 use crate::span::Span;
 use crate::token::Token;
@@ -166,6 +166,10 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
                         register_ctors(def, &mut block_env);
                         Value::Unit // 型宣言もブロック値に寄与しない
                     }
+                    TStmt::Impl(ms) => {
+                        register_methods(ms, &mut block_env);
+                        Value::Unit // impl もブロック値に寄与しない
+                    }
                     TStmt::Expr(e) => eval_expr(e, &block_env)?,
                 };
             }
@@ -217,6 +221,22 @@ fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)
         },
         // or パターン: いずれかの選択肢に当たればその束縛を返す（束縛の整合性は型検査で保証済み）。
         Pattern::Or(alts) => alts.iter().find_map(|alt| match_pattern(alt, value)),
+    }
+}
+
+// impl の各メソッドをマングル名（型頭#メソッド）のクロージャとして環境に登録する。
+// name を刻むので自己再帰メソッドは呼び出し時に自分自身を注入できる（let と同じ仕組み）。
+// メソッド呼び出しはチェッカが Call(Var(マングル名), [recv, ...]) へ lower 済みなので、
+// あとは通常の関数として呼ばれる。
+fn register_methods(methods: &[TMethod], env: &mut Env) {
+    for m in methods {
+        let closure = Closure {
+            params: m.params.clone(),
+            body: m.body.clone(),
+            env: env.clone(),
+            name: Some(m.mangled.clone()),
+        };
+        env.insert(m.mangled.clone(), Value::Func(Rc::new(closure)));
     }
 }
 
@@ -289,6 +309,8 @@ pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, Locate
             TStmt::Expr(expr) => results.push(eval_expr(expr, env)?),
             // 型宣言は構築子を登録するだけ。結果行は出さない。
             TStmt::Type(def) => register_ctors(def, env),
+            // impl はメソッドを登録するだけ。結果行は出さない。
+            TStmt::Impl(ms) => register_methods(ms, env),
         };
     }
     Ok(results)

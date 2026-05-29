@@ -42,7 +42,7 @@ fn run(
     // 表示用に各 Let/Expr 文の型を取り出す（Type 文は飛ばす）。
     let types = typed.iter().filter_map(|ts| match ts {
         TStmt::Let(_, te) | TStmt::Expr(te) => Some(te.ty.clone()),
-        TStmt::Type(_) => None,
+        TStmt::Type(_) | TStmt::Impl(_) => None,
     });
     Ok(values.into_iter().zip(types).collect())
 }
@@ -682,6 +682,74 @@ mod tests {
         assert_eq!(
             eval("let inc = fn(n) { n + 1 }; let double = fn(n) { n * 2 }; 1 |>\ninc |>\ndouble"),
             Ok(num(4.0))
+        );
+    }
+
+    // ===== 限定メソッド（Phase 6）=====
+
+    const OPT: &str = "type Opt(a) { Some(a); None }; \
+        impl Opt(a) { \
+          fn map(self, f) { case self { Some(x) -> Some(f(x)); None -> None } }; \
+          fn unwrap_or(self, d) { case self { Some(x) -> x; None -> d } } \
+        }; let inc = fn(n) { n + 1 }; ";
+
+    #[test]
+    fn example_methods() {
+        let src = include_str!("../examples/methods.awa");
+        let mut env = Env::new();
+        let mut checker = Checker::new();
+        let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(num(7.0)));
+    }
+
+    #[test]
+    fn メソッド呼び出しとチェーン() {
+        assert_eq!(eval(&format!("{OPT} Some(5).map(inc).unwrap_or(0)")), Ok(num(6.0)));
+        assert_eq!(eval(&format!("{OPT} None.map(inc).unwrap_or(99)")), Ok(num(99.0)));
+    }
+
+    #[test]
+    fn 組込型のメソッド() {
+        assert_eq!(
+            eval("impl Num { fn double(self) { self * 2 } }; 5.double()"),
+            Ok(num(10.0))
+        );
+    }
+
+    #[test]
+    fn 自己再帰メソッド() {
+        assert_eq!(
+            eval(
+                "type Tree(a) { Leaf(a); Branch(Tree(a), Tree(a)) }; \
+                 impl Tree(a) { fn size(self) { case self { Leaf(x) -> 1; Branch(l, r) -> l.size() + r.size() } } }; \
+                 Branch(Leaf(1), Branch(Leaf(2), Leaf(3))).size()"
+            ),
+            Ok(num(3.0))
+        );
+    }
+
+    #[test]
+    fn 未確定レシーバはエラー() {
+        // x の型が定まらないのでメソッドを解決できない。
+        assert_eq!(
+            eval("impl Num { fn double(self) { self * 2 } }; fn(x) { x.double() }"),
+            Err(AwaError::MethodReceiverUnknown)
+        );
+    }
+
+    #[test]
+    fn 引数注釈でレシーバが定まれば解決する() {
+        assert_eq!(
+            eval("impl Num { fn double(self) { self * 2 } }; let f = fn(x: Num) { x.double() }; f(5)"),
+            Ok(num(10.0))
+        );
+    }
+
+    #[test]
+    fn 未定義メソッドはエラー() {
+        assert_eq!(
+            eval(&format!("{OPT} Some(1).ghost()")),
+            Err(AwaError::UnknownMethod { ty: "Opt".to_string(), method: "ghost".to_string() })
         );
     }
 }

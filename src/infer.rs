@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, ExprKind, Pattern, Stmt, TExpr, TExprKind, TStmt, TypeDef, TypeExpr};
+use crate::ast::{
+    Expr, ExprKind, ImplBlock, Pattern, Stmt, TExpr, TExprKind, TMethod, TStmt, TypeDef, TypeExpr,
+};
 use crate::error::{AwaError, LocatedError};
 use crate::match_check::{Sigs, check_matches};
 use crate::span::Span;
@@ -10,6 +12,20 @@ use crate::types::{Scheme, Subst, Type, VarGen, apply, ftv, instantiate, render_
 // 型名 → 型パラメータの個数（arity）。型式の解決時に「Option(a) の引数個数が
 // 宣言と合うか」を検査するのに使う。3b の網羅性チェックで variant 一覧へ拡張予定。
 type Arities = HashMap<String, usize>;
+
+// メソッド表: (型頭名, メソッド名) → メソッドの関数型スキーム（self を第一引数に取る）。
+type MethodEnv = HashMap<(String, String), Scheme>;
+
+// 値の型から「型頭名」を取り出す（メソッド解決のキー）。関数型・型変数は名前を持たない。
+fn type_head(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Con(name, _) => Some(name.clone()),
+        Type::Num => Some("Num".to_string()),
+        Type::Bool => Some("Bool".to_string()),
+        Type::Unit => Some("Nil".to_string()),
+        Type::Fun(..) | Type::Var(_) => None,
+    }
+}
 
 // AwaError（種類）に span を添えて LocatedError にする小ヘルパ。
 // unify などの失敗を「その式の位置」で包むのに使う。
@@ -42,6 +58,8 @@ pub struct Checker {
     arities: Arities,
     // 網羅性チェック用の構築子シグネチャ（型名↔構築子↔arity）。REPL で行をまたいで持ち越す。
     sigs: Sigs,
+    // メソッド表（impl で登録）。REPL で行をまたいで持ち越す。
+    methods: MethodEnv,
 }
 
 impl Checker {
@@ -65,6 +83,7 @@ impl Checker {
                         &mut self.subst,
                         &mut self.vargen,
                         &self.arities,
+                        &self.methods,
                     )?;
                     typed.push(TStmt::Let(name.clone(), te));
                 }
@@ -75,6 +94,7 @@ impl Checker {
                         &mut self.subst,
                         &mut self.vargen,
                         &self.arities,
+                        &self.methods,
                     )?;
                     typed.push(TStmt::Expr(te));
                 }
@@ -89,6 +109,17 @@ impl Checker {
                     // 網羅性チェック用のシグネチャも積む（トップレベル型は持ち越す）。
                     self.sigs.add(def);
                     typed.push(TStmt::Type(def.clone()));
+                }
+                Stmt::Impl(def) => {
+                    let tmethods = register_impl(
+                        def,
+                        &self.env,
+                        &mut self.subst,
+                        &mut self.vargen,
+                        &self.arities,
+                        &mut self.methods,
+                    )?;
+                    typed.push(TStmt::Impl(tmethods));
                 }
             }
         }
@@ -142,6 +173,11 @@ fn resolve_tstmt(ts: &mut TStmt, subst: &Subst) {
     match ts {
         TStmt::Let(_, te) | TStmt::Expr(te) => resolve_texpr(te, subst),
         TStmt::Type(_) => {}
+        TStmt::Impl(methods) => {
+            for m in methods {
+                resolve_texpr(&mut m.body, subst);
+            }
+        }
     }
 }
 
@@ -182,6 +218,81 @@ fn register_type(
         env.insert(variant.name.clone(), scheme);
     }
     Ok(())
+}
+
+// impl ブロックを処理: 各メソッドを「self を第一引数に取る関数」として型検査し、
+// (型頭, メソッド名) のスキームをメソッド表に登録する。自己再帰メソッドのため、先に
+// 全メソッドの暫定シグネチャを登録してから本体を検査する（let-rec と同じ）。
+// 型付き TMethod（マングル名・引数名・本体）を返す。
+fn register_impl(
+    def: &ImplBlock,
+    env: &TypeEnv,
+    subst: &mut Subst,
+    vargen: &mut VarGen,
+    arities: &Arities,
+    methods: &mut MethodEnv,
+) -> Result<Vec<TMethod>, LocatedError> {
+    // self の型: 組込なら Num/Bool/Unit、ADT なら Con(name, fresh params)。
+    let param_vars: Vec<Type> = def.params.iter().map(|_| vargen.fresh()).collect();
+    let self_ty = resolve_con(&def.type_name, param_vars.clone(), arities)?;
+    let head = type_head(&self_ty).expect("impl 対象は型頭を持つ");
+    // 注釈の型変数を impl の型パラメータと共有させる土台（fn(a)->b の a が Option(a) の a）。
+    let param_map: HashMap<String, Type> = def
+        .params
+        .iter()
+        .cloned()
+        .zip(param_vars.iter().cloned())
+        .collect();
+
+    // (1) 暫定シグネチャ（self_ty を第一引数とする関数型）を先に全登録。
+    let mut sigs: Vec<(Vec<Type>, Type)> = Vec::with_capacity(def.methods.len());
+    for m in &def.methods {
+        let mut sig_vars = param_map.clone();
+        let mut param_tys = vec![self_ty.clone()]; // params[0] = self
+        for (_, ann) in m.params.iter().skip(1) {
+            let t = match ann {
+                Some(a) => resolve_annotation(a, &mut sig_vars, vargen, arities)?,
+                None => vargen.fresh(),
+            };
+            param_tys.push(t);
+        }
+        let ret = match &m.ret {
+            Some(a) => resolve_annotation(a, &mut sig_vars, vargen, arities)?,
+            None => vargen.fresh(),
+        };
+        methods.insert(
+            (head.clone(), m.name.clone()),
+            Scheme::mono(Type::Fun(param_tys.clone(), Box::new(ret.clone()))),
+        );
+        sigs.push((param_tys, ret));
+    }
+
+    // (2) 各本体を検査（self＋引数を環境に入れて）。本体内の自己メソッド呼び出しは
+    //     暫定スキームで解決される。
+    let mut tmethods = Vec::with_capacity(def.methods.len());
+    for (m, (param_tys, ret_ty)) in def.methods.iter().zip(sigs.iter()) {
+        let mut body_env = env.clone();
+        let mut param_names = Vec::with_capacity(m.params.len());
+        for ((pname, _), pty) in m.params.iter().zip(param_tys.iter()) {
+            body_env.insert(pname.clone(), Scheme::mono(pty.clone()));
+            param_names.push(pname.clone());
+        }
+        let body_t = infer_expr(&m.body, &body_env, subst, vargen, arities, &*methods)?;
+        at(unify(subst, &body_t.ty, ret_ty), m.body.span)?;
+        tmethods.push(TMethod {
+            mangled: format!("{}#{}", head, m.name),
+            params: param_names,
+            body: body_t,
+        });
+    }
+
+    // (3) 確定した型を generalize してメソッド表を上書き（多相メソッド: ∀a. fn(Option(a), ...)）。
+    for (m, (param_tys, ret_ty)) in def.methods.iter().zip(sigs.iter()) {
+        let fn_ty = Type::Fun(param_tys.clone(), Box::new(ret_ty.clone()));
+        let scheme = generalize(env, subst, &fn_ty);
+        methods.insert((head.clone(), m.name.clone()), scheme);
+    }
+    Ok(tmethods)
 }
 
 // 型構築子名（と解決済み引数）を意味論的な Type へ。組込型 Num/Bool/Nil と
@@ -337,10 +448,11 @@ fn infer_let(
     subst: &mut Subst,
     vargen: &mut VarGen,
     arities: &Arities,
+    methods: &MethodEnv,
 ) -> Result<TExpr, LocatedError> {
     let placeholder = vargen.fresh();
     env.insert(name.to_string(), Scheme::mono(placeholder.clone()));
-    let te = infer_expr(expr, env, subst, vargen, arities)?;
+    let te = infer_expr(expr, env, subst, vargen, arities, methods)?;
     let span = te.span;
     at(unify(subst, &placeholder, &te.ty), span)?;
     // 自分自身の単相 placeholder を環境から外してから一般化する。
@@ -384,6 +496,7 @@ fn infer_expr(
     subst: &mut Subst,
     vargen: &mut VarGen,
     arities: &Arities,
+    methods: &MethodEnv,
 ) -> Result<TExpr, LocatedError> {
     let span = expr.span;
     let (kind, ty) = match &expr.kind {
@@ -403,22 +516,22 @@ fn infer_expr(
         }
         // 単項マイナスはオペランドが Num、結果も Num。
         ExprKind::Neg(operand) => {
-            let t = infer_expr(operand, env, subst, vargen, arities)?;
+            let t = infer_expr(operand, env, subst, vargen, arities, methods)?;
             at(unify(subst, &t.ty, &Type::Num), span)?;
             (TExprKind::Neg(Box::new(t)), Type::Num)
         }
         ExprKind::BinOp(left, op, right) => {
-            let lt = infer_expr(left, env, subst, vargen, arities)?;
-            let rt = infer_expr(right, env, subst, vargen, arities)?;
+            let lt = infer_expr(left, env, subst, vargen, arities, methods)?;
+            let rt = infer_expr(right, env, subst, vargen, arities, methods)?;
             let ty = at(infer_binop(&lt.ty, op, &rt.ty, subst), span)?;
             (TExprKind::BinOp(Box::new(lt), op.clone(), Box::new(rt)), ty)
         }
         // if: 条件は Bool、両腕は同じ型でなければならない。結果はその腕の型。
         ExprKind::If(cond, then_branch, else_branch) => {
-            let ct = infer_expr(cond, env, subst, vargen, arities)?;
+            let ct = infer_expr(cond, env, subst, vargen, arities, methods)?;
             at(unify(subst, &ct.ty, &Type::Bool), ct.span)?;
-            let tt = infer_expr(then_branch, env, subst, vargen, arities)?;
-            let et = infer_expr(else_branch, env, subst, vargen, arities)?;
+            let tt = infer_expr(then_branch, env, subst, vargen, arities, methods)?;
+            let et = infer_expr(else_branch, env, subst, vargen, arities, methods)?;
             at(unify(subst, &tt.ty, &et.ty), et.span)?;
             let ty = apply(subst, &tt.ty);
             (TExprKind::If(Box::new(ct), Box::new(tt), Box::new(et)), ty)
@@ -441,7 +554,7 @@ fn infer_expr(
                 param_types.push(ty);
                 param_names.push(name.clone());
             }
-            let body_t = infer_expr(body, &body_env, subst, vargen, arities)?;
+            let body_t = infer_expr(body, &body_env, subst, vargen, arities, methods)?;
             if let Some(ann) = ret_annotation {
                 let ann_ty = at(resolve_annotation(ann, &mut sig_vars, vargen, arities), span)?;
                 at(unify(subst, &body_t.ty, &ann_ty), body_t.span)?;
@@ -454,10 +567,10 @@ fn infer_expr(
         // unify が「callee が関数か」「引数の個数と型が合うか」を一括で検査する。
         // 戻り型は fresh 型変数で置き、unify 後に確定したものを返す。
         ExprKind::Call(callee, args) => {
-            let callee_t = infer_expr(callee, env, subst, vargen, arities)?;
+            let callee_t = infer_expr(callee, env, subst, vargen, arities, methods)?;
             let mut targs = Vec::with_capacity(args.len());
             for a in args {
-                targs.push(infer_expr(a, env, subst, vargen, arities)?);
+                targs.push(infer_expr(a, env, subst, vargen, arities, methods)?);
             }
             let ret = vargen.fresh();
             let arg_types = targs.iter().map(|t| t.ty.clone()).collect();
@@ -469,12 +582,12 @@ fn infer_expr(
         // ブロックは新しいスコープ。親の型環境をクローンして始め、抜けると破棄する。
         ExprKind::Block(stmts) => {
             let mut block_env = env.clone();
-            let (tstmts, ty) = infer_stmts(stmts, &mut block_env, subst, vargen, arities)?;
+            let (tstmts, ty) = infer_stmts(stmts, &mut block_env, subst, vargen, arities, methods)?;
             (TExprKind::Block(tstmts), ty)
         }
         // パターンマッチ: 主語の型に各腕のパターン型を unify、全腕の本体型を互いに unify。
         ExprKind::Case(subject, arms) => {
-            let st = infer_expr(subject, env, subst, vargen, arities)?;
+            let st = infer_expr(subject, env, subst, vargen, arities, methods)?;
             let result = vargen.fresh();
             let mut tarms = Vec::with_capacity(arms.len());
             for (pattern, body) in arms {
@@ -487,12 +600,53 @@ fn infer_expr(
                 for (name, t) in bindings {
                     arm_env.insert(name, Scheme::mono(t));
                 }
-                let bty = infer_expr(body, &arm_env, subst, vargen, arities)?;
+                let bty = infer_expr(body, &arm_env, subst, vargen, arities, methods)?;
                 at(unify(subst, &bty.ty, &result), bty.span)?;
                 tarms.push((pattern.clone(), bty));
             }
             let ty = apply(subst, &result);
             (TExprKind::Case(Box::new(st), tarms), ty)
+        }
+        // メソッド呼び出し: レシーバの具体型でメソッドを静的に解決し、通常の関数適用
+        // Call(Var("型頭#メソッド"), [recv, ...args]) へ lower する。
+        ExprKind::MethodCall(receiver, method, args) => {
+            let recv = infer_expr(receiver, env, subst, vargen, arities, methods)?;
+            let recv_ty = apply(subst, &recv.ty);
+            // レシーバの型頭が定まらなければ解決不能（型注釈を促す）。
+            let head = type_head(&recv_ty)
+                .ok_or_else(|| LocatedError::at(AwaError::MethodReceiverUnknown, span))?;
+            let scheme = methods.get(&(head.clone(), method.clone())).ok_or_else(|| {
+                LocatedError::at(
+                    AwaError::UnknownMethod {
+                        ty: head.clone(),
+                        method: method.clone(),
+                    },
+                    span,
+                )
+            })?;
+            let method_ty = instantiate(scheme, vargen);
+            // 引数を推論。
+            let mut targs = Vec::with_capacity(args.len());
+            for a in args {
+                targs.push(infer_expr(a, env, subst, vargen, arities, methods)?);
+            }
+            // メソッド型を fn(レシーバ型, 引数型...) -> 新戻り型 と unify。
+            let ret = vargen.fresh();
+            let mut call_param_tys = vec![recv.ty.clone()];
+            call_param_tys.extend(targs.iter().map(|t| t.ty.clone()));
+            let expected = Type::Fun(call_param_tys, Box::new(ret.clone()));
+            at(unify(subst, &method_ty, &expected), span)?;
+            let result_ty = apply(subst, &ret);
+            // Call へ lower。callee はマングル名のグローバル関数 Var("型頭#メソッド")。
+            let mangled = format!("{}#{}", head, method);
+            let callee = TExpr {
+                ty: apply(subst, &method_ty),
+                span,
+                kind: TExprKind::Var(mangled),
+            };
+            let mut call_args = vec![recv];
+            call_args.extend(targs);
+            (TExprKind::Call(Box::new(callee), call_args), result_ty)
         }
     };
     Ok(TExpr {
@@ -574,14 +728,25 @@ fn infer_stmts(
     subst: &mut Subst,
     vargen: &mut VarGen,
     arities: &Arities,
+    methods: &MethodEnv,
 ) -> Result<(Vec<TStmt>, Type), LocatedError> {
     let mut local_arities = arities.clone();
+    let mut local_methods = methods.clone();
     let mut tstmts = Vec::with_capacity(stmts.len());
     let mut last = Type::Unit;
     for stmt in stmts {
         match stmt {
             Stmt::Let(name, annotation, expr) => {
-                let te = infer_let(name, annotation, expr, env, subst, vargen, &local_arities)?;
+                let te = infer_let(
+                    name,
+                    annotation,
+                    expr,
+                    env,
+                    subst,
+                    vargen,
+                    &local_arities,
+                    &local_methods,
+                )?;
                 tstmts.push(TStmt::Let(name.clone(), te));
                 last = Type::Unit; // let 文はブロック値に寄与しない
             }
@@ -590,8 +755,14 @@ fn infer_stmts(
                 tstmts.push(TStmt::Type(def.clone()));
                 last = Type::Unit; // 型宣言もブロック値に寄与しない
             }
+            Stmt::Impl(def) => {
+                let tmethods =
+                    register_impl(def, env, subst, vargen, &local_arities, &mut local_methods)?;
+                tstmts.push(TStmt::Impl(tmethods));
+                last = Type::Unit; // impl もブロック値に寄与しない
+            }
             Stmt::Expr(expr) => {
-                let te = infer_expr(expr, env, subst, vargen, &local_arities)?;
+                let te = infer_expr(expr, env, subst, vargen, &local_arities, &local_methods)?;
                 last = te.ty.clone();
                 tstmts.push(TStmt::Expr(te));
             }
@@ -644,7 +815,7 @@ mod tests {
                     .last()
                     .map(|ts| match ts {
                         TStmt::Let(_, te) | TStmt::Expr(te) => te.ty.clone(),
-                        TStmt::Type(_) => Type::Unit,
+                        TStmt::Type(_) | TStmt::Impl(_) => Type::Unit,
                     })
                     .unwrap_or(Type::Unit)
             })

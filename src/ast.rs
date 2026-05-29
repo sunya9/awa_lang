@@ -32,6 +32,9 @@ pub enum ExprKind {
     Block(Vec<Stmt>),
     // パターンマッチ case 主語 { パターン -> 本体; ... }。腕を上から試す。
     Case(Box<Expr>, Vec<(Pattern, Expr)>),
+    // メソッド呼び出し receiver.method(引数,...)。チェッカがレシーバの具体型で
+    // 解決し、型付き AST では通常の Call へ lower される（型付き側に MethodCall は無い）。
+    MethodCall(Box<Expr>, String, Vec<Expr>),
 }
 
 // ===== パターン（case の腕の左辺）=====
@@ -96,6 +99,16 @@ pub enum TStmt {
     Let(String, TExpr),
     Expr(TExpr),
     Type(TypeDef), // 型宣言は値を持たない（評価では構築子登録のみ）
+    // メソッド定義（elaboration 後）。eval は各メソッドをマングル名のクロージャとして登録する。
+    Impl(Vec<TMethod>),
+}
+
+// 型付きメソッド。mangled は "型頭#メソッド名"（eval の env キー＝ユーザーが書けない名前）。
+#[derive(Debug, Clone)]
+pub struct TMethod {
+    pub mangled: String,
+    pub params: Vec<String>, // 先頭が self
+    pub body: TExpr,
 }
 
 // 1 つの構築子（variant）。fields が空ならヌル構築子（None など）。
@@ -115,4 +128,23 @@ pub enum Stmt {
     Expr(Expr),
     // 型宣言。値は返さない（評価では構築子を環境に登録し、結果行は出さない）。
     Type(TypeDef),
+    // メソッド定義 impl Name(params) { fn ... }。値は返さない。
+    Impl(ImplBlock),
+}
+
+// impl ブロック。ある型にメソッド群を生やす。
+#[derive(Debug, Clone)]
+pub struct ImplBlock {
+    pub type_name: String,       // "Option" / "Num" など（メソッドを生やす型の頭）
+    pub params: Vec<String>,     // 型パラメータ（ADT なら ["a"]、組込なら空）
+    pub methods: Vec<Method>,
+}
+
+// 1 つのメソッド。params[0] がレシーバ（self）。
+#[derive(Debug, Clone)]
+pub struct Method {
+    pub name: String,
+    pub params: Vec<(String, Option<TypeExpr>)>, // 先頭が self（型注釈は通常省略）
+    pub ret: Option<TypeExpr>,
+    pub body: Expr,
 }
