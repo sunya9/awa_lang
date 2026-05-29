@@ -1736,6 +1736,34 @@ mod tests {
     }
 
     #[test]
+    fn socket_tcp_connectクライアントが往復する() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        // Rust 側のエコーサーバ（ephemeral port、1 接続だけ処理）。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf) {
+                    let _ = s.write_all(&buf[..n]);
+                }
+            }
+        });
+        // awa クライアント: connect → write → read → 受信内容を表示。
+        let src = format!(
+            "print(run(do {{ \
+               sock <- tcp_connect(\"127.0.0.1\", {port}); \
+               _ <- sock_write(sock, \"ping awa\"); \
+               reply <- sock_read(sock); \
+               pure(reply) }}))\n"
+        );
+        let out = compile_and_run(&src);
+        let _ = server.join();
+        assert_eq!(out, "ping awa\n");
+    }
+
+    #[test]
     fn file_async_がネイティブのスレッドプールで動く() {
         // read_file_async はワーカースレッドでブロッキング read し、完了を kqueue 経由で
         // メインループへ通知して Future を解決する。
