@@ -172,6 +172,7 @@ struct Module {
     ctors: HashMap<String, CtorInfo>,       // 構築子名 → 情報
     strings: String,                        // 文字列リテラルのグローバル定義
     str_ctr: usize,
+    drops: HashSet<String>,                 // 生成済み drop_fn 名（フィールド型レイアウトごと）
 }
 
 // トップレベル関数の定義（単相化で本体を特殊化するため本体も持つ）。
@@ -397,16 +398,16 @@ impl Gen {
 
     // 値の所有権を 1 増やす（owning convention の「変数を読む＝新たな所有参照を作る」）。
     // ヒープ型のみ対象。スカラ（Int/Bool 等）は何もしない。
-    // M2a は文字列のみ。ADT は M2b、クロージャ(env) は M2c で追加する。
+    // 文字列(M2a)・ADT(M2b) は ptr 直接。クロージャ(env) は M2c で追加する。
     fn retain(&mut self, val: &str, ty: &Type) {
-        if matches!(ty, Type::Str) {
+        if matches!(ty, Type::Str | Type::Con(..)) {
             self.line(&format!("call void @awa_retain(ptr {})", val));
         }
     }
 
     // 値の所有権を 1 減らす（スコープ脱出・値の破棄）。0 で解放。
     fn release(&mut self, val: &str, ty: &Type) {
-        if matches!(ty, Type::Str) {
+        if matches!(ty, Type::Str | Type::Con(..)) {
             self.line(&format!("call void @awa_release(ptr {})", val));
         }
     }
@@ -607,7 +608,7 @@ impl Gen {
             Ok(r)
         } else if let Some(ci) = m.ctors.get(name).cloned() {
             if ci.arity == 0 {
-                self.construct(&ci, &[]) // ヌル構築子
+                self.construct(&ci, &[], m) // ヌル構築子
             } else {
                 unsupported(format!("構築子を値として使う: {}", name))
             }
@@ -773,7 +774,7 @@ impl Gen {
     }
 
     // 構築子ブロックを malloc して tag と各フィールドを格納し、その ptr を返す。
-    fn construct(&mut self, ci: &CtorInfo, fields: &[(String, Type)]) -> Result<String> {
+    fn construct(&mut self, ci: &CtorInfo, fields: &[(String, Type)], m: &mut Module) -> Result<String> {
         let field_tys: Vec<Type> = fields.iter().map(|(_, t)| t.clone()).collect();
         let bty = block_ty(&field_tys)?;
         let szp = format!("%t{}", self.fresh());
@@ -782,8 +783,14 @@ impl Gen {
         self.line(&format!("{} = ptrtoint ptr {} to i64", sz, szp));
         let p = format!("%t{}", self.fresh());
         self.line(&format!("{} = call ptr @malloc(i64 {})", p, sz));
-        // RC ヘッダを初期化（rc=1、drop_fn は M2 で実装するので当面 null）。
+        // RC ヘッダを初期化（rc=1、drop=null）。
         self.init_header(&p)?;
+        // ヒープ型フィールドがあれば drop_fn をヘッダ(offset 8)に設定。
+        if let Some(dropname) = ensure_drop_fn(m, &field_tys)? {
+            let dp = format!("%t{}", self.fresh());
+            self.line(&format!("{} = getelementptr i8, ptr {}, i64 8", dp, p));
+            self.line(&format!("store ptr @{}, ptr {}", dropname, dp));
+        }
         let tp = format!("%t{}", self.fresh());
         self.line(&format!(
             "{} = getelementptr {}, ptr {}, i32 0, i32 2",
@@ -822,7 +829,7 @@ impl Gen {
                     let v = self.expr(a, m)?;
                     fields.push((v, a.ty.clone()));
                 }
-                return self.construct(&ci, &fields);
+                return self.construct(&ci, &fields, m);
             }
         }
         // callee がトップレベル関数名なら直接呼び出し（env=null）。具体型で特殊化（単相化）。
@@ -999,6 +1006,46 @@ impl Gen {
         ));
         Ok(c1)
     }
+}
+
+// 構築子ブロックの drop_fn を生成（メモ化）。ヒープ型フィールドを release してから戻る。
+// release（フリー）自体は awa_release が行うので、drop_fn の役目は「子の参照を1つ減らす」こと。
+// ヒープ型フィールドが無ければ None（ヘッダの drop は null のまま＝解放するだけ）。
+// キーはフィールド型のレイアウト（同一レイアウトの別構築子は drop_fn を共有）。
+fn ensure_drop_fn(m: &mut Module, field_tys: &[Type]) -> Result<Option<String>> {
+    let has_heap = field_tys
+        .iter()
+        .any(|t| matches!(t, Type::Str | Type::Con(..) | Type::Fun(..)));
+    if !has_heap {
+        return Ok(None);
+    }
+    let key: String = field_tys.iter().map(mangle_ty).collect::<Vec<_>>().join("_");
+    let name = format!("drop${}", key);
+    if m.drops.contains(&name) {
+        return Ok(Some(name));
+    }
+    m.drops.insert(name.clone());
+    let bty = block_ty(field_tys)?;
+    let mut g = Gen::new();
+    for (i, fty) in field_tys.iter().enumerate() {
+        if !matches!(fty, Type::Str | Type::Con(..) | Type::Fun(..)) {
+            continue;
+        }
+        let fp = format!("%t{}", g.fresh());
+        g.line(&format!(
+            "{} = getelementptr {}, ptr %o, i32 0, i32 {}",
+            fp,
+            bty,
+            i + 3
+        ));
+        let fv = format!("%t{}", g.fresh());
+        g.line(&format!("{} = load {}, ptr {}", fv, llvm_ty(fty)?, fp));
+        g.release(&fv, fty);
+    }
+    g.line("ret void");
+    m.funcs
+        .push_str(&format!("define void @{}(ptr %o) {{\n{}}}\n\n", name, g.out));
+    Ok(Some(name))
 }
 
 // 1 つの関数定義を生成して module.funcs に追記する。
@@ -1193,6 +1240,7 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
         ctors,
         strings: String::new(),
         str_ctr: 0,
+        drops: HashSet::new(),
     };
 
     // 単相なトップレベル関数だけを @name で先に出力する。

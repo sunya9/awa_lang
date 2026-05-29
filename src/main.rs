@@ -980,6 +980,31 @@ mod tests {
     }
 
     #[test]
+    fn gc_再帰adtがリークしない() {
+        // List(Int) を構築して畳み込み、drop_fn の連鎖解放で残存数が 0 になること。
+        let (out, code) = compile_run_status(
+            "type List(a) { Cons(a, List(a)); Nil }\n\
+             let sum = fn(xs: List(Int)) -> Int { case xs { Nil -> 0; Cons(h, t) -> h + sum(t) } }\n\
+             sum(Cons(1, Cons(2, Cons(3, Nil))))",
+        );
+        assert_eq!(out, "6\n");
+        assert_eq!(code, 0, "ADT がリークしている（残存ヒープ数 {}）", code);
+    }
+
+    #[test]
+    fn gc_文字列フィールドを持つadtがリークしない() {
+        // Some(String) の case：取り出した文字列は生存し、Some ブロックの drop が中身を解放。
+        let (out, code) = compile_run_status(
+            "type Opt(a) { Some(a); None }\n\
+             let get = fn(o: Opt(String), d: String) -> String { case o { Some(s) -> s; None -> d } }\n\
+             get(Some(\"hi\" <> \"!\"), \"def\")\n\
+             get(None, \"fallback\")",
+        );
+        assert_eq!(out, "hi!\nfallback\n");
+        assert_eq!(code, 0, "文字列フィールド付き ADT がリークしている（残存 {}）", code);
+    }
+
+    #[test]
     fn codegen_再帰factがネイティブ実行される() {
         let out = compile_and_run(
             "let fact = fn(n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)",
