@@ -141,6 +141,7 @@ impl Checker {
         self.env.insert("read_file".to_string(), mono(vec![Type::Str], Type::Str));
         self.env.insert("write_file".to_string(), mono(vec![Type::Str, Type::Str], Type::Unit));
         self.env.insert("now".to_string(), mono(vec![], Type::Int));
+        self.env.insert("string_to_int".to_string(), mono(vec![Type::Str], Type::Int));
 
         // OS 連携（ソケット非同期）。Socket は組込型（fd ハンドル、arity 0）。native ビルド専用。
         self.arities.insert("Socket".to_string(), 0);

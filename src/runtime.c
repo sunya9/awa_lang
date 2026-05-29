@@ -77,6 +77,8 @@ long long awa_now(void) {
   clock_gettime(CLOCK_REALTIME, &ts);
   return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+// 文字列 → 整数（非数値は 0）。
+long long awa_string_to_int(void* strobj) { return atoll((char*)strobj + 16); }
 
 // ===== 非同期イベントループ =====
 typedef long long Word;

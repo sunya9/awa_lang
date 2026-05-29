@@ -621,6 +621,18 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
                 .unwrap_or(0);
             return Ok(Value::Int(ms));
         }
+        "string_to_int" => {
+            if let Some(Value::Str(s)) = args.into_iter().next() {
+                // 非数値は 0（C の atoll と揃える）。先頭の数値部だけを読む。
+                let t = s.trim();
+                let n = t.parse::<i64>().unwrap_or_else(|_| {
+                    let end = t.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(t.len());
+                    t[..end].parse::<i64>().unwrap_or(0)
+                });
+                return Ok(Value::Int(n));
+            }
+            unreachable!("string_to_int の引数は String");
+        }
         // ファイル擬似非同期: インタプリタでは同期読み込みして即解決 Future を返す
         //（native はスレッドプールで本当に非同期）。
         "read_file_async" => {
@@ -678,6 +690,7 @@ pub fn builtins_env() -> Env {
         "read_file",
         "write_file",
         "now",
+        "string_to_int",
         // OS 連携（ソケット非同期）。native ビルド専用（インタプリタは明示エラー）。
         "tcp_listen",
         "sock_port",

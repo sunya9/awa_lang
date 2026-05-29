@@ -435,6 +435,13 @@ mod tests {
     }
 
     #[test]
+    fn io_string_to_int() {
+        assert_eq!(eval("string_to_int(\"42\")"), Ok(Value::Int(42)));
+        assert_eq!(eval("string_to_int(\"-7\")"), Ok(Value::Int(-7)));
+        assert_eq!(eval("string_to_int(\"abc\")"), Ok(Value::Int(0))); // 非数値は 0
+    }
+
+    #[test]
     fn io_nowは正のintを返す() {
         match eval("now()") {
             Ok(Value::Int(n)) => assert!(n > 0, "now() は正のはず: {}", n),
