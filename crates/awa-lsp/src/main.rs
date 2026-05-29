@@ -5,16 +5,18 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 
-use awa_core::query::{completions, definition_at, type_at};
+use awa_core::query::{
+    Member, MemberKind, completions, definition_at, module_members, module_qualifier_path, type_at,
+};
 use awa_core::span::{line_col_to_offset, offset_to_line_col};
-use awa_core::{check_document, check_source, fmt, span::Span};
+use awa_core::{check_document, check_source, fmt, resolve_module_source, span::Span};
 use lsp_server::{Connection, Message, Notification, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics};
 use lsp_types::{
-    CompletionItem, CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
-    DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, Location, MarkedString, OneOf, Position,
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    Documentation, DocumentFormattingParams, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, Location, MarkedString, OneOf, Position,
     PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextEdit, Url,
 };
@@ -140,8 +142,17 @@ fn handle_completion(docs: &HashMap<Url, String>, params: Value) -> Value {
         return Value::Null;
     };
     let pos = p.text_document_position.position;
-    // カーソル行が `import ...` なら、import 可能なモジュール名を提案する。
-    // そうでなければ通常の補完（キーワード/組込/トップレベル名）。
+    // カーソル直前のテキスト（現在行の先頭〜カーソル）。
+    let line = text.lines().nth(pos.line as usize).unwrap_or("");
+    let prefix: String = line.chars().take(pos.character as usize).collect();
+
+    // 1) `module.` の文脈なら、そのモジュールのメンバーだけを（ドキュメント付きで）提案。
+    if let Some(qual) = member_access_qualifier(&prefix) {
+        let items = module_member_items(uri, text, &qual);
+        return serde_json::to_value(CompletionResponse::Array(items)).unwrap_or(Value::Null);
+    }
+
+    // 2) import 行ならモジュール名。3) それ以外は通常補完。
     let labels = if is_import_line(text, pos.line) {
         import_completions(uri)
     } else {
@@ -155,6 +166,61 @@ fn handle_completion(docs: &HashMap<Url, String>, params: Value) -> Value {
         })
         .collect();
     serde_json::to_value(CompletionResponse::Array(items)).unwrap_or(Value::Null)
+}
+
+// 行プレフィックスが `<ident>.<部分>` で終わるなら、その修飾子 ident を返す。
+fn member_access_qualifier(prefix: &str) -> Option<String> {
+    let chars: Vec<char> = prefix.chars().collect();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = chars.len();
+    while i > 0 && is_word(chars[i - 1]) {
+        i -= 1; // 入力中の部分メンバーを飛ばす
+    }
+    if i == 0 || chars[i - 1] != '.' {
+        return None;
+    }
+    i -= 1; // ドットを飛ばす
+    let end = i;
+    while i > 0 && is_word(chars[i - 1]) {
+        i -= 1;
+    }
+    if i == end {
+        return None; // ドットの前に識別子が無い（メソッドチェーン等）
+    }
+    Some(chars[i..end].iter().collect())
+}
+
+// 修飾子がインポート済みモジュールなら、その公開メンバーを CompletionItem 化（ドキュメント付き）。
+// モジュールでなければ空（メンバーアクセス文脈ではグローバル補完に落とさない）。
+fn module_member_items(uri: &Url, text: &str, qualifier: &str) -> Vec<CompletionItem> {
+    let Some(segs) = module_qualifier_path(text, qualifier) else {
+        return vec![];
+    };
+    let root = uri
+        .to_file_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // stdlib=None＝焼き込み std を使う。
+    let Some(src) = resolve_module_source(&root, None, &segs) else {
+        return vec![];
+    };
+    module_members(&src).into_iter().map(member_item).collect()
+}
+
+fn member_item(m: Member) -> CompletionItem {
+    let kind = match m.kind {
+        MemberKind::Value => CompletionItemKind::FUNCTION,
+        MemberKind::Type => CompletionItemKind::CLASS,
+        MemberKind::Constructor => CompletionItemKind::CONSTRUCTOR,
+    };
+    CompletionItem {
+        label: m.label,
+        kind: Some(kind),
+        detail: m.detail,
+        documentation: m.doc.map(Documentation::String),
+        ..Default::default()
+    }
 }
 
 // 指定行（0 始まり）が import 文か（先頭の空白を除いて "import" で始まる）。
@@ -311,6 +377,30 @@ mod tests {
         let comp = import_completions(&uri());
         assert!(comp.iter().any(|c| c == "std/io"));
         assert!(comp.iter().any(|c| c == "std/list"));
+    }
+
+    #[test]
+    fn ピリオド後はモジュールのメンバーのみ補完() {
+        // `option.` の文脈では std/option（焼き込み）のメンバーだけ＋ドキュメント。
+        assert_eq!(member_access_qualifier("  option."), Some("option".to_string()));
+        assert_eq!(member_access_qualifier("  option.unw"), Some("option".to_string()));
+        assert_eq!(member_access_qualifier("let x = 1"), None);
+        assert_eq!(member_access_qualifier("foo().bar"), None); // メソッドチェーンは対象外
+
+        let text = "import std/option\noption.\n";
+        let items = module_member_items(&uri(), text, "option");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Some"));
+        assert!(labels.contains(&"None"));
+        assert!(labels.contains(&"map"));
+        assert!(labels.contains(&"unwrap_or"));
+        // flatMap は impl メソッド（receiver.method）なので module. では出ない。
+        assert!(!labels.contains(&"flatMap"));
+        // ドキュメント or detail が付く。
+        let map_item = items.iter().find(|i| i.label == "map").unwrap();
+        assert!(map_item.documentation.is_some() || map_item.detail.is_some());
+        // 未インポートの修飾子は空。
+        assert!(module_member_items(&uri(), text, "list").is_empty());
     }
 
     #[test]

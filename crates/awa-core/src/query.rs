@@ -3,11 +3,167 @@
 // 型検査（check_program）の型付き AST と、字句のトークン列を使う。
 use crate::ast::{Stmt, TExpr, TExprKind, TStmt};
 use crate::infer::Checker;
-use crate::lexer::tokenize;
+use crate::lexer::{tokenize, tokenize_with_comments};
 use crate::parser::Parser;
 use crate::span::Span;
 use crate::token::Token;
 use crate::types::{Type, render_type};
+
+// モジュールの公開メンバー（module.X でアクセスできるもの）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberKind {
+    Value,
+    Type,
+    Constructor,
+}
+
+#[derive(Debug, Clone)]
+pub struct Member {
+    pub label: String,
+    pub kind: MemberKind,
+    pub detail: Option<String>, // シグネチャ（型注釈や構築子フィールド）
+    pub doc: Option<String>,    // 直前の // コメント（ドキュメント）
+}
+
+// 文書内の import から、修飾子（別名 or 末尾セグメント）に対応するモジュールパスを引く。
+// 例: `import std/option` があるとき "option" -> ["std","option"]。
+// 編集中の文書はカーソル位置で構文的に不完全なことが多いので、全体をパースせず
+// トークン列を走査して import 文だけを拾う（lex は通る前提）。
+pub fn module_qualifier_path(src: &str, qualifier: &str) -> Option<Vec<String>> {
+    let tokens = tokenize(src).ok()?;
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].node != Token::Import {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        // seg (/ seg)*
+        let mut path = vec![];
+        while let Some(Token::Ident(s)) = tokens.get(i).map(|t| &t.node) {
+            path.push(s.clone());
+            i += 1;
+            if tokens.get(i).map(|t| &t.node) == Some(&Token::Slash) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        // 任意の `as alias`
+        let mut alias = None;
+        if tokens.get(i).map(|t| &t.node) == Some(&Token::As) {
+            i += 1;
+            if let Some(Token::Ident(a)) = tokens.get(i).map(|t| &t.node) {
+                alias = Some(a.clone());
+                i += 1;
+            }
+        }
+        let qual = alias.as_deref().or_else(|| path.last().map(|s| s.as_str()));
+        if qual == Some(qualifier) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn line_starts(src: &str) -> Vec<usize> {
+    let mut v = vec![0];
+    for (i, c) in src.chars().enumerate() {
+        if c == '\n' {
+            v.push(i + 1);
+        }
+    }
+    v
+}
+
+// モジュールソースから、module.X でアクセスできる公開メンバーを集める。
+// pub let（値）、pub type（型名）、pub 型の構築子。各メンバーに直前の行コメントを添える。
+// メソッド（impl）は receiver.method で呼ぶもので module.method ではないため含めない。
+pub fn module_members(src: &str) -> Vec<Member> {
+    let Ok((tokens, mut comments)) = tokenize_with_comments(src) else {
+        return vec![];
+    };
+    let Ok(module) = Parser::new(tokens).parse_module() else {
+        return vec![];
+    };
+    comments.sort_by_key(|c| c.span.start);
+    let chars: Vec<char> = src.chars().collect();
+    let starts = line_starts(src);
+    let line_of = |off: usize| starts.partition_point(|&s| s <= off);
+    let slice = |sp: Span| {
+        chars[sp.start.min(chars.len())..sp.end.min(chars.len())]
+            .iter()
+            .collect::<String>()
+    };
+    // 定義の開始行のすぐ上から連続する行コメントをドキュメントとして集める。
+    let doc_above = |start: usize| -> Option<String> {
+        let target = line_of(start) as i64;
+        let mut lines: Vec<String> = vec![];
+        let mut ln = target - 1;
+        while ln >= 1 {
+            match comments
+                .iter()
+                .find(|c| !c.block && line_of(c.span.start) as i64 == ln)
+            {
+                Some(c) => {
+                    lines.push(c.text.trim_start_matches('/').trim().to_string());
+                    ln -= 1;
+                }
+                None => break,
+            }
+        }
+        if lines.is_empty() {
+            None
+        } else {
+            lines.reverse();
+            Some(lines.join("\n"))
+        }
+    };
+
+    let mut out = vec![];
+    for s in &module.stmts {
+        match s {
+            Stmt::Let(name, ann, e) if module.exports.contains(name) => {
+                out.push(Member {
+                    label: name.clone(),
+                    kind: MemberKind::Value,
+                    detail: ann.as_ref().map(|a| slice(a.span)),
+                    doc: doc_above(e.span.start),
+                });
+            }
+            Stmt::Type(def) if module.exports.contains(&def.name) => {
+                let params = if def.params.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", def.params.join(", "))
+                };
+                out.push(Member {
+                    label: def.name.clone(),
+                    kind: MemberKind::Type,
+                    detail: Some(format!("type {}{}", def.name, params)),
+                    doc: doc_above(def.span.start),
+                });
+                // pub 型はその構築子も公開される。
+                for v in &def.variants {
+                    let sig = if v.fields.is_empty() {
+                        v.name.clone()
+                    } else {
+                        let fs: Vec<String> = v.fields.iter().map(|f| slice(f.span)).collect();
+                        format!("{}({})", v.name, fs.join(", "))
+                    };
+                    out.push(Member {
+                        label: v.name.clone(),
+                        kind: MemberKind::Constructor,
+                        detail: Some(sig),
+                        doc: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 // オフセット位置にある識別子（名前とその span）。トークン列から探す。
 pub fn ident_at(source: &str, offset: usize) -> Option<(String, Span)> {
@@ -151,6 +307,42 @@ pub fn completions(source: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::span::line_col_to_offset;
+
+    #[test]
+    fn module_members_は公開メンバーとドキュメントを集める() {
+        let src = "// オプション型\n\
+                   pub type Option(a) { Some(a); None }\n\
+                   // 中身に関数適用\n\
+                   pub let map: fn(Option(a), fn(a) -> b) -> Option(b) = fn(o, f) { o }\n\
+                   let hidden = 1\n";
+        let ms = module_members(src);
+        let names: Vec<&str> = ms.iter().map(|m| m.label.as_str()).collect();
+        assert!(names.contains(&"Option")); // pub 型
+        assert!(names.contains(&"Some")); // 構築子
+        assert!(names.contains(&"None"));
+        assert!(names.contains(&"map")); // pub 値
+        assert!(!names.contains(&"hidden")); // 非 pub は出ない
+        let map_m = ms.iter().find(|m| m.label == "map").unwrap();
+        assert_eq!(map_m.doc.as_deref(), Some("中身に関数適用"));
+        assert!(map_m.detail.as_deref().unwrap().contains("Option(a)"));
+        let some_m = ms.iter().find(|m| m.label == "Some").unwrap();
+        assert_eq!(some_m.kind, MemberKind::Constructor);
+        assert_eq!(some_m.detail.as_deref(), Some("Some(a)"));
+    }
+
+    #[test]
+    fn module_qualifier_path_を引く() {
+        let src = "import std/option\nimport std/list as l\n0\n";
+        assert_eq!(
+            module_qualifier_path(src, "option"),
+            Some(vec!["std".to_string(), "option".to_string()])
+        );
+        assert_eq!(
+            module_qualifier_path(src, "l"),
+            Some(vec!["std".to_string(), "list".to_string()])
+        );
+        assert_eq!(module_qualifier_path(src, "nope"), None);
+    }
 
     #[test]
     fn type_at_変数() {

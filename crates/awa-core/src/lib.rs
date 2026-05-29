@@ -90,6 +90,29 @@ pub fn load_program(
     load_program_with_overrides(root, stdlib, entry_path, &HashMap::new())
 }
 
+// 1 モジュールのソースだけを解決して返す（LSP の補完がモジュールのメンバーを引くのに使う）。
+// 解決規則は load_module と同じ: std は焼き込み（ディスクがあれば優先）、他は root 相対。
+pub fn resolve_module_source(
+    root: &Path,
+    stdlib: Option<&Path>,
+    segs: &[String],
+) -> Option<String> {
+    let is_std = segs.first().map(|s| s.as_str()) == Some("std");
+    let mut path = match (is_std, stdlib) {
+        (true, Some(s)) => s.to_path_buf(),
+        _ => root.to_path_buf(),
+    };
+    for s in segs {
+        path.push(s);
+    }
+    path.set_extension("awa");
+    match std::fs::read_to_string(&path) {
+        Ok(disk) => Some(disk),
+        Err(_) if is_std => stdlib::embedded_source(segs).map(str::to_string),
+        Err(_) => None,
+    }
+}
+
 // load_program と同じだが、モジュールキー（"seg/seg"）→ソースの上書きを受け取る。
 // LSP がディスク未保存のバッファ内容で検査するために使う（該当モジュールはディスクを読まない）。
 pub fn load_program_with_overrides(
