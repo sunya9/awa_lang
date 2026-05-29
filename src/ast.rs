@@ -38,6 +38,9 @@ pub enum ExprKind {
     // メソッド呼び出し receiver.method(引数,...)。チェッカがレシーバの具体型で
     // 解決し、型付き AST では通常の Call へ lower される（型付き側に MethodCall は無い）。
     MethodCall(Box<Expr>, String, Vec<Expr>),
+    // 修飾アクセス receiver.member（括弧なし）。モジュール名前解決でのみ意味を持ち、
+    // resolve が Var("mod.member") へ潰す（型付き AST には現れない）。単一ファイルでは無効。
+    Field(Box<Expr>, String),
 }
 
 // ===== パターン（case の腕の左辺）=====
@@ -139,16 +142,20 @@ pub enum Stmt {
     Impl(ImplBlock),
 }
 
-// import 文。`import app/util` → path = ["app","util"]。修飾子は末尾セグメント（"util"）。
+// import 文。`import app/util` → path = ["app","util"]。`import app/util as u` で別名。
 #[derive(Debug, Clone)]
 pub struct Import {
     pub path: Vec<String>,
+    pub alias: Option<String>,
 }
 
 impl Import {
-    // モジュールを参照するときの修飾子（`util.double` の "util"）。
+    // モジュールを参照するときの修飾子。別名があればそれ、無ければ末尾セグメント（"util"）。
     pub fn qualifier(&self) -> &str {
-        self.path.last().map(|s| s.as_str()).unwrap_or("")
+        self.alias
+            .as_deref()
+            .or_else(|| self.path.last().map(|s| s.as_str()))
+            .unwrap_or("")
     }
 }
 

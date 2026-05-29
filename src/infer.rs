@@ -740,6 +740,15 @@ fn infer_expr(
             call_args.extend(targs);
             (TExprKind::Call(Box::new(callee), call_args), result_ty)
         }
+        // 修飾アクセス `x.member`（括弧なし）。モジュール解決で潰されているはずなので、
+        // ここに残っているのは未 import のモジュール参照か、レコードの無い単一ファイル＝エラー。
+        ExprKind::Field(receiver, member) => {
+            let qual = match &receiver.kind {
+                ExprKind::Var(q) => q.clone(),
+                _ => member.clone(),
+            };
+            return Err(LocatedError::at(AwaError::UnknownModule(qual), span));
+        }
     };
     Ok(TExpr {
         ty,

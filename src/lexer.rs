@@ -269,6 +269,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     "do" => Token::Do,
                     "import" => Token::Import,
                     "pub" => Token::Pub,
+                    "as" => Token::As,
                     "true" => Token::Bool(true),
                     "false" => Token::Bool(false),
                     _ => Token::Ident(word),

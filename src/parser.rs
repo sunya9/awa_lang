@@ -204,7 +204,18 @@ impl Parser {
                 break;
             }
         }
-        Ok(Import { path })
+        // 任意の別名 `as u`。
+        let alias = if self.peek() == Some(&Token::As) {
+            self.next(); // 'as'
+            match self.next() {
+                Some(Token::Ident(a)) => Some(a),
+                Some(other) => return Err(self.unexpected(&other)),
+                None => return Err(self.eof()),
+            }
+        } else {
+            None
+        };
+        Ok(Import { path, alias })
     }
 
     // ブロック { 文; ...; 式 }。'{' は呼び出し側が消費済みとして '}' まで読む。
@@ -707,31 +718,30 @@ impl Parser {
                         span,
                     };
                 }
-                // メソッド呼び出し recv.method(...)。
-                // 例外: `recv.Ctor`（大文字・括弧なし）は修飾されたヌル構築子 util.None として
-                // 引数なしの MethodCall にする（リネームパスが Var("util.None") へ展開）。
+                // `recv.member(...)`（括弧あり）= メソッド呼び出し／修飾呼び出し。
+                // `recv.member`（括弧なし）= 修飾アクセス Field（値参照・ヌル構築子）。
                 Some(Token::Dot) => {
                     self.next(); // '.'
-                    let method = match self.next() {
+                    let member = match self.next() {
                         Some(Token::Ident(name)) => name,
                         Some(other) => return Err(self.unexpected(&other)),
                         None => return Err(self.eof()),
                     };
-                    let args = if self.peek() == Some(&Token::LParen) {
-                        self.next(); // '('
-                        self.parse_arg_list()?
-                    } else if is_upper(&method) {
-                        Vec::new() // 括弧なしの大文字 = ヌル構築子 util.None
-                    } else {
-                        // 小文字メソッドは括弧必須（修飾された値参照は M-mod-3）。
-                        self.expect(Token::LParen)?;
-                        self.parse_arg_list()?
-                    };
                     let span = Span::new(expr.span.start, self.last_span().end);
-                    expr = Expr {
-                        kind: ExprKind::MethodCall(Box::new(expr), method, args),
-                        span,
-                    };
+                    if self.peek() == Some(&Token::LParen) {
+                        self.next(); // '('
+                        let args = self.parse_arg_list()?;
+                        let span = Span::new(expr.span.start, self.last_span().end);
+                        expr = Expr {
+                            kind: ExprKind::MethodCall(Box::new(expr), member, args),
+                            span,
+                        };
+                    } else {
+                        expr = Expr {
+                            kind: ExprKind::Field(Box::new(expr), member),
+                            span,
+                        };
+                    }
                 }
                 _ => break,
             }

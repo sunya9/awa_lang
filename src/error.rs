@@ -56,6 +56,7 @@ pub enum AwaError {
     Unsupported(String), // codegen がまだ対応していない構造/型
     // ----- モジュール（Phase 10） -----
     NotExported { module: String, name: String }, // 参照先がそのモジュールで pub 公開されていない
+    UnknownModule(String),                        // 修飾アクセスの左がモジュールでない（未 import 等）
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -126,6 +127,9 @@ impl fmt::Display for AwaError {
             }
             AwaError::NotExported { module, name } => {
                 write!(f, "{} は {} で公開されていません（pub を付けてください）", name, module)
+            }
+            AwaError::UnknownModule(name) => {
+                write!(f, "モジュールではありません（未 import の可能性）: {}", name)
             }
         }
     }

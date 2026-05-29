@@ -395,5 +395,6 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
             }
             Ok(())
         }
+        ExprKind::Field(receiver, _) => check_expr(receiver, sigs),
     }
 }

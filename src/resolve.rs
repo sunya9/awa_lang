@@ -12,11 +12,6 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{Expr, ExprKind, Import, Pattern, Stmt, TypeExpr};
 use crate::error::{AwaError, LocatedError};
 
-// 先頭大文字なら型／構築子（parser と同じ規約）。
-fn is_upper(name: &str) -> bool {
-    name.chars().next().is_some_and(|c| c.is_uppercase())
-}
-
 // ローダが用意する、解決前の 1 モジュール。
 #[derive(Debug)]
 pub struct LoadedModule {
@@ -274,26 +269,17 @@ impl Resolver<'_> {
                 }
                 ExprKind::Case(subj, out)
             }
-            // メソッド呼び出し。レシーバが import 修飾子なら修飾名での参照/呼び出しへ展開。
+            // `mod.f(args)`（括弧あり）。レシーバが import 修飾子なら修飾名での呼び出しへ展開。
             ExprKind::MethodCall(recv, method, args) => {
                 if let ExprKind::Var(q) = &recv.kind {
                     if !locals.contains(q) {
                         if let Some(qname) = self.resolve_qualified(q, method)? {
-                            let args = self.exprs(args, locals)?;
-                            // 大文字・引数なし = 修飾されたヌル構築子 → 値参照 Var。
-                            if args.is_empty() && is_upper(method) {
-                                return Ok(Expr {
-                                    kind: ExprKind::Var(qname),
-                                    span: e.span,
-                                });
-                            }
-                            // それ以外は通常の呼び出し（関数 or 構築子適用）。
                             let callee = Expr {
                                 kind: ExprKind::Var(qname),
                                 span: recv.span,
                             };
                             return Ok(Expr {
-                                kind: ExprKind::Call(Box::new(callee), args),
+                                kind: ExprKind::Call(Box::new(callee), self.exprs(args, locals)?),
                                 span: e.span,
                             });
                         }
@@ -304,6 +290,22 @@ impl Resolver<'_> {
                     method.clone(),
                     self.exprs(args, locals)?,
                 )
+            }
+            // `mod.member`（括弧なし）= 修飾アクセス。モジュール参照なら Var("mod.member") へ。
+            // 値関数の参照（`util.double` を値として渡す）と修飾ヌル構築子（`util.None`）の両方を担う。
+            ExprKind::Field(recv, member) => {
+                if let ExprKind::Var(q) = &recv.kind {
+                    if !locals.contains(q) {
+                        if let Some(qname) = self.resolve_qualified(q, member)? {
+                            return Ok(Expr {
+                                kind: ExprKind::Var(qname),
+                                span: e.span,
+                            });
+                        }
+                    }
+                }
+                // モジュール参照でない（= 未 import 等）。型検査側で UnknownModule になる。
+                ExprKind::Field(Box::new(self.expr(recv, locals)?), member.clone())
             }
         };
         Ok(Expr { kind, span: e.span })

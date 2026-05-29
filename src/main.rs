@@ -1197,6 +1197,39 @@ mod tests {
     }
 
     #[test]
+    fn module_import別名で参照できる() {
+        let (out, code) = compile_modules_status(
+            &[
+                ("util.awa", "pub let double = fn(n: Int) -> Int { n * 2 }\n"),
+                ("main.awa", "import util as u\nu.double(21)\n"),
+            ],
+            "main",
+        );
+        assert_eq!(out, "42\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn module_修飾値参照を高階とpipeで使える() {
+        // util.double を「値として」高階関数へ渡し、pipe の右辺にも置く。
+        let (out, code) = compile_modules_status(
+            &[
+                ("util.awa", "pub let double = fn(n: Int) -> Int { n * 2 }\n"),
+                (
+                    "main.awa",
+                    "import util\n\
+                     let apply = fn(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\n\
+                     apply(util.double, 21)\n\
+                     10 |> util.double\n",
+                ),
+            ],
+            "main",
+        );
+        assert_eq!(out, "42\n20\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn module_循環importはエラー() {
         let id = std::process::id() as u64 * 1_000_000
             + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);

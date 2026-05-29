@@ -17,6 +17,7 @@ pub enum Token {
     Do,            // キーワード do（モナド糖衣）
     Import,        // キーワード import（モジュール取り込み）
     Pub,           // キーワード pub（公開修飾子）
+    As,            // キーワード as（import の別名）
     Comma,         // ,
     Dot,           // .（メソッド呼び出し）
     Colon,         // :（型注釈）
