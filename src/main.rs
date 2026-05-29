@@ -15,6 +15,7 @@ use error::AwaError;
 use eval::eval_program;
 use infer::Checker;
 use parser::Parser;
+use types::{Type, render_type};
 use value::{Env, Value};
 
 // ===== パイプライン =====
@@ -23,12 +24,15 @@ use value::{Env, Value};
 // 実行前に捕まり、eval には well-typed なプログラムだけが進む。
 // env / checker をともに借用で受け取るので、ファイル実行（使い捨て）も
 // REPL（行をまたいで持ち越す）もこの 1 つの関数で賄える。
-fn run(source: &str, env: &mut Env, checker: &mut Checker) -> Result<Vec<Value>, AwaError> {
+// 各文の (値, 型) を順に返す。check_program と eval_program はどちらも 1 文につき
+// 1 要素を同順で返すので zip して対応づけられる。
+fn run(source: &str, env: &mut Env, checker: &mut Checker) -> Result<Vec<(Value, Type)>, AwaError> {
     let tokens = lexer::tokenize(source)?;
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program()?;
-    checker.check_program(&program)?;
-    eval_program(&program, env)
+    let types = checker.check_program(&program)?;
+    let values = eval_program(&program, env)?;
+    Ok(values.into_iter().zip(types).collect())
 }
 
 // ===== ファイル実行 =====
@@ -45,9 +49,9 @@ fn run_file(path: &str) {
     let mut env: Env = HashMap::new();
     let mut checker = Checker::new();
     match run(&source, &mut env, &mut checker) {
-        Ok(values) => {
-            for v in values {
-                println!("{}", v);
+        Ok(rows) => {
+            for (v, t) in rows {
+                println!("{} : {}", v, render_type(&t));
             }
         }
         Err(e) => {
@@ -75,9 +79,9 @@ fn repl() -> std::io::Result<()> {
             break; // EOF
         }
         match run(&line, &mut env, &mut checker) {
-            Ok(values) => {
-                for v in values {
-                    println!("{}", v);
+            Ok(rows) => {
+                for (v, t) in rows {
+                    println!("{} : {}", v, render_type(&t));
                 }
             }
             Err(e) => eprintln!("エラー: {}", e),
@@ -108,7 +112,17 @@ mod tests {
     fn eval(src: &str) -> Result<Value, AwaError> {
         let mut env = Env::new();
         let mut checker = Checker::new();
-        run(src, &mut env, &mut checker).map(|values| values.last().cloned().unwrap_or(Value::Unit))
+        run(src, &mut env, &mut checker)
+            .map(|rows| rows.last().map(|(v, _)| v.clone()).unwrap_or(Value::Unit))
+    }
+
+    // 値だけを取り出すヘルパ（run は (値, 型) を返すようになったため）。
+    fn run_values(
+        src: &str,
+        env: &mut Env,
+        checker: &mut Checker,
+    ) -> Result<Vec<Value>, AwaError> {
+        run(src, env, checker).map(|rows| rows.into_iter().map(|(v, _)| v).collect())
     }
 
     fn num(n: f64) -> Value {
@@ -184,8 +198,8 @@ mod tests {
         let mut env = Env::new();
         let mut checker = Checker::new();
         // 型環境も checker に持ち越されるので、2 行目の x も型検査を通る。
-        assert_eq!(run("let x = 10", &mut env, &mut checker), Ok(vec![Value::Num(10.0)]));
-        assert_eq!(run("x + 5", &mut env, &mut checker), Ok(vec![Value::Num(15.0)]));
+        assert_eq!(run_values("let x = 10", &mut env, &mut checker), Ok(vec![Value::Num(10.0)]));
+        assert_eq!(run_values("x + 5", &mut env, &mut checker), Ok(vec![Value::Num(15.0)]));
     }
 
     #[test]
@@ -257,7 +271,7 @@ mod tests {
         let mut env = Env::new();
         let mut checker = Checker::new();
         assert_eq!(
-            run("let x = 5\nx + 1", &mut env, &mut checker),
+            run_values("let x = 5\nx + 1", &mut env, &mut checker),
             Ok(vec![Value::Num(5.0), Value::Num(6.0)])
         );
     }
@@ -318,5 +332,19 @@ mod tests {
     #[test]
     fn 括弧内は改行を無視して複数行に書ける() {
         assert_eq!(eval("let add = fn(a, b) { a + b }; add(\n1,\n2\n)"), Ok(num(3.0)));
+    }
+
+    // ===== examples/ をテストとして実行する =====
+    // include_str! でコンパイル時に埋め込むので、例が壊れるとビルド時の
+    // テストで気づける（例とテストを二重管理しない）。
+
+    #[test]
+    fn example_polymorphism() {
+        let src = include_str!("../examples/polymorphism.awa");
+        let mut env = Env::new();
+        let mut checker = Checker::new();
+        let rows = run(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        // 末尾は fact(6) = 720 : Num。
+        assert_eq!(rows.last().map(|(v, _)| v.clone()), Some(num(720.0)));
     }
 }

@@ -48,6 +48,41 @@ impl fmt::Display for Type {
     }
 }
 
+// 型を人間向けに表示する文字列にする。Display と違い、型変数を「出現順に a, b, c...」
+// へ振り直して読みやすくする（内部 ID は飛び飛びなので表示用に正規化）。
+// 多相な型もそのまま fn(a) -> a のように出す（Gleam 風に ∀ は付けない）。
+pub fn render_type(ty: &Type) -> String {
+    fn go(ty: &Type, names: &mut HashMap<u32, char>, next: &mut u8, out: &mut String) {
+        match ty {
+            Type::Num => out.push_str("Num"),
+            Type::Bool => out.push_str("Bool"),
+            Type::Unit => out.push_str("Nil"),
+            Type::Fun(params, ret) => {
+                out.push_str("fn(");
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    go(p, names, next, out);
+                }
+                out.push_str(") -> ");
+                go(ret, names, next, out);
+            }
+            Type::Var(id) => {
+                let c = *names.entry(*id).or_insert_with(|| {
+                    let c = (b'a' + *next % 26) as char;
+                    *next += 1;
+                    c
+                });
+                out.push(c);
+            }
+        }
+    }
+    let mut out = String::new();
+    go(ty, &mut HashMap::new(), &mut 0, &mut out);
+    out
+}
+
 // ===== 置換（Substitution）=====
 // 「型変数 ID → 確定した型」の対応表。推論が進むと埋まっていく。
 // これが型推論の状態の本体。
