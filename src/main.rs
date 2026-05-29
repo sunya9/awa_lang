@@ -970,6 +970,20 @@ mod tests {
     }
 
     #[test]
+    fn codegen_クロージャと高階関数() {
+        // make_adder のキャプチャ（malloc env）と apply_twice の間接呼び出しが native 実行される。
+        let out = compile_and_run(
+            "let make_adder = fn(n: Int) { fn(x: Int) -> Int { x + n } }; \
+             let add5 = make_adder(5); \
+             add5(10)\n\
+             let inc = fn(n: Int) -> Int { n + 1 }; \
+             let twice = fn(f: fn(Int) -> Int, x: Int) -> Int { f(f(x)) }; \
+             twice(inc, 0)",
+        );
+        assert_eq!(out, "15\n2\n");
+    }
+
+    #[test]
     fn example_native() {
         let src = include_str!("../examples/native.awa");
         let out = compile_and_run(src);

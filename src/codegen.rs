@@ -1,111 +1,110 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{TExpr, TExprKind, TStmt};
 use crate::error::AwaError;
 use crate::token::Token;
 use crate::types::Type;
 
-// ===== LLVM コード生成（バックエンド・マイルストーン1）=====
-// 型付き AST から LLVM IR テキスト(.ll)を生成する。clang file.ll -o exe でネイティブ化。
-// 対応サブセット: Int(i64)/Bool(i1)、算術・比較・if・let・トップレベル非キャプチャ関数・
-// 呼び出し・再帰。未対応の構造/型に当たったら AwaError::Unsupported を返す（誤コンパイルしない）。
+// ===== LLVM コード生成（バックエンド・マイルストーン2: クロージャ）=====
+// 型付き AST → LLVM IR テキスト(.ll)。clang file.ll -o exe でネイティブ化。
 //
-// SSA は alloca＋load/store で組み（phi 回避）、各基本ブロックは out へ順次 append する。
+// 値表現: Int/Long=i64、Float=double、Bool=i1、関数=クロージャ構造体 { ptr fn, ptr env }。
+// クロージャ変換: すべての関数は第一引数に env ポインタを取り、本体冒頭でキャプチャ変数を
+// env から load する。トップレベル関数はキャプチャなし（env=null・直接呼び出し）。ネスト lambda は
+// 外側スコープの変数を malloc した env に詰めて捕獲する（解放しない＝v1 はリーク許容）。
+// 未対応（ADT/String/case 等）は AwaError::Unsupported を返す（誤コンパイルしない）。
 
 type Result<T> = std::result::Result<T, AwaError>;
+const CLOSURE_TY: &str = "{ ptr, ptr }";
 
 fn unsupported<T>(what: impl Into<String>) -> Result<T> {
     Err(AwaError::Unsupported(what.into()))
 }
 
-// awa の型 → LLVM 型。Int/Long=i64、Float=double、Bool=i1。
-fn llvm_ty(ty: &Type) -> Result<&'static str> {
+// awa の型 → LLVM 型。関数型はクロージャ構造体。
+fn llvm_ty(ty: &Type) -> Result<String> {
     match ty {
-        Type::Int | Type::Long => Ok("i64"),
-        Type::Float => Ok("double"),
-        Type::Bool => Ok("i1"),
+        Type::Int | Type::Long => Ok("i64".into()),
+        Type::Float => Ok("double".into()),
+        Type::Bool => Ok("i1".into()),
+        Type::Fun(..) => Ok(CLOSURE_TY.into()),
         other => unsupported(format!("型 {}", other)),
     }
 }
 
-// 浮動小数か（命令選択用）。
 fn is_float(ty: &Type) -> bool {
     matches!(ty, Type::Float)
 }
 
-// トップレベル関数のシグネチャ。
-struct FnSig {
-    params: Vec<Type>,
-    ret: Type,
+// env 構造体の LLVM 型文字列（キャプチャ型の並び）。
+fn env_struct_ty(caps: &[(String, Type)]) -> Result<String> {
+    let tys: Vec<String> = caps.iter().map(|(_, t)| llvm_ty(t)).collect::<Result<_>>()?;
+    Ok(format!("{{ {} }}", tys.join(", ")))
 }
 
-// 1 関数本体の生成状態。
-struct Gen<'a> {
-    out: String,                              // 命令を溜める
-    reg: usize,                               // レジスタ/ラベルの採番
-    locals: HashMap<String, (String, Type)>, // 変数名 → (alloca の ptr レジスタ, 型)
-    funcs: &'a HashMap<String, FnSig>,        // 呼び出せるトップレベル関数
+// ===== モジュール全体の状態 =====
+struct Module {
+    funcs: String,                          // 全関数定義
+    fn_ctr: usize,                          // 匿名関数 @fnN の採番
+    globals: HashMap<String, (Vec<Type>, Type)>, // トップレベル関数名 → (引数型, 戻り型)
 }
 
-impl<'a> Gen<'a> {
-    fn new(funcs: &'a HashMap<String, FnSig>) -> Self {
+impl Module {
+    fn fresh_fn(&mut self) -> String {
+        let n = self.fn_ctr;
+        self.fn_ctr += 1;
+        format!("fn{}", n)
+    }
+}
+
+// ===== 1 関数本体の生成状態 =====
+struct Gen {
+    out: String,
+    reg: usize,
+    scope: HashMap<String, (String, Type)>, // 変数名 → (alloca ptr, 型)
+}
+
+impl Gen {
+    fn new() -> Self {
         Gen {
             out: String::new(),
             reg: 0,
-            locals: HashMap::new(),
-            funcs,
+            scope: HashMap::new(),
         }
     }
-
     fn fresh(&mut self) -> usize {
         let n = self.reg;
         self.reg += 1;
         n
     }
-
     fn line(&mut self, s: &str) {
         self.out.push_str("  ");
         self.out.push_str(s);
         self.out.push('\n');
     }
-
     fn label(&mut self, l: &str) {
         self.out.push_str(l);
         self.out.push_str(":\n");
     }
-
-    // ローカル変数を alloca して値を格納し、名前を登録する。
     fn bind_local(&mut self, name: &str, operand: &str, ty: &Type) -> Result<()> {
         let llty = llvm_ty(ty)?;
         let slot = format!("%v{}", self.fresh());
         self.line(&format!("{} = alloca {}", slot, llty));
         self.line(&format!("store {} {}, ptr {}", llty, operand, slot));
-        self.locals.insert(name.to_string(), (slot, ty.clone()));
+        self.scope.insert(name.to_string(), (slot, ty.clone()));
         Ok(())
     }
 
-    // 式をコンパイルし、結果の LLVM オペランド（即値 or レジスタ）を返す。
-    fn expr(&mut self, e: &TExpr) -> Result<String> {
+    // 式 → LLVM オペランド。
+    fn expr(&mut self, e: &TExpr, m: &mut Module) -> Result<String> {
         match &e.kind {
             TExprKind::Int(n) | TExprKind::Long(n) => Ok(n.to_string()),
-            // LLVM の double リテラルはビットパターンの 16 進で出すのが確実。
             TExprKind::Float(n) => Ok(format!("0x{:016X}", n.to_bits())),
             TExprKind::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
-            TExprKind::Var(name) => {
-                if let Some((slot, ty)) = self.locals.get(name).cloned() {
-                    let llty = llvm_ty(&ty)?;
-                    let r = format!("%t{}", self.fresh());
-                    self.line(&format!("{} = load {}, ptr {}", r, llty, slot));
-                    Ok(r)
-                } else if self.funcs.contains_key(name) {
-                    unsupported(format!("関数を値として使う: {}", name))
-                } else {
-                    // params 以外の自由変数（クロージャのキャプチャ）。
-                    unsupported(format!("自由変数（キャプチャ）: {}", name))
-                }
-            }
+            TExprKind::Str(_) => unsupported("型 String"),
+            TExprKind::Var(name) => self.var(name, m),
             TExprKind::Neg(x) => {
-                let v = self.expr(x)?;
+                let v = self.expr(x, m)?;
                 let r = format!("%t{}", self.fresh());
                 if is_float(&x.ty) {
                     self.line(&format!("{} = fneg double {}", r, v));
@@ -114,35 +113,57 @@ impl<'a> Gen<'a> {
                 }
                 Ok(r)
             }
-            TExprKind::BinOp(l, op, r) => self.binop(l, op, r),
-            TExprKind::If(c, t, e) => self.if_expr(c, t, e),
-            TExprKind::Call(callee, args) => self.call(callee, args),
-            TExprKind::Block(stmts) => self.block(stmts),
-            TExprKind::Str(_) => unsupported("型 String"),
-            TExprKind::Lambda(..) => unsupported("ネストした関数/クロージャ"),
+            TExprKind::BinOp(l, op, r) => self.binop(l, op, r, m),
+            TExprKind::If(c, t, e2) => self.if_expr(c, t, e2, m),
+            TExprKind::Call(callee, args) => self.call(callee, args, m),
+            TExprKind::Block(stmts) => self.block(stmts, m),
+            TExprKind::Lambda(params, body) => self.lambda(params, body, &e.ty, m),
             TExprKind::Case(..) => unsupported("case（パターンマッチ）"),
         }
     }
 
-    fn binop(&mut self, l: &TExpr, op: &Token, r: &TExpr) -> Result<String> {
-        let lv = self.expr(l)?;
-        let rv = self.expr(r)?;
-        let llty = llvm_ty(&l.ty)?; // l と r は同型（型検査済み）
+    // 変数参照: ローカル/キャプチャ（scope の alloca）→ load、トップレベル関数 → クロージャ値 {@name, null}。
+    fn var(&mut self, name: &str, m: &Module) -> Result<String> {
+        if let Some((slot, ty)) = self.scope.get(name).cloned() {
+            let llty = llvm_ty(&ty)?;
+            let r = format!("%t{}", self.fresh());
+            self.line(&format!("{} = load {}, ptr {}", r, llty, slot));
+            Ok(r)
+        } else if m.globals.contains_key(name) {
+            // トップレベル関数を値として使う → クロージャ {@name, null}。
+            let c0 = format!("%t{}", self.fresh());
+            self.line(&format!(
+                "{} = insertvalue {} undef, ptr @{}, 0",
+                c0, CLOSURE_TY, name
+            ));
+            let c1 = format!("%t{}", self.fresh());
+            self.line(&format!(
+                "{} = insertvalue {} {}, ptr null, 1",
+                c1, CLOSURE_TY, c0
+            ));
+            Ok(c1)
+        } else {
+            unsupported(format!("捕獲できない変数: {}（トップレベル値の参照は未対応）", name))
+        }
+    }
+
+    fn binop(&mut self, l: &TExpr, op: &Token, r: &TExpr, m: &mut Module) -> Result<String> {
+        let lv = self.expr(l, m)?;
+        let rv = self.expr(r, m)?;
+        let llty = llvm_ty(&l.ty)?;
         let float = is_float(&l.ty);
-        let r_reg = format!("%t{}", self.fresh());
-        // 算術: 整数は add/sub/mul/sdiv、浮動小数は fadd/fsub/fmul/fdiv。
+        let reg = format!("%t{}", self.fresh());
         let arith = match op {
             Token::Plus => Some(if float { "fadd" } else { "add" }),
             Token::Minus => Some(if float { "fsub" } else { "sub" }),
             Token::Star => Some(if float { "fmul" } else { "mul" }),
-            Token::Slash => Some(if float { "fdiv" } else { "sdiv" }), // 整数 0 除算は v1 未チェック(UB)
+            Token::Slash => Some(if float { "fdiv" } else { "sdiv" }),
             _ => None,
         };
         if let Some(instr) = arith {
-            self.line(&format!("{} = {} {} {}, {}", r_reg, instr, llty, lv, rv));
-            return Ok(r_reg);
+            self.line(&format!("{} = {} {} {}, {}", reg, instr, llty, lv, rv));
+            return Ok(reg);
         }
-        // 比較: 整数/Bool は icmp、浮動小数は fcmp（ordered）。
         let pred = match (op, float) {
             (Token::Lt, false) => "icmp slt",
             (Token::Gt, false) => "icmp sgt",
@@ -159,191 +180,374 @@ impl<'a> Gen<'a> {
             (Token::Concat, _) => return unsupported("文字列連結 <>"),
             (other, _) => unreachable!("二項演算子でないトークン: {:?}", other),
         };
-        self.line(&format!("{} = {} {} {}, {}", r_reg, pred, llty, lv, rv));
-        Ok(r_reg)
+        self.line(&format!("{} = {} {} {}, {}", reg, pred, llty, lv, rv));
+        Ok(reg)
     }
 
-    fn if_expr(&mut self, c: &TExpr, t: &TExpr, e: &TExpr) -> Result<String> {
+    fn if_expr(&mut self, c: &TExpr, t: &TExpr, e: &TExpr, m: &mut Module) -> Result<String> {
         let res_ty = llvm_ty(&t.ty)?;
-        // 結果スロットを先に確保。
         let slot = format!("%v{}", self.fresh());
         self.line(&format!("{} = alloca {}", slot, res_ty));
-        let cond = self.expr(c)?;
+        let cond = self.expr(c, m)?;
         let id = self.fresh();
-        let (then_l, else_l, merge_l) =
-            (format!("then{id}"), format!("else{id}"), format!("merge{id}"));
-        self.line(&format!(
-            "br i1 {}, label %{}, label %{}",
-            cond, then_l, else_l
-        ));
-        // then
-        self.label(&then_l);
-        let tv = self.expr(t)?;
+        let (tl, el, ml) = (format!("then{id}"), format!("else{id}"), format!("merge{id}"));
+        self.line(&format!("br i1 {}, label %{}, label %{}", cond, tl, el));
+        self.label(&tl);
+        let tv = self.expr(t, m)?;
         self.line(&format!("store {} {}, ptr {}", res_ty, tv, slot));
-        self.line(&format!("br label %{}", merge_l));
-        // else
-        self.label(&else_l);
-        let ev = self.expr(e)?;
+        self.line(&format!("br label %{}", ml));
+        self.label(&el);
+        let ev = self.expr(e, m)?;
         self.line(&format!("store {} {}, ptr {}", res_ty, ev, slot));
-        self.line(&format!("br label %{}", merge_l));
-        // merge
-        self.label(&merge_l);
+        self.line(&format!("br label %{}", ml));
+        self.label(&ml);
         let r = format!("%t{}", self.fresh());
         self.line(&format!("{} = load {}, ptr {}", r, res_ty, slot));
         Ok(r)
     }
 
-    fn call(&mut self, callee: &TExpr, args: &[TExpr]) -> Result<String> {
-        // callee はトップレベル関数名でなければならない（値としての関数は未対応）。
-        let TExprKind::Var(name) = &callee.kind else {
-            return unsupported("間接呼び出し（関数値）");
-        };
-        let Some(sig) = self.funcs.get(name) else {
-            return unsupported(format!("ローカル関数の呼び出し: {}", name));
-        };
-        if sig.params.len() != args.len() {
-            return unsupported("引数個数不一致");
+    fn call(&mut self, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
+        // 引数の型と値。
+        let mut arg_parts = Vec::with_capacity(args.len());
+        // callee がトップレベル関数名なら直接呼び出し（env=null）。
+        if let TExprKind::Var(name) = &callee.kind {
+            if let Some((params, ret)) = m.globals.get(name).cloned() {
+                let ret_ll = llvm_ty(&ret)?;
+                for (a, pty) in args.iter().zip(params.iter()) {
+                    let v = self.expr(a, m)?;
+                    arg_parts.push(format!("{} {}", llvm_ty(pty)?, v));
+                }
+                let r = format!("%t{}", self.fresh());
+                let mut call_args = vec!["ptr null".to_string()];
+                call_args.extend(arg_parts);
+                self.line(&format!(
+                    "{} = call {} @{}({})",
+                    r,
+                    ret_ll,
+                    name,
+                    call_args.join(", ")
+                ));
+                return Ok(r);
+            }
         }
-        let ret = llvm_ty(&sig.ret)?.to_string();
-        // 引数を評価（先に型文字列を作ってから可変借用を解く）。
-        let param_tys: Vec<String> = sig
-            .params
-            .iter()
-            .map(|t| llvm_ty(t).map(|s| s.to_string()))
-            .collect::<Result<_>>()?;
-        let mut parts = Vec::with_capacity(args.len());
-        for (a, pty) in args.iter().zip(param_tys.iter()) {
-            let v = self.expr(a)?;
-            parts.push(format!("{} {}", pty, v));
+        // 間接呼び出し: callee をクロージャ値に評価し fn/env を取り出して呼ぶ。
+        let Type::Fun(params, ret) = &callee.ty else {
+            return unsupported("関数でない値の呼び出し");
+        };
+        let ret_ll = llvm_ty(ret)?;
+        let param_lls: Vec<String> = params.iter().map(llvm_ty).collect::<Result<_>>()?;
+        let clos = self.expr(callee, m)?;
+        let fnp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = extractvalue {} {}, 0", fnp, CLOSURE_TY, clos));
+        let envp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = extractvalue {} {}, 1", envp, CLOSURE_TY, clos));
+        for (a, pll) in args.iter().zip(param_lls.iter()) {
+            let v = self.expr(a, m)?;
+            arg_parts.push(format!("{} {}", pll, v));
         }
         let r = format!("%t{}", self.fresh());
+        let mut call_args = vec![format!("ptr {}", envp)];
+        call_args.extend(arg_parts);
         self.line(&format!(
-            "{} = call {} @{}({})",
+            "{} = call {} {}({})",
             r,
-            ret,
-            name,
-            parts.join(", ")
+            ret_ll,
+            fnp,
+            call_args.join(", ")
         ));
         Ok(r)
     }
 
-    fn block(&mut self, stmts: &[TStmt]) -> Result<String> {
-        // 新スコープ（簡易: 既存 locals を保存して復元）。
-        let saved = self.locals.clone();
+    fn block(&mut self, stmts: &[TStmt], m: &mut Module) -> Result<String> {
+        let saved = self.scope.clone();
         let mut last = String::new();
         for s in stmts {
             match s {
                 TStmt::Let(name, rhs) => {
-                    if matches!(rhs.kind, TExprKind::Lambda(..)) {
-                        return unsupported("ブロック内の関数定義");
-                    }
-                    let v = self.expr(rhs)?;
+                    let v = self.expr(rhs, m)?;
                     self.bind_local(name, &v, &rhs.ty)?;
                     last = String::new();
                 }
-                TStmt::Expr(e) => last = self.expr(e)?,
-                TStmt::Type(_) | TStmt::Impl(_) => {
-                    return unsupported("ブロック内の type/impl");
-                }
+                TStmt::Expr(e) => last = self.expr(e, m)?,
+                TStmt::Type(_) | TStmt::Impl(_) => return unsupported("ブロック内の type/impl"),
             }
         }
-        self.locals = saved;
+        self.scope = saved;
         if last.is_empty() {
             unsupported("値を持たないブロック")
         } else {
             Ok(last)
         }
     }
+
+    // ネスト lambda: キャプチャを env(malloc)に詰めてクロージャ値 {@fnN, env} を作る。
+    fn lambda(
+        &mut self,
+        params: &[String],
+        body: &TExpr,
+        fn_ty: &Type,
+        m: &mut Module,
+    ) -> Result<String> {
+        let Type::Fun(param_tys, ret) = fn_ty else {
+            return unsupported("関数の型が解決できない");
+        };
+        // キャプチャ＝本体の自由変数のうち、トップレベル関数でないもの。型は現スコープから。
+        let fv = free_vars(params, body);
+        let mut caps: Vec<(String, Type)> = Vec::new();
+        for name in &fv {
+            if m.globals.contains_key(name) {
+                continue; // トップレベル関数は名前参照（捕獲しない）
+            }
+            match self.scope.get(name) {
+                Some((_, ty)) => caps.push((name.clone(), ty.clone())),
+                None => return unsupported(format!("捕獲できない変数: {}", name)),
+            }
+        }
+        let fn_name = m.fresh_fn();
+        let typed_params: Vec<(String, Type)> = params
+            .iter()
+            .cloned()
+            .zip(param_tys.iter().cloned())
+            .collect();
+        gen_function(m, &fn_name, &caps, &typed_params, ret, body)?;
+
+        // env を malloc してキャプチャを格納。
+        let env_operand = if caps.is_empty() {
+            "null".to_string()
+        } else {
+            let env_ty = env_struct_ty(&caps)?;
+            // sizeof(env) を getelementptr で求める。
+            let szp = format!("%t{}", self.fresh());
+            self.line(&format!(
+                "{} = getelementptr {}, ptr null, i32 1",
+                szp, env_ty
+            ));
+            let sz = format!("%t{}", self.fresh());
+            self.line(&format!("{} = ptrtoint ptr {} to i64", sz, szp));
+            let env = format!("%t{}", self.fresh());
+            self.line(&format!("{} = call ptr @malloc(i64 {})", env, sz));
+            // 各キャプチャを格納（現スコープから load → env に store）。
+            for (i, (cname, cty)) in caps.iter().enumerate() {
+                let cv = self.var(cname, m)?;
+                let fp = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = getelementptr {}, ptr {}, i32 0, i32 {}",
+                    fp, env_ty, env, i
+                ));
+                self.line(&format!("store {} {}, ptr {}", llvm_ty(cty)?, cv, fp));
+            }
+            env
+        };
+        // クロージャ {@fnN, env} を組む。
+        let c0 = format!("%t{}", self.fresh());
+        self.line(&format!(
+            "{} = insertvalue {} undef, ptr @{}, 0",
+            c0, CLOSURE_TY, fn_name
+        ));
+        let c1 = format!("%t{}", self.fresh());
+        self.line(&format!(
+            "{} = insertvalue {} {}, ptr {}, 1",
+            c1, CLOSURE_TY, c0, env_operand
+        ));
+        Ok(c1)
+    }
 }
 
-// プログラム全体を LLVM IR テキストへ。
+// 1 つの関数定義を生成して module.funcs に追記する。
+// シグネチャ: define <ret> @name(ptr %env, <params...>)。本体冒頭でキャプチャを env から load。
+fn gen_function(
+    m: &mut Module,
+    name: &str,
+    caps: &[(String, Type)],
+    params: &[(String, Type)],
+    ret: &Type,
+    body: &TExpr,
+) -> Result<()> {
+    let ret_ll = llvm_ty(ret)?;
+    let mut g = Gen::new();
+    // 引数ヘッダ（先頭は env）。
+    let mut header = vec!["ptr %env".to_string()];
+    for (i, (_, pty)) in params.iter().enumerate() {
+        header.push(format!("{} %arg{}", llvm_ty(pty)?, i));
+    }
+    // キャプチャを env から load してローカルに束縛。
+    if !caps.is_empty() {
+        let env_ty = env_struct_ty(caps)?;
+        for (i, (cname, cty)) in caps.iter().enumerate() {
+            let fp = format!("%t{}", g.fresh());
+            g.line(&format!(
+                "{} = getelementptr {}, ptr %env, i32 0, i32 {}",
+                fp, env_ty, i
+            ));
+            let v = format!("%t{}", g.fresh());
+            g.line(&format!("{} = load {}, ptr {}", v, llvm_ty(cty)?, fp));
+            g.bind_local(cname, &v, cty)?;
+        }
+    }
+    // 引数を束縛。
+    for (i, (pname, pty)) in params.iter().enumerate() {
+        g.bind_local(pname, &format!("%arg{}", i), pty)?;
+    }
+    let result = g.expr(body, m)?;
+    g.line(&format!("ret {} {}", ret_ll, result));
+    m.funcs.push_str(&format!(
+        "define {} @{}({}) {{\n{}}}\n\n",
+        ret_ll,
+        name,
+        header.join(", "),
+        g.out
+    ));
+    Ok(())
+}
+
+// 本体の自由変数（params と内側で束縛される名前を除く）。決定的な順序で返す。
+fn free_vars(params: &[String], body: &TExpr) -> Vec<String> {
+    let mut bound: HashSet<String> = params.iter().cloned().collect();
+    let mut free: Vec<String> = Vec::new();
+    fv(body, &mut bound, &mut free);
+    free.sort();
+    free.dedup();
+    free
+}
+
+fn fv(e: &TExpr, bound: &HashSet<String>, free: &mut Vec<String>) {
+    match &e.kind {
+        TExprKind::Int(_)
+        | TExprKind::Long(_)
+        | TExprKind::Float(_)
+        | TExprKind::Str(_)
+        | TExprKind::Bool(_) => {}
+        TExprKind::Var(n) => {
+            if !bound.contains(n) {
+                free.push(n.clone());
+            }
+        }
+        TExprKind::Neg(x) => fv(x, bound, free),
+        TExprKind::BinOp(l, _, r) => {
+            fv(l, bound, free);
+            fv(r, bound, free);
+        }
+        TExprKind::If(c, t, e2) => {
+            fv(c, bound, free);
+            fv(t, bound, free);
+            fv(e2, bound, free);
+        }
+        TExprKind::Lambda(ps, b) => {
+            let mut b2 = bound.clone();
+            for p in ps {
+                b2.insert(p.clone());
+            }
+            fv(b, &b2, free);
+        }
+        TExprKind::Call(c, args) => {
+            fv(c, bound, free);
+            for a in args {
+                fv(a, bound, free);
+            }
+        }
+        TExprKind::Block(stmts) => {
+            let mut b2 = bound.clone();
+            for s in stmts {
+                match s {
+                    TStmt::Let(n, rhs) => {
+                        fv(rhs, &b2, free);
+                        b2.insert(n.clone());
+                    }
+                    TStmt::Expr(e2) => fv(e2, &b2, free),
+                    TStmt::Type(_) | TStmt::Impl(_) => {}
+                }
+            }
+        }
+        TExprKind::Case(subj, arms) => {
+            fv(subj, bound, free);
+            for (pat, body) in arms {
+                let mut b2 = bound.clone();
+                pattern_vars(pat, &mut b2);
+                fv(body, &b2, free);
+            }
+        }
+    }
+}
+
+fn pattern_vars(p: &crate::ast::Pattern, out: &mut HashSet<String>) {
+    use crate::ast::Pattern;
+    match p {
+        Pattern::Var(n) => {
+            out.insert(n.clone());
+        }
+        Pattern::Ctor(_, subs) | Pattern::Or(subs) => {
+            for s in subs {
+                pattern_vars(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// プログラム全体 → LLVM IR テキスト。
 pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
-    // パス1: トップレベル関数のシグネチャを集める（前方参照・再帰のため）。
-    let mut funcs: HashMap<String, FnSig> = HashMap::new();
+    let mut globals: HashMap<String, (Vec<Type>, Type)> = HashMap::new();
     for s in stmts {
         if let TStmt::Let(name, te) = s {
             if let TExprKind::Lambda(_, _) = &te.kind {
                 let Type::Fun(params, ret) = &te.ty else {
                     return unsupported("関数の型が解決できない");
                 };
-                funcs.insert(
-                    name.clone(),
-                    FnSig {
-                        params: params.clone(),
-                        ret: (**ret).clone(),
-                    },
-                );
+                globals.insert(name.clone(), (params.clone(), (**ret).clone()));
             }
         }
     }
 
+    let mut m = Module {
+        funcs: String::new(),
+        fn_ctr: 0,
+        globals,
+    };
+
+    // トップレベル関数を @name で出力（キャプチャなし＝env は使わない）。
+    for s in stmts {
+        if let TStmt::Let(name, te) = s {
+            if let TExprKind::Lambda(param_names, body) = &te.kind {
+                let Type::Fun(param_tys, ret) = &te.ty else {
+                    unreachable!()
+                };
+                let typed_params: Vec<(String, Type)> = param_names
+                    .iter()
+                    .cloned()
+                    .zip(param_tys.iter().cloned())
+                    .collect();
+                gen_function(&mut m, name, &[], &typed_params, ret, body)?;
+            }
+        }
+    }
+
+    // main。
+    let main = compile_main(stmts, &mut m)?;
+
     let mut module = String::new();
-    // target triple はあえて出力しない（clang がホスト既定を使う＝上書き警告を避ける）。
     module.push_str("declare i32 @printf(ptr, ...)\n");
+    module.push_str("declare ptr @malloc(i64)\n");
     module.push_str("@.di = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n");
     module.push_str("@.df = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"\n");
     module.push_str("@.ds = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"\n");
     module.push_str("@.t = private unnamed_addr constant [5 x i8] c\"true\\00\"\n");
     module.push_str("@.f = private unnamed_addr constant [6 x i8] c\"false\\00\"\n\n");
-
-    // パス2: 各関数定義を出力。
-    for s in stmts {
-        if let TStmt::Let(name, te) = s {
-            if let TExprKind::Lambda(param_names, body) = &te.kind {
-                module.push_str(&compile_fn(name, param_names, body, &funcs)?);
-                module.push('\n');
-            }
-        }
-    }
-
-    // main: 関数定義でないトップレベル文を実行し、Expr 文の結果を printf。
-    module.push_str(&compile_main(stmts, &funcs)?);
+    module.push_str(&m.funcs);
+    module.push_str(&main);
     Ok(module)
 }
 
-fn compile_fn(
-    name: &str,
-    param_names: &[String],
-    body: &TExpr,
-    funcs: &HashMap<String, FnSig>,
-) -> Result<String> {
-    let sig = &funcs[name];
-    let ret = llvm_ty(&sig.ret)?;
-    let mut g = Gen::new(funcs);
-    // 引数を alloca にコピー（Var の load を一様にする）。
-    let mut header_params = Vec::new();
-    let mut arg_index = 0;
-    for (pname, pty) in param_names.iter().zip(sig.params.iter()) {
-        let llty = llvm_ty(pty)?;
-        header_params.push(format!("{} %arg{}", llty, arg_index));
-        g.bind_local(pname, &format!("%arg{}", arg_index), pty)?;
-        arg_index += 1;
-    }
-    let result = g.expr(body)?;
-    g.line(&format!("ret {} {}", ret, result));
-    Ok(format!(
-        "define {} @{}({}) {{\n{}}}\n",
-        ret,
-        name,
-        header_params.join(", "),
-        g.out
-    ))
-}
-
-fn compile_main(stmts: &[TStmt], funcs: &HashMap<String, FnSig>) -> Result<String> {
-    let mut g = Gen::new(funcs);
+fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
+    let mut g = Gen::new();
     for s in stmts {
         match s {
-            // 関数定義はパス2 で出力済み。スキップ。
             TStmt::Let(_, te) if matches!(te.kind, TExprKind::Lambda(..)) => {}
-            // トップレベルの値 let は main のローカルに束縛。
             TStmt::Let(name, rhs) => {
-                let v = g.expr(rhs)?;
+                let v = g.expr(rhs, m)?;
                 g.bind_local(name, &v, &rhs.ty)?;
             }
-            // トップレベル式は評価して printf。
             TStmt::Expr(e) => {
-                let v = g.expr(e)?;
+                let v = g.expr(e, m)?;
                 emit_print(&mut g, &v, &e.ty)?;
             }
             TStmt::Type(_) | TStmt::Impl(_) => {}
@@ -353,7 +557,6 @@ fn compile_main(stmts: &[TStmt], funcs: &HashMap<String, FnSig>) -> Result<Strin
     Ok(format!("define i32 @main() {{\n{}}}\n", g.out))
 }
 
-// 値を型に応じて printf する。
 fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
     match ty {
         Type::Int | Type::Long => {
@@ -371,12 +574,8 @@ fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
             ));
         }
         Type::Bool => {
-            // i1 を "true"/"false" の文字列ポインタへ select して printf。
             let s = g.fresh();
-            g.line(&format!(
-                "%s{} = select i1 {}, ptr @.t, ptr @.f",
-                s, operand
-            ));
+            g.line(&format!("%s{} = select i1 {}, ptr @.t, ptr @.f", s, operand));
             let r = g.fresh();
             g.line(&format!(
                 "%p{} = call i32 (ptr, ...) @printf(ptr @.ds, ptr %s{})",
@@ -401,7 +600,6 @@ mod tests {
         let typed = Checker::new().check_program(&program).unwrap();
         compile_program(&typed)
     }
-
     fn ir(src: &str) -> String {
         try_ir(src).unwrap()
     }
@@ -409,11 +607,10 @@ mod tests {
     #[test]
     fn 関数と呼び出しと算術を出力する() {
         let out = ir("let f = fn(x: Int) -> Int { x + 1 }; f(2)");
-        assert!(out.contains("define i64 @f(i64 %arg0)"));
+        assert!(out.contains("define i64 @f(ptr %env, i64 %arg0)"));
         assert!(out.contains("add i64"));
-        assert!(out.contains("call i64 @f("));
+        assert!(out.contains("call i64 @f(ptr null"));
         assert!(out.contains("define i32 @main()"));
-        assert!(out.contains("@printf"));
     }
 
     #[test]
@@ -422,21 +619,18 @@ mod tests {
         assert!(out.contains("define i64 @fact"));
         assert!(out.contains("icmp eq i64"));
         assert!(out.contains("mul i64"));
-        assert!(out.contains("br i1"));
+    }
+
+    #[test]
+    fn クロージャはmallocとキャプチャを出力する() {
+        let out = ir("let mk = fn(n: Int) { fn(x: Int) -> Int { x + n } }; 0");
+        assert!(out.contains("@malloc"));
+        assert!(out.contains("insertvalue"));
     }
 
     #[test]
     fn 文字列は未対応() {
         assert!(matches!(try_ir(r#""hi""#), Err(AwaError::Unsupported(_))));
-    }
-
-    #[test]
-    fn クロージャは未対応() {
-        // 内側の fn が外側の n をキャプチャ → codegen 未対応。
-        assert!(matches!(
-            try_ir("let mk = fn(n: Int) { fn(x: Int) -> Int { x + n } }; 0"),
-            Err(AwaError::Unsupported(_))
-        ));
     }
 
     #[test]
