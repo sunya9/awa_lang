@@ -46,6 +46,8 @@ fn llvm_ty(ty: &Type) -> Result<String> {
         Type::Bool => Ok("i1".into()),
         Type::Str => Ok("ptr".into()),
         Type::Fun(..) => Ok(CLOSURE_TY.into()),
+        // Future はランタイム所有のイベントループ内のハンドル（i64 id）。
+        Type::Con(name, _) if name == "Future" => Ok("i64".into()),
         Type::Con(..) => Ok("ptr".into()),
         other => unsupported(format!("型 {}", other)),
     }
@@ -62,6 +64,56 @@ fn is_builtin(name: &str) -> bool {
             | "int_to_string"
             | "float_to_string"
     )
+}
+
+// 非同期の組込（イベントループランタイムへ委譲する）。
+fn is_async_builtin(name: &str) -> bool {
+    matches!(name, "pure" | "delay" | "run" | "Future#flatMap" | "Future#map")
+}
+
+// 呼び出し対象の戻り型（callee.ty = Fun(params, ret) の ret）。
+fn callee_ret(callee: &TExpr) -> Result<Type> {
+    match &callee.ty {
+        Type::Fun(_, ret) => Ok((**ret).clone()),
+        _ => unsupported("呼び出し対象が関数型でない"),
+    }
+}
+
+// flatMap/map 用のトランポリン関数を生成して名前を返す。
+// シグネチャ: i64 @trampN(ptr %state, i64 %boxed)。%state は保存した継続クロージャ {fn,env}。
+// boxed を a 型へアンボックス → 継続 k を呼ぶ。flatMap は k の戻り（Future=i64）をそのまま返し、
+// map は k の戻り（b）をボックス化して返す。ランタイムは常にこの均一シグネチャで呼ぶ。
+fn gen_trampoline(m: &mut Module, a_ty: &Type, b_ty: &Type, is_map: bool) -> Result<String> {
+    let name = m.fresh_fn();
+    let a_ll = llvm_ty(a_ty)?;
+    let mut g = Gen::new();
+    // a へアンボックス。
+    let a = g.unbox_word("%boxed", a_ty)?;
+    // 継続クロージャ {fn,env} を state から load。
+    let kfn = format!("%t{}", g.fresh());
+    g.line(&format!("{} = load ptr, ptr %state", kfn));
+    let ep = format!("%t{}", g.fresh());
+    g.line(&format!("{} = getelementptr i8, ptr %state, i64 8", ep));
+    let kenv = format!("%t{}", g.fresh());
+    g.line(&format!("{} = load ptr, ptr {}", kenv, ep));
+    // k(env, a) を呼ぶ。flatMap なら戻りは i64(Future)、map なら b。
+    let ret_ll = if is_map { llvm_ty(b_ty)? } else { "i64".to_string() };
+    let res = format!("%t{}", g.fresh());
+    g.line(&format!(
+        "{} = call {} {}(ptr {}, {} {})",
+        res, ret_ll, kfn, kenv, a_ll, a
+    ));
+    if is_map {
+        let boxed = g.box_word(&res, b_ty)?;
+        g.line(&format!("ret i64 {}", boxed));
+    } else {
+        g.line(&format!("ret i64 {}", res));
+    }
+    m.funcs.push_str(&format!(
+        "define i64 @{}(ptr %state, i64 %boxed) {{\n{}}}\n\n",
+        name, g.out
+    ));
+    Ok(name)
 }
 
 // Rust 文字列 → LLVM の文字列定数 `[N x i8] c"...\00"` と長さ N（null 込み）。
@@ -845,9 +897,134 @@ impl Gen {
         Ok(p)
     }
 
+    // 値を均一な i64 ワードへボックス化（Future のペイロードはランタイムで型消去されるため）。
+    fn box_word(&mut self, operand: &str, ty: &Type) -> Result<String> {
+        let r = format!("%t{}", self.fresh());
+        match ty {
+            Type::Int | Type::Long => Ok(operand.to_string()),
+            Type::Bool => {
+                self.line(&format!("{} = zext i1 {} to i64", r, operand));
+                Ok(r)
+            }
+            Type::Float => {
+                self.line(&format!("{} = bitcast double {} to i64", r, operand));
+                Ok(r)
+            }
+            Type::Str | Type::Con(..) => {
+                self.line(&format!("{} = ptrtoint ptr {} to i64", r, operand));
+                Ok(r)
+            }
+            other => unsupported(format!("Future に積めない型: {}", other)),
+        }
+    }
+
+    // i64 ワードを本来の型へアンボックス。
+    fn unbox_word(&mut self, operand: &str, ty: &Type) -> Result<String> {
+        let r = format!("%t{}", self.fresh());
+        match ty {
+            Type::Int | Type::Long => Ok(operand.to_string()),
+            Type::Bool => {
+                self.line(&format!("{} = trunc i64 {} to i1", r, operand));
+                Ok(r)
+            }
+            Type::Float => {
+                self.line(&format!("{} = bitcast i64 {} to double", r, operand));
+                Ok(r)
+            }
+            Type::Str | Type::Con(..) => {
+                self.line(&format!("{} = inttoptr i64 {} to ptr", r, operand));
+                Ok(r)
+            }
+            other => unsupported(format!("Future から取り出せない型: {}", other)),
+        }
+    }
+
+    // Future(a) の型引数 a を取り出す。
+    fn future_arg(ty: &Type) -> Result<Type> {
+        match ty {
+            Type::Con(n, args) if n == "Future" && args.len() == 1 => Ok(args[0].clone()),
+            _ => unsupported("Future 型でない"),
+        }
+    }
+
+    // 非同期組込（pure/delay/run/Future#flatMap/Future#map）の codegen。
+    fn async_call(&mut self, name: &str, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
+        match name {
+            "pure" => {
+                let v = self.expr(&args[0], m)?;
+                let boxed = self.box_word(&v, &args[0].ty)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i64 @awa_future_pure(i64 {})", r, boxed));
+                Ok(r)
+            }
+            "delay" => {
+                let ms = self.expr(&args[0], m)?;
+                let v = self.expr(&args[1], m)?;
+                let boxed = self.box_word(&v, &args[1].ty)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call i64 @awa_future_delay(i64 {}, i64 {})",
+                    r, ms, boxed
+                ));
+                Ok(r)
+            }
+            "run" => {
+                let f = self.expr(&args[0], m)?;
+                let boxed = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i64 @awa_future_run(i64 {})", boxed, f));
+                // 戻り値の型は callee の戻り型（Future(a) の a）。
+                let Type::Fun(_, ret) = &callee.ty else {
+                    return unsupported("run の型が解決できない");
+                };
+                self.unbox_word(&boxed, ret)
+            }
+            "Future#flatMap" | "Future#map" => {
+                let is_map = name == "Future#map";
+                let recv = self.expr(&args[0], m)?; // i64 future
+                let a_ty = Self::future_arg(&args[0].ty)?;
+                // 結果は Future(b)。
+                let b_ty = Self::future_arg(&callee_ret(callee)?)?;
+                let k = self.expr(&args[1], m)?; // クロージャ値 {ptr,ptr}
+                // k をヒープに保存して state ポインタにする。
+                let state = self.store_closure(&k)?;
+                let tramp = gen_trampoline(m, &a_ty, &b_ty, is_map)?;
+                let rt = if is_map { "awa_future_map" } else { "awa_future_flatmap" };
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call i64 @{}(i64 {}, ptr @{}, ptr {})",
+                    r, rt, recv, tramp, state
+                ));
+                Ok(r)
+            }
+            _ => unsupported(format!("非同期組込 {}", name)),
+        }
+    }
+
+    // クロージャ値 {ptr fn, ptr env} を 16 バイトのヒープに保存し、その ptr を返す
+    //（ランタイムが継続の state として保持する）。簡単のため解放しない（async ランタイムの領域）。
+    fn store_closure(&mut self, clos: &str) -> Result<String> {
+        let p = format!("%t{}", self.fresh());
+        self.line(&format!("{} = call ptr @malloc(i64 16)", p));
+        let fnp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = extractvalue {} {}, 0", fnp, CLOSURE_TY, clos));
+        let envp = format!("%t{}", self.fresh());
+        self.line(&format!("{} = extractvalue {} {}, 1", envp, CLOSURE_TY, clos));
+        self.line(&format!("store ptr {}, ptr {}", fnp, p));
+        let ep = format!("%t{}", self.fresh());
+        self.line(&format!("{} = getelementptr i8, ptr {}, i64 8", ep, p));
+        self.line(&format!("store ptr {}, ptr {}", envp, ep));
+        Ok(p)
+    }
+
     fn call(&mut self, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
         // 引数の型と値。
         let mut arg_parts = Vec::with_capacity(args.len());
+        // 非同期組込（pure/delay/run/Future#flatMap/Future#map）。
+        if let TExprKind::Var(name) = &callee.kind {
+            if is_async_builtin(name) {
+                return self.async_call(name, callee, args, m);
+            }
+        }
         // callee が組込変換関数なら専用 IR（すべて単項）。
         if let TExprKind::Var(name) = &callee.kind {
             if is_builtin(name) {
@@ -990,6 +1167,7 @@ impl Gen {
                 || m.value_globals.contains_key(name)
                 || m.ctors.contains_key(name)
                 || is_builtin(name)
+                || is_async_builtin(name)
             {
                 continue;
             }
@@ -1346,6 +1524,12 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i32 @snprintf(ptr, i64, ptr, ...)\n");
     module.push_str("declare void @exit(i32)\n");
     module.push_str("declare void @free(ptr)\n");
+    // 非同期イベントループ（C ランタイム async_runtime.c が定義、build 時にリンク）。
+    module.push_str("declare i64 @awa_future_pure(i64)\n");
+    module.push_str("declare i64 @awa_future_delay(i64, i64)\n");
+    module.push_str("declare i64 @awa_future_flatmap(i64, ptr, ptr)\n");
+    module.push_str("declare i64 @awa_future_map(i64, ptr, ptr)\n");
+    module.push_str("declare i64 @awa_future_run(i64)\n");
     // 生存ヒープオブジェクト数（リーク検出用）。init_header で ++、awa_release の解放で --。
     module.push_str("@.live = internal global i64 0\n");
     // 書式・定数文字列。
@@ -1488,6 +1672,73 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
     g.line(&format!("ret i32 {}", ec));
     Ok(format!("define i32 @main() {{\n{}}}\n", g.out))
 }
+
+// ===== 非同期イベントループの C ランタイム（Phase 11 / M-async-2）=====
+// `awa build` 時に clang でこの .c を .ll と一緒にコンパイル・リンクする。
+// 論理時間・型消去（ペイロードは均一な i64 ワード）。継続は (state, word)->word の
+// 関数ポインタ（codegen が生成するトランポリン）と state ポインタの組で持つ。
+// インタプリタ版（eval.rs）と同じ意味モデルを C で実装したもの。
+pub const ASYNC_RUNTIME_C: &str = r#"
+#include <stdlib.h>
+typedef long long Word;
+typedef Word (*ContFn)(void* state, Word x);
+typedef struct Waiter { int kind; long g; ContFn fn; void* state; struct Waiter* next; } Waiter;
+typedef struct { int resolved; Word value; Waiter* waiters; } Future;
+static Future* futs = 0; static long futs_cap = 0, futs_len = 0;
+typedef struct { long tick; long seq; long id; Word value; } Timer;
+static Timer* timers = 0; static long timers_cap = 0, timers_len = 0;
+static long now_tick = 0, seq_ctr = 0;
+static long new_future(int resolved, Word v) {
+  if (futs_len == futs_cap) { futs_cap = futs_cap ? futs_cap*2 : 16; futs = (Future*)realloc(futs, futs_cap*sizeof(Future)); }
+  long id = futs_len++; futs[id].resolved = resolved; futs[id].value = v; futs[id].waiters = 0; return id;
+}
+long awa_future_pure(Word v) { return new_future(1, v); }
+long awa_future_delay(Word ms, Word v) {
+  long id = new_future(0, 0);
+  if (timers_len == timers_cap) { timers_cap = timers_cap ? timers_cap*2 : 16; timers = (Timer*)realloc(timers, timers_cap*sizeof(Timer)); }
+  timers[timers_len].tick = now_tick + ms; timers[timers_len].seq = seq_ctr++; timers[timers_len].id = id; timers[timers_len].value = v; timers_len++;
+  return id;
+}
+static void resolve(long id, Word v);
+static void link_fut(long h, long g) {
+  if (futs[h].resolved) resolve(g, futs[h].value);
+  else { Waiter* w = (Waiter*)malloc(sizeof(Waiter)); w->kind=0; w->g=g; w->fn=0; w->state=0; w->next=futs[h].waiters; futs[h].waiters=w; }
+}
+static void resolve(long id, Word v) {
+  futs[id].resolved = 1; futs[id].value = v;
+  Waiter* w = futs[id].waiters; futs[id].waiters = 0;
+  while (w) {
+    Waiter* next = w->next;
+    if (w->kind == 0) resolve(w->g, v);
+    else if (w->kind == 1) { long h = w->fn(w->state, v); link_fut(h, w->g); }
+    else { Word y = w->fn(w->state, v); resolve(w->g, y); }
+    free(w); w = next;
+  }
+}
+long awa_future_flatmap(long f, ContFn fn, void* state) {
+  long g = new_future(0, 0);
+  if (futs[f].resolved) { long h = fn(state, futs[f].value); link_fut(h, g); }
+  else { Waiter* w = (Waiter*)malloc(sizeof(Waiter)); w->kind=1; w->g=g; w->fn=fn; w->state=state; w->next=futs[f].waiters; futs[f].waiters=w; }
+  return g;
+}
+long awa_future_map(long f, ContFn fn, void* state) {
+  long g = new_future(0, 0);
+  if (futs[f].resolved) { Word y = fn(state, futs[f].value); resolve(g, y); }
+  else { Waiter* w = (Waiter*)malloc(sizeof(Waiter)); w->kind=2; w->g=g; w->fn=fn; w->state=state; w->next=futs[f].waiters; futs[f].waiters=w; }
+  return g;
+}
+Word awa_future_run(long f) {
+  while (!futs[f].resolved) {
+    if (timers_len == 0) exit(70); /* deadlock */
+    long mi = 0;
+    for (long i = 1; i < timers_len; i++)
+      if (timers[i].tick < timers[mi].tick || (timers[i].tick==timers[mi].tick && timers[i].seq<timers[mi].seq)) mi = i;
+    Timer t = timers[mi]; timers[mi] = timers[timers_len-1]; timers_len--; now_tick = t.tick;
+    resolve(t.id, t.value);
+  }
+  return futs[f].value;
+}
+"#;
 
 fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
     match ty {

@@ -294,8 +294,14 @@ fn build_file(path: &str) {
         eprintln!("IR を書けません ({}): {}", ll_path, e);
         std::process::exit(1);
     }
+    // 非同期イベントループの C ランタイムも書き出して一緒にリンクする。
+    let rt_path = format!("{}.async_rt.c", base);
+    if let Err(e) = std::fs::write(&rt_path, codegen::ASYNC_RUNTIME_C) {
+        eprintln!("ランタイムを書けません ({}): {}", rt_path, e);
+        std::process::exit(1);
+    }
     let status = std::process::Command::new("clang")
-        .args([&ll_path, "-o", base])
+        .args([&rt_path, &ll_path, "-o", base])
         .status();
     match status {
         Ok(s) if s.success() => println!("built: {}", base),
@@ -1141,9 +1147,12 @@ mod tests {
             + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir();
         let ll = dir.join(format!("awa_cg_{}.ll", id));
+        let rt = dir.join(format!("awa_rt_{}.c", id));
         let exe = dir.join(format!("awa_cg_{}", id));
         std::fs::write(&ll, &ir).unwrap();
+        std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
+            .arg(&rt)
             .arg(&ll)
             .arg("-o")
             .arg(&exe)
@@ -1152,6 +1161,7 @@ mod tests {
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行できる");
         let _ = std::fs::remove_file(&ll);
+        let _ = std::fs::remove_file(&rt);
         let _ = std::fs::remove_file(&exe);
         String::from_utf8(out.stdout).unwrap()
     }
@@ -1163,13 +1173,16 @@ mod tests {
             + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir();
         let ll = dir.join(format!("awa_cg_{}.ll", id));
+        let rt = dir.join(format!("awa_rt_{}.c", id));
         let exe = dir.join(format!("awa_cg_{}", id));
         std::fs::write(&ll, &ir).unwrap();
+        std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行できる");
         let _ = std::fs::remove_file(&ll);
+        let _ = std::fs::remove_file(&rt);
         let _ = std::fs::remove_file(&exe);
         (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap_or(-1))
     }
@@ -1191,10 +1204,12 @@ mod tests {
         let modules = load_program(&dir, entry).expect("モジュール読み込み成功");
         let ir = compile_modules_to_ir(&modules).expect("コンパイル成功");
         let ll = dir.join("out.ll");
+        let rt = dir.join("async_rt.c");
         let exe = dir.join("out");
         std::fs::write(&ll, &ir).unwrap();
+        std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行できる");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1676,6 +1691,17 @@ mod tests {
     }
 
     #[test]
+    fn codegen_async_がネイティブ実行される() {
+        // do/Future が C ランタイムのイベントループ上で native 実行される（インタプリタと一致）。
+        // 終了コードは継続クロージャの env リークで非0になりうるので stdout のみ確認。
+        let out = compile_and_run(
+            "run(do { x <- delay(10, 1); y <- delay(5, 2); pure(x + y) })\n\
+             run(delay(3, 20).map(fn(n: Int) -> Int { n + 1 }))",
+        );
+        assert_eq!(out, "3\n21\n");
+    }
+
+    #[test]
     fn codegen_ゼロ除算は実行時に検出() {
         // 整数の 0 除算は実行時チェックで abort（終了コード 1）。
         let ir = compile_to_llvm("let div = fn(a: Int, b: Int) -> Int { a / b }; div(10, 0)")
@@ -1684,10 +1710,12 @@ mod tests {
             + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir();
         let ll = dir.join(format!("awa_cg_{}.ll", id));
+        let rt = dir.join(format!("awa_rt_{}.c", id));
         let exe = dir.join(format!("awa_cg_{}", id));
         std::fs::write(&ll, &ir).unwrap();
+        std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
         let st = std::process::Command::new("clang")
-            .arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
         assert!(st.success(), "clang が失敗");
         let out = std::process::Command::new(&exe).output().expect("実行できる");
         let _ = std::fs::remove_file(&ll);
