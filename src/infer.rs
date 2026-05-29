@@ -1,14 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, Pattern, Stmt, TExpr, TExprKind, TStmt, TypeDef, TypeExpr};
-use crate::error::AwaError;
+use crate::ast::{Expr, ExprKind, Pattern, Stmt, TExpr, TExprKind, TStmt, TypeDef, TypeExpr};
+use crate::error::{AwaError, LocatedError};
 use crate::match_check::{Sigs, check_matches};
+use crate::span::Span;
 use crate::token::Token;
 use crate::types::{Scheme, Subst, Type, VarGen, apply, ftv, instantiate, render_type, unify};
 
 // 型名 → 型パラメータの個数（arity）。型式の解決時に「Option(a) の引数個数が
 // 宣言と合うか」を検査するのに使う。3b の網羅性チェックで variant 一覧へ拡張予定。
 type Arities = HashMap<String, usize>;
+
+// AwaError（種類）に span を添えて LocatedError にする小ヘルパ。
+// unify などの失敗を「その式の位置」で包むのに使う。
+fn at<T>(r: Result<T, AwaError>, span: Span) -> Result<T, LocatedError> {
+    r.map_err(|e| LocatedError::at(e, span))
+}
 
 // ===== 型推論（Algorithm W / let 多相つき Hindley-Milner）=====
 // AST をたどって式の型を計算し、矛盾があれば unify が CannotUnify などを返す。
@@ -45,7 +52,7 @@ impl Checker {
     // プログラム（トップレベルの文の並び）を型検査し、型付き AST（elaboration の結果）を返す。
     // eval_program はこの型付きプログラムを実行する。let の束縛・型宣言はトップレベルの
     // self に積まれ、次の行から参照できる。型宣言は値文を生まない（eval と整合）。
-    pub fn check_program(&mut self, stmts: &[Stmt]) -> Result<Vec<TStmt>, AwaError> {
+    pub fn check_program(&mut self, stmts: &[Stmt]) -> Result<Vec<TStmt>, LocatedError> {
         let mut typed = Vec::new();
         for stmt in stmts {
             match stmt {
@@ -330,33 +337,37 @@ fn infer_let(
     subst: &mut Subst,
     vargen: &mut VarGen,
     arities: &Arities,
-) -> Result<TExpr, AwaError> {
+) -> Result<TExpr, LocatedError> {
     let placeholder = vargen.fresh();
     env.insert(name.to_string(), Scheme::mono(placeholder.clone()));
     let te = infer_expr(expr, env, subst, vargen, arities)?;
-    unify(subst, &placeholder, &te.ty)?;
+    let span = te.span;
+    at(unify(subst, &placeholder, &te.ty), span)?;
     // 自分自身の単相 placeholder を環境から外してから一般化する。
     // 外さないと placeholder が型変数を環境に縛り、何も量化されなくなる。
     env.remove(name);
-    // 型注釈があれば突き合わせる。
+    // 型注釈があれば突き合わせる。エラーは束縛値の式 span に寄せる。
     if let Some(ann) = annotation {
         // (1) 制約: 注釈型と推論型を unify。噛み合わない型（Num と Bool 等）はここで CannotUnify。
         let mut vars = HashMap::new();
-        let ann_ty = resolve_annotation(ann, &mut vars, vargen, arities)?;
-        unify(subst, &placeholder, &ann_ty)?;
+        let ann_ty = at(resolve_annotation(ann, &mut vars, vargen, arities), span)?;
+        at(unify(subst, &placeholder, &ann_ty), span)?;
         // (2) subsumption: 注釈が推論された principal 型より一般的すぎないか。
         // principal を instantiate し、注釈を skolem 化して別 subst 上で unify する。
         // 失敗＝注釈が実際には持っていない一般性を主張している。
         let principal = generalize(env, subst, &placeholder);
         let inst = instantiate(&principal, vargen);
         let mut sk = HashMap::new();
-        let ann_skolem = resolve_skolem(ann, &mut sk, vargen, arities)?;
+        let ann_skolem = at(resolve_skolem(ann, &mut sk, vargen, arities), span)?;
         let mut scratch = subst.clone();
         if unify(&mut scratch, &inst, &ann_skolem).is_err() {
-            return Err(AwaError::AnnotationTooGeneral {
-                inferred: render_type(&principal.ty),
-                annotation: render_type(&ann_ty),
-            });
+            return Err(LocatedError::at(
+                AwaError::AnnotationTooGeneral {
+                    inferred: render_type(&principal.ty),
+                    annotation: render_type(&ann_ty),
+                },
+                span,
+            ));
         }
     }
     let scheme = generalize(env, subst, &placeholder);
@@ -373,56 +384,56 @@ fn infer_expr(
     subst: &mut Subst,
     vargen: &mut VarGen,
     arities: &Arities,
-) -> Result<TExpr, AwaError> {
-    let (kind, ty) = match expr {
-        Expr::Num(n) => (TExprKind::Num(*n), Type::Num),
-        Expr::Bool(b) => (TExprKind::Bool(*b), Type::Bool),
+) -> Result<TExpr, LocatedError> {
+    let span = expr.span;
+    let (kind, ty) = match &expr.kind {
+        ExprKind::Num(n) => (TExprKind::Num(*n), Type::Num),
+        ExprKind::Bool(b) => (TExprKind::Bool(*b), Type::Bool),
         // 変数は型環境を引き、スキームを instantiate して fresh な型に具体化する。
         // 多相な束縛（構築子 Some 等も含む）はここで使用箇所ごとに独立した型変数を得る。
         // 無ければ評価時と同じ UndefinedVariable。
-        Expr::Var(name) => {
+        ExprKind::Var(name) => {
             let ty = env
                 .get(name)
                 .map(|scheme| instantiate(scheme, vargen))
-                .ok_or_else(|| AwaError::UndefinedVariable(name.clone()))?;
+                .ok_or_else(|| {
+                    LocatedError::at(AwaError::UndefinedVariable(name.clone()), span)
+                })?;
             (TExprKind::Var(name.clone()), ty)
         }
         // 単項マイナスはオペランドが Num、結果も Num。
-        Expr::Neg(operand) => {
+        ExprKind::Neg(operand) => {
             let t = infer_expr(operand, env, subst, vargen, arities)?;
-            unify(subst, &t.ty, &Type::Num)?;
+            at(unify(subst, &t.ty, &Type::Num), span)?;
             (TExprKind::Neg(Box::new(t)), Type::Num)
         }
-        Expr::BinOp(left, op, right) => {
+        ExprKind::BinOp(left, op, right) => {
             let lt = infer_expr(left, env, subst, vargen, arities)?;
             let rt = infer_expr(right, env, subst, vargen, arities)?;
-            let ty = infer_binop(&lt.ty, op, &rt.ty, subst)?;
+            let ty = at(infer_binop(&lt.ty, op, &rt.ty, subst), span)?;
             (TExprKind::BinOp(Box::new(lt), op.clone(), Box::new(rt)), ty)
         }
         // if: 条件は Bool、両腕は同じ型でなければならない。結果はその腕の型。
-        Expr::If(cond, then_branch, else_branch) => {
+        ExprKind::If(cond, then_branch, else_branch) => {
             let ct = infer_expr(cond, env, subst, vargen, arities)?;
-            unify(subst, &ct.ty, &Type::Bool)?;
+            at(unify(subst, &ct.ty, &Type::Bool), ct.span)?;
             let tt = infer_expr(then_branch, env, subst, vargen, arities)?;
             let et = infer_expr(else_branch, env, subst, vargen, arities)?;
-            unify(subst, &tt.ty, &et.ty)?;
+            at(unify(subst, &tt.ty, &et.ty), et.span)?;
             let ty = apply(subst, &tt.ty);
-            (
-                TExprKind::If(Box::new(ct), Box::new(tt), Box::new(et)),
-                ty,
-            )
+            (TExprKind::If(Box::new(ct), Box::new(tt), Box::new(et)), ty)
         }
         // 無名関数: 各引数に型を割り当て（注釈があればその型、無ければ fresh）、
         // その下で本体を推論する。戻り型注釈があれば本体型と unify する。
         // 注釈中の型変数はこのシグネチャ内で共有する（sig_vars を引数・戻り型で使い回す）。
-        Expr::Lambda(params, ret_annotation, body) => {
+        ExprKind::Lambda(params, ret_annotation, body) => {
             let mut body_env = env.clone();
             let mut sig_vars = HashMap::new();
             let mut param_types = Vec::with_capacity(params.len());
             let mut param_names = Vec::with_capacity(params.len());
             for (name, annotation) in params {
                 let ty = match annotation {
-                    Some(ann) => resolve_annotation(ann, &mut sig_vars, vargen, arities)?,
+                    Some(ann) => at(resolve_annotation(ann, &mut sig_vars, vargen, arities), span)?,
                     None => vargen.fresh(),
                 };
                 // ラムダ引数は単相（多相化しない）。HM の多相境界は let だけ。
@@ -432,8 +443,8 @@ fn infer_expr(
             }
             let body_t = infer_expr(body, &body_env, subst, vargen, arities)?;
             if let Some(ann) = ret_annotation {
-                let ann_ty = resolve_annotation(ann, &mut sig_vars, vargen, arities)?;
-                unify(subst, &body_t.ty, &ann_ty)?;
+                let ann_ty = at(resolve_annotation(ann, &mut sig_vars, vargen, arities), span)?;
+                at(unify(subst, &body_t.ty, &ann_ty), body_t.span)?;
             }
             let param_types = param_types.iter().map(|t| apply(subst, t)).collect();
             let ty = Type::Fun(param_types, Box::new(apply(subst, &body_t.ty)));
@@ -442,7 +453,7 @@ fn infer_expr(
         // 呼び出し: callee を fn(実引数型...) -> 新しい戻り型 と unify する。
         // unify が「callee が関数か」「引数の個数と型が合うか」を一括で検査する。
         // 戻り型は fresh 型変数で置き、unify 後に確定したものを返す。
-        Expr::Call(callee, args) => {
+        ExprKind::Call(callee, args) => {
             let callee_t = infer_expr(callee, env, subst, vargen, arities)?;
             let mut targs = Vec::with_capacity(args.len());
             for a in args {
@@ -451,39 +462,44 @@ fn infer_expr(
             let ret = vargen.fresh();
             let arg_types = targs.iter().map(|t| t.ty.clone()).collect();
             let expected = Type::Fun(arg_types, Box::new(ret.clone()));
-            unify(subst, &callee_t.ty, &expected)?;
+            at(unify(subst, &callee_t.ty, &expected), span)?;
             let ty = apply(subst, &ret);
             (TExprKind::Call(Box::new(callee_t), targs), ty)
         }
         // ブロックは新しいスコープ。親の型環境をクローンして始め、抜けると破棄する。
-        Expr::Block(stmts) => {
+        ExprKind::Block(stmts) => {
             let mut block_env = env.clone();
             let (tstmts, ty) = infer_stmts(stmts, &mut block_env, subst, vargen, arities)?;
             (TExprKind::Block(tstmts), ty)
         }
         // パターンマッチ: 主語の型に各腕のパターン型を unify、全腕の本体型を互いに unify。
-        Expr::Case(subject, arms) => {
+        ExprKind::Case(subject, arms) => {
             let st = infer_expr(subject, env, subst, vargen, arities)?;
             let result = vargen.fresh();
             let mut tarms = Vec::with_capacity(arms.len());
             for (pattern, body) in arms {
-                let (pty, bindings) = infer_pattern(pattern, env, subst, vargen)?;
+                // パターン由来のエラー（未定義構築子など）は腕の本体 span に寄せる。
+                let (pty, bindings) = at(infer_pattern(pattern, env, subst, vargen), body.span)?;
                 // パターンが主語と同じ型を覆うこと。
-                unify(subst, &pty, &st.ty)?;
+                at(unify(subst, &pty, &st.ty), body.span)?;
                 // パターンが束縛した変数を単相スキームで環境に入れて本体を推論する。
                 let mut arm_env = env.clone();
                 for (name, t) in bindings {
                     arm_env.insert(name, Scheme::mono(t));
                 }
                 let bty = infer_expr(body, &arm_env, subst, vargen, arities)?;
-                unify(subst, &bty.ty, &result)?;
+                at(unify(subst, &bty.ty, &result), bty.span)?;
                 tarms.push((pattern.clone(), bty));
             }
             let ty = apply(subst, &result);
             (TExprKind::Case(Box::new(st), tarms), ty)
         }
     };
-    Ok(TExpr { ty, kind })
+    Ok(TExpr {
+        ty,
+        span: expr.span,
+        kind,
+    })
 }
 
 // パターンの型と、そのパターンが束縛する変数の型を推論する。
@@ -558,7 +574,7 @@ fn infer_stmts(
     subst: &mut Subst,
     vargen: &mut VarGen,
     arities: &Arities,
-) -> Result<(Vec<TStmt>, Type), AwaError> {
+) -> Result<(Vec<TStmt>, Type), LocatedError> {
     let mut local_arities = arities.clone();
     let mut tstmts = Vec::with_capacity(stmts.len());
     let mut last = Type::Unit;
@@ -621,15 +637,18 @@ mod tests {
         let tokens = tokenize(src).unwrap();
         let program = Parser::new(tokens).parse_program().unwrap();
         let mut checker = Checker::new();
-        checker.check_program(&program).map(|typed| {
-            typed
-                .last()
-                .map(|ts| match ts {
-                    TStmt::Let(_, te) | TStmt::Expr(te) => te.ty.clone(),
-                    TStmt::Type(_) => Type::Unit,
-                })
-                .unwrap_or(Type::Unit)
-        })
+        checker
+            .check_program(&program)
+            .map(|typed| {
+                typed
+                    .last()
+                    .map(|ts| match ts {
+                        TStmt::Let(_, te) | TStmt::Expr(te) => te.ty.clone(),
+                        TStmt::Type(_) => Type::Unit,
+                    })
+                    .unwrap_or(Type::Unit)
+            })
+            .map_err(|e| e.error) // テストは AwaError（種類）と比較する
     }
 
     #[test]

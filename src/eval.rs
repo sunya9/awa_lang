@@ -1,11 +1,18 @@
 use std::rc::Rc;
 
 use crate::ast::{Pattern, TExpr, TExprKind, TStmt, TypeDef};
-use crate::error::AwaError;
+use crate::error::{AwaError, LocatedError};
+use crate::span::Span;
 use crate::token::Token;
 use crate::value::{Closure, Env, Value, type_name};
 
 // ===== 評価（Evaluator）=====
+
+// AwaError（種類）に span を添えて LocatedError にする小ヘルパ。
+// 実行時エラーを「その式の位置」で包むのに使う。
+fn at<T>(r: Result<T, AwaError>, span: Span) -> Result<T, LocatedError> {
+    r.map_err(|e| LocatedError::at(e, span))
+}
 
 // 値から f64 を取り出す。数値でなければ型エラー（算術・比較は数値専用）。
 fn as_num(v: Value) -> Result<f64, AwaError> {
@@ -43,7 +50,8 @@ fn bind_name(value: Value, name: &str) -> Value {
     }
 }
 
-pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, AwaError> {
+pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
+    let span = expr.span;
     match &expr.kind {
         TExprKind::Num(n) => Ok(Value::Num(*n)),
         TExprKind::Bool(b) => Ok(Value::Bool(*b)),
@@ -52,16 +60,20 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, AwaError> {
         TExprKind::Var(name) => env
             .get(name)
             .cloned()
-            .ok_or_else(|| AwaError::UndefinedVariable(name.clone())),
-        TExprKind::Neg(operand) => Ok(Value::Num(-as_num(eval_expr(operand, env)?)?)),
+            .ok_or_else(|| LocatedError::at(AwaError::UndefinedVariable(name.clone()), span)),
+        TExprKind::Neg(operand) => {
+            let v = eval_expr(operand, env)?;
+            Ok(Value::Num(-at(as_num(v), span)?))
+        }
         TExprKind::BinOp(left, op, right) => {
             let l = eval_expr(left, env)?;
             let r = eval_expr(right, env)?;
-            eval_binop(l, op, r)
+            at(eval_binop(l, op, r), span)
         }
         // if は選ばれた腕だけを評価する（短絡評価）。
         TExprKind::If(cond, then_branch, else_branch) => {
-            if as_bool(eval_expr(cond, env)?)? {
+            let c = eval_expr(cond, env)?;
+            if at(as_bool(c), span)? {
                 eval_expr(then_branch, env)
             } else {
                 eval_expr(else_branch, env)
@@ -85,10 +97,13 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, AwaError> {
                 // 構築子適用: 引数を評価して Data を作る。
                 Value::Ctor { name, arity } => {
                     if args.len() != arity {
-                        return Err(AwaError::ArityMismatch {
-                            expected: arity,
-                            found: args.len(),
-                        });
+                        return Err(LocatedError::at(
+                            AwaError::ArityMismatch {
+                                expected: arity,
+                                found: args.len(),
+                            },
+                            span,
+                        ));
                     }
                     let mut arg_values = Vec::with_capacity(args.len());
                     for arg in args {
@@ -99,14 +114,22 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, AwaError> {
                         args: arg_values,
                     });
                 }
-                other => return Err(AwaError::NotCallable(type_name(&other))),
+                other => {
+                    return Err(LocatedError::at(
+                        AwaError::NotCallable(type_name(&other)),
+                        span,
+                    ));
+                }
             };
             // 2. 引数の個数チェック。
             if args.len() != closure.params.len() {
-                return Err(AwaError::ArityMismatch {
-                    expected: closure.params.len(),
-                    found: args.len(),
-                });
+                return Err(LocatedError::at(
+                    AwaError::ArityMismatch {
+                        expected: closure.params.len(),
+                        found: args.len(),
+                    },
+                    span,
+                ));
             }
             // 3. 各引数を「呼び出し側の env」で評価する（ここは呼び出し側スコープ）。
             let mut arg_values = Vec::with_capacity(args.len());
@@ -162,7 +185,7 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, AwaError> {
                 }
             }
             // どの腕にも当たらなかった（網羅性チェックは Phase 3b で静的に防ぐ）。
-            Err(AwaError::NoMatch)
+            Err(LocatedError::at(AwaError::NoMatch, span))
         }
     }
 }
@@ -254,7 +277,7 @@ fn values_equal(l: Value, r: Value) -> Result<bool, AwaError> {
 
 // プログラム（文の並び）を順に評価し、各文の値を順に返す。
 // env は呼び出し側が所有して渡す（REPL は行をまたいで使い回す）。
-pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, AwaError> {
+pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, LocatedError> {
     let mut results = Vec::new();
     for stmt in stmts {
         match stmt {

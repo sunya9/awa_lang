@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use crate::ast::{Expr, Pattern, Stmt, TypeDef};
-use crate::error::AwaError;
+use crate::ast::{Expr, ExprKind, Pattern, Stmt, TypeDef};
+use crate::error::{AwaError, LocatedError};
+use crate::span::Span;
 
 // ===== 網羅性・到達不能チェック（Phase 3b）=====
 // Maranget "Warnings for pattern matching" の usefulness アルゴリズムを、awa の
@@ -291,7 +292,8 @@ fn render_pattern(p: &Pattern) -> String {
 // 1 つの case 式の腕を検査する。or パターンは展開して行列の複数行にしてから、
 // 到達不能を先に（具体的な腕を指せる）、次に網羅性を見る。
 // 各行は 1 列（[パターン]）。展開後は or を含まないので usefulness は or を知らない。
-fn check_case(arms: &[(Pattern, Expr)], sigs: &Sigs) -> Result<(), AwaError> {
+// 1 つの case 式の腕を検査する。エラーは case 式全体の span に寄せる。
+fn check_case(arms: &[(Pattern, Expr)], sigs: &Sigs, span: Span) -> Result<(), LocatedError> {
     // 到達不能: 腕 i の展開のどれかが「上の腕の展開全体」に対して useful なら到達可能。
     // どの展開も useful でなければ腕全体が死んでいる。
     let mut prior: Vec<Vec<Pattern>> = Vec::new();
@@ -299,15 +301,21 @@ fn check_case(arms: &[(Pattern, Expr)], sigs: &Sigs) -> Result<(), AwaError> {
         let rows: Vec<Vec<Pattern>> = expand(pattern).into_iter().map(|p| vec![p]).collect();
         let reachable = rows.iter().any(|row| useful(&prior, row, sigs));
         if !reachable {
-            return Err(AwaError::UnreachablePattern(render_pattern(pattern)));
+            return Err(LocatedError::at(
+                AwaError::UnreachablePattern(render_pattern(pattern)),
+                span,
+            ));
         }
         prior.extend(rows);
     }
     // 網羅性: 全腕の展開を集めた行列に、覆えない値（witness）が無いか。
     if let Some(witness) = missing(&prior, 1, sigs) {
-        return Err(AwaError::NonExhaustiveMatch {
-            witness: render_pattern(&witness[0]),
-        });
+        return Err(LocatedError::at(
+            AwaError::NonExhaustiveMatch {
+                witness: render_pattern(&witness[0]),
+            },
+            span,
+        ));
     }
     Ok(())
 }
@@ -316,12 +324,12 @@ fn check_case(arms: &[(Pattern, Expr)], sigs: &Sigs) -> Result<(), AwaError> {
 // 型検査が通った後に呼ぶ。全 case 式を見つけて検査する。型宣言はその場で sigs に
 // 足す（ブロック内のローカル型はブロックスコープ限り）。sigs は呼び出し側（Checker）が
 // トップレベル型を積んだものを渡す（REPL の行またぎ参照のため）。
-pub fn check_matches(stmts: &[Stmt], sigs: &Sigs) -> Result<(), AwaError> {
+pub fn check_matches(stmts: &[Stmt], sigs: &Sigs) -> Result<(), LocatedError> {
     let mut local = sigs.clone();
     check_stmts(stmts, &mut local)
 }
 
-fn check_stmts(stmts: &[Stmt], sigs: &mut Sigs) -> Result<(), AwaError> {
+fn check_stmts(stmts: &[Stmt], sigs: &mut Sigs) -> Result<(), LocatedError> {
     for stmt in stmts {
         match stmt {
             Stmt::Type(def) => sigs.add(def),
@@ -331,38 +339,38 @@ fn check_stmts(stmts: &[Stmt], sigs: &mut Sigs) -> Result<(), AwaError> {
     Ok(())
 }
 
-fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), AwaError> {
-    match expr {
-        Expr::Num(_) | Expr::Bool(_) | Expr::Var(_) => Ok(()),
-        Expr::Neg(x) => check_expr(x, sigs),
-        Expr::BinOp(l, _, r) => {
+fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
+    match &expr.kind {
+        ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Var(_) => Ok(()),
+        ExprKind::Neg(x) => check_expr(x, sigs),
+        ExprKind::BinOp(l, _, r) => {
             check_expr(l, sigs)?;
             check_expr(r, sigs)
         }
-        Expr::If(c, t, e) => {
+        ExprKind::If(c, t, e) => {
             check_expr(c, sigs)?;
             check_expr(t, sigs)?;
             check_expr(e, sigs)
         }
-        Expr::Lambda(_, _, body) => check_expr(body, sigs),
-        Expr::Call(callee, args) => {
+        ExprKind::Lambda(_, _, body) => check_expr(body, sigs),
+        ExprKind::Call(callee, args) => {
             check_expr(callee, sigs)?;
             for a in args {
                 check_expr(a, sigs)?;
             }
             Ok(())
         }
-        Expr::Block(stmts) => {
+        ExprKind::Block(stmts) => {
             // ブロック内のローカル型はこのスコープ限り。
             let mut local = sigs.clone();
             check_stmts(stmts, &mut local)
         }
-        Expr::Case(subject, arms) => {
+        ExprKind::Case(subject, arms) => {
             check_expr(subject, sigs)?;
             for (_, body) in arms {
                 check_expr(body, sigs)?;
             }
-            check_case(arms, sigs)
+            check_case(arms, sigs, expr.span)
         }
     }
 }

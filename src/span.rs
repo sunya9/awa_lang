@@ -13,6 +13,13 @@ impl Span {
         Span { start, end }
     }
 
+    // 2 つの span を包む最小の span（子ノードから親ノードの span を作るのに使う）。
+    pub fn merge(a: Span, b: Span) -> Self {
+        Span {
+            start: a.start.min(b.start),
+            end: a.end.max(b.end),
+        }
+    }
 }
 
 // 値に span を添えた汎用ラッパ。トークン列に使う。

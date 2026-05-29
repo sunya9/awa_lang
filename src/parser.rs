@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Pattern, Stmt, TypeDef, TypeExpr, Variant};
+use crate::ast::{Expr, ExprKind, Pattern, Stmt, TypeDef, TypeExpr, Variant};
 use crate::error::{AwaError, LocatedError};
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -90,6 +90,14 @@ impl Parser {
         LocatedError::at(AwaError::UnexpectedEof, self.span_here())
     }
 
+    // 開始位置 start から「直前に消費したトークンの末尾」までを span として Expr を組む。
+    fn finish(&self, start: usize, kind: ExprKind) -> Expr {
+        Expr {
+            kind,
+            span: Span::new(start, self.last_span().end),
+        }
+    }
+
     // 期待するトークンを 1 つ消費する。違っていれば位置つきエラー。
     fn expect(&mut self, expected: Token) -> Result<(), LocatedError> {
         match self.next() {
@@ -130,6 +138,8 @@ impl Parser {
     // ブロック { 文; ...; 式 }。'{' は呼び出し側が消費済みとして '}' まで読む。
     // プログラムと同じ「文 + 終端」の繰り返しだが、終わりが } になる。
     fn parse_block(&mut self) -> Result<Expr, LocatedError> {
+        // 呼び出し側が直前に '{' を消費しているので、その位置を span の起点にする。
+        let start = self.last_span().start;
         let mut stmts = Vec::new();
         self.skip_terminators();
         while self.peek() != Some(&Token::RBrace) {
@@ -151,7 +161,7 @@ impl Parser {
             }
         }
         self.expect(Token::RBrace)?;
-        Ok(Expr::Block(stmts))
+        Ok(self.finish(start, ExprKind::Block(stmts)))
     }
 
     // 文 = `let ident = expr`（束縛）/ `type ...`（型宣言）/ `expr`（式文）。
@@ -394,7 +404,11 @@ impl Parser {
         while let Some(Token::EqEq | Token::NotEq) = self.peek() {
             let op = self.next().unwrap();
             let right = self.parse_comparison()?;
-            left = Expr::BinOp(Box::new(left), op, Box::new(right));
+            let span = Span::merge(left.span, right.span);
+            left = Expr {
+                kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)),
+                span,
+            };
         }
         Ok(left)
     }
@@ -405,7 +419,11 @@ impl Parser {
         while let Some(Token::Lt | Token::Gt | Token::Le | Token::Ge) = self.peek() {
             let op = self.next().unwrap();
             let right = self.parse_additive()?;
-            left = Expr::BinOp(Box::new(left), op, Box::new(right));
+            let span = Span::merge(left.span, right.span);
+            left = Expr {
+                kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)),
+                span,
+            };
         }
         Ok(left)
     }
@@ -417,7 +435,11 @@ impl Parser {
                 Token::Plus | Token::Minus => {
                     let op = self.next().unwrap();
                     let right = self.parse_term()?;
-                    left = Expr::BinOp(Box::new(left), op, Box::new(right));
+                    let span = Span::merge(left.span, right.span);
+            left = Expr {
+                kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)),
+                span,
+            };
                 }
                 _ => break,
             }
@@ -432,7 +454,11 @@ impl Parser {
                 Token::Star | Token::Slash => {
                     let op = self.next().unwrap();
                     let right = self.parse_unary()?;
-                    left = Expr::BinOp(Box::new(left), op, Box::new(right));
+                    let span = Span::merge(left.span, right.span);
+            left = Expr {
+                kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)),
+                span,
+            };
                 }
                 _ => break,
             }
@@ -444,9 +470,10 @@ impl Parser {
     // factor より高い優先順位: `-3 * 2` は `(-3) * 2`、`-2 + 1` は `(-2) + 1`。
     fn parse_unary(&mut self) -> Result<Expr, LocatedError> {
         if let Some(Token::Minus) = self.peek() {
+            let start = self.span_here().start;
             self.next(); // '-' を消費
             let operand = self.parse_unary()?;
-            Ok(Expr::Neg(Box::new(operand)))
+            Ok(self.finish(start, ExprKind::Neg(Box::new(operand))))
         } else {
             self.parse_call()
         }
@@ -472,16 +499,21 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen)?;
-            expr = Expr::Call(Box::new(expr), args);
+            let span = Span::new(expr.span.start, self.last_span().end);
+            expr = Expr {
+                kind: ExprKind::Call(Box::new(expr), args),
+                span,
+            };
         }
         Ok(expr)
     }
 
     fn parse_factor(&mut self) -> Result<Expr, LocatedError> {
+        let start = self.span_here().start;
         match self.next() {
-            Some(Token::Num(n)) => Ok(Expr::Num(n)),
-            Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
-            Some(Token::Ident(name)) => Ok(Expr::Var(name)),
+            Some(Token::Num(n)) => Ok(self.finish(start, ExprKind::Num(n))),
+            Some(Token::Bool(b)) => Ok(self.finish(start, ExprKind::Bool(b))),
+            Some(Token::Ident(name)) => Ok(self.finish(start, ExprKind::Var(name))),
             // 無名関数 fn(引数: 型?, ...) -> 戻り型? { 本体ブロック }。
             Some(Token::Fn) => {
                 self.expect(Token::LParen)?;
@@ -519,7 +551,7 @@ impl Parser {
                 };
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block()?;
-                Ok(Expr::Lambda(params, ret_annotation, Box::new(body)))
+                Ok(self.finish(start, ExprKind::Lambda(params, ret_annotation, Box::new(body))))
             }
             // if 条件 { ブロック } else { ブロック }。各腕はブロック式。
             Some(Token::If) => {
@@ -529,10 +561,13 @@ impl Parser {
                 self.expect(Token::Else)?;
                 self.expect(Token::LBrace)?;
                 let else_branch = self.parse_block()?;
-                Ok(Expr::If(
-                    Box::new(cond),
-                    Box::new(then_branch),
-                    Box::new(else_branch),
+                Ok(self.finish(
+                    start,
+                    ExprKind::If(
+                        Box::new(cond),
+                        Box::new(then_branch),
+                        Box::new(else_branch),
+                    ),
                 ))
             }
             // パターンマッチ case 主語 { パターン -> 本体; ... }。
@@ -563,9 +598,9 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace)?;
-                Ok(Expr::Case(Box::new(subject), arms))
+                Ok(self.finish(start, ExprKind::Case(Box::new(subject), arms)))
             }
-            // 単独のブロック式 { ... }。
+            // 単独のブロック式 { ... }。parse_block が span つきで返す。
             Some(Token::LBrace) => self.parse_block(),
             Some(Token::LParen) => {
                 let e = self.parse_expr()?;

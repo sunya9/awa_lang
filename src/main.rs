@@ -596,4 +596,47 @@ mod tests {
             Ok(num(9.0))
         );
     }
+
+    // ===== エラーの位置情報（Phase 4）=====
+
+    // run を直接呼んで位置つきエラーを得るヘルパ。
+    fn run_err(src: &str) -> LocatedError {
+        let mut env = Env::new();
+        let mut checker = Checker::new();
+        run(src, &mut env, &mut checker).unwrap_err()
+    }
+
+    #[test]
+    fn 構文エラーに位置がつく() {
+        let err = run_err("let y = )");
+        assert!(err.span.is_some());
+        // ) は 9 文字目（1 始まり）。
+        assert!(report(&err, "let y = )").contains("1:9"));
+    }
+
+    #[test]
+    fn 型エラーに位置がつく() {
+        // true + 1 の二項演算ノード（1:1 から）を指す。
+        let err = run_err("true + 1");
+        assert!(matches!(err.error, AwaError::CannotUnify { .. }));
+        let msg = report(&err, "true + 1");
+        assert!(msg.contains("--> 1:1"));
+        assert!(msg.contains("^"));
+    }
+
+    #[test]
+    fn 未定義変数に位置がつく() {
+        let err = run_err("1 + zzz");
+        assert_eq!(err.error, AwaError::UndefinedVariable("zzz".to_string()));
+        // zzz は 5 文字目。
+        assert!(report(&err, "1 + zzz").contains("1:5"));
+    }
+
+    #[test]
+    fn 実行時エラーに位置がつく() {
+        // 型は通り、評価時にゼロ除算。位置つきで報告される。
+        let err = run_err("10 / 0");
+        assert_eq!(err.error, AwaError::DivisionByZero);
+        assert!(err.span.is_some());
+    }
 }

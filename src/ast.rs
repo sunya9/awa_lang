@@ -1,11 +1,20 @@
+use crate::span::Span;
 use crate::token::Token;
 use crate::types::Type;
 
 // ===== AST =====
-// Clone を derive する理由: 関数を値にすると、Closure が本体 Expr を
-// 保持する。クロージャ生成時に本体を複製できる必要があるため。
+// パーサが作る式。各ノードがソース上の位置（span）を持つので、型エラーや
+// 実行時エラーを「どこで起きたか」と共に報告できる。
+// Clone を derive する理由: 関数を値にすると、Closure が本体を保持し、
+// クロージャ生成時に本体を複製できる必要があるため。
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprKind {
     Num(f64),
     Bool(bool),     // 真偽値リテラル
     Var(String),    // 変数参照
@@ -63,6 +72,7 @@ pub struct TypeDef {
 #[derive(Debug, Clone)]
 pub struct TExpr {
     pub ty: Type,
+    pub span: Span,
     pub kind: TExprKind,
 }
 
