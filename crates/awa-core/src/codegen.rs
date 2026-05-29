@@ -347,9 +347,12 @@ struct Module {
     value_globals: HashMap<String, Type>,   // トップレベルの値 let 名 → 型（LLVM グローバル変数）
     instances: HashSet<String>,             // 発行済みの特殊化インスタンス（マングル名）
     ctors: HashMap<String, CtorInfo>,       // 構築子名 → 情報
+    // 型名 → その全構築子（宣言順）。構造的等価 ==/!= の生成で variant を列挙するのに使う。
+    type_variants: HashMap<String, Vec<CtorInfo>>,
     strings: String,                        // 文字列リテラルのグローバル定義
     str_ctr: usize,
     drops: HashSet<String>,                 // 生成済み drop_fn 名（フィールド型レイアウトごと）
+    eqs: HashSet<String>,                   // 生成済み構造的等価関数 eq$<ty> 名（型ごと・メモ化）
 }
 
 // トップレベル関数の定義（単相化で本体を特殊化するため本体も持つ）。
@@ -1052,13 +1055,24 @@ impl Gen {
         }
         let llty = llvm_ty(&l.ty)?;
         let float = is_float(&l.ty);
-        // 複合ヒープ型（ADT/タプル/配列）の ==/!= はポインタ比較になってしまい構造的でない。
-        // 黙って誤った結果＋リークを出すより、明示的に未対応とする（パターンマッチを使う）。
-        // String はこの手前で str_binop（中身比較）に分岐済み。
+        // 複合ヒープ型（ADT/タプル/配列/レコード）の ==/!= は構造的等価関数 eq$ty で比較する
+        // （インタプリタの構造比較と一致）。String はこの手前で str_binop に分岐済み。
         if matches!(op, Token::EqEq | Token::NotEq) && llty == "ptr" {
-            return unsupported(
-                "複合型（ADT/タプル/配列）の ==/!= は native 未対応です。case で分解して比較してください",
-            );
+            let eqfn = ensure_eq_fn(m, &l.ty)?;
+            let eqres = format!("%t{}", self.fresh());
+            self.line(&format!(
+                "{} = call i1 @{}(ptr {}, ptr {})",
+                eqres, eqfn, lv, rv
+            ));
+            // 演算子は両オペランドを consume する。
+            self.release(&lv, &l.ty);
+            self.release(&rv, &r.ty);
+            if matches!(op, Token::NotEq) {
+                let neg = format!("%t{}", self.fresh());
+                self.line(&format!("{} = xor i1 {}, true", neg, eqres));
+                return Ok(neg);
+            }
+            return Ok(eqres);
         }
         let reg = format!("%t{}", self.fresh());
         // 整数除算は 0 除算を実行時チェック（0 ならメッセージを出して exit）。
@@ -1801,6 +1815,191 @@ fn ensure_drop_fn(
     Ok(Some(name))
 }
 
+// 型 fty の値 va, vb を等価関数 eq$fty で比較する呼び出しを g に出し、結果 i1 reg を返す。
+fn emit_eq_call(g: &mut Gen, m: &mut Module, fty: &Type, va: &str, vb: &str) -> Result<String> {
+    let f = ensure_eq_fn(m, fty)?;
+    let llty = llvm_ty(fty)?;
+    let r = format!("%t{}", g.fresh());
+    g.line(&format!("{} = call i1 @{}({} {}, {} {})", r, f, llty, va, llty, vb));
+    Ok(r)
+}
+
+// 型 ty の構造的等価関数 `define i1 @eq$<ty>(<llty> %a, <llty> %b)` を生成（メモ化）し名前を返す。
+// インタプリタの Value::PartialEq と一致する意味論（ADT は tag＋フィールド再帰、配列/タプルは
+// 要素ごと、String は中身）。再帰型（List 等）は自己参照する名前付き関数なので問題ない。
+fn ensure_eq_fn(m: &mut Module, ty: &Type) -> Result<String> {
+    let name = format!("eq${}", mangle_ty(ty));
+    if m.eqs.contains(&name) {
+        return Ok(name);
+    }
+    m.eqs.insert(name.clone());
+    let llty = llvm_ty(ty)?;
+    let mut g = Gen::new();
+    match ty {
+        // スカラ（i64 系: Int/Long）。
+        Type::Int | Type::Long => {
+            g.line("%r = icmp eq i64 %a, %b");
+            g.line("ret i1 %r");
+        }
+        // ランタイムハンドル（Future/Socket）は i64 として同一性で比較。
+        Type::Con(n, _) if n == "Future" || n == "Socket" => {
+            g.line("%r = icmp eq i64 %a, %b");
+            g.line("ret i1 %r");
+        }
+        Type::Bool => {
+            g.line("%r = icmp eq i1 %a, %b");
+            g.line("ret i1 %r");
+        }
+        Type::Float => {
+            g.line("%r = fcmp oeq double %a, %b");
+            g.line("ret i1 %r");
+        }
+        // Unit は唯一の値、型変数は使われない → 常に等しい。
+        Type::Unit | Type::Var(_) => {
+            g.line("ret i1 true");
+        }
+        // 関数は等価を定義しない（インタプリタも false）。
+        Type::Fun(..) => {
+            g.line("ret i1 false");
+        }
+        // 文字列は中身比較（strcmp）。
+        Type::Str => {
+            g.line("%ab = getelementptr i8, ptr %a, i64 16");
+            g.line("%bb = getelementptr i8, ptr %b, i64 16");
+            g.line("%c = call i32 @strcmp(ptr %ab, ptr %bb)");
+            g.line("%r = icmp eq i32 %c, 0");
+            g.line("ret i1 %r");
+        }
+        // 配列: 長さ一致 → 要素ごとに比較。
+        Type::Con(n, args) if n == "Array" => {
+            let elem = &args[0];
+            let ell = llvm_ty(elem)?;
+            let esize = elem_size_of(&ell);
+            g.line("%lap = getelementptr i8, ptr %a, i64 16");
+            g.line("%la = load i64, ptr %lap");
+            g.line("%lbp = getelementptr i8, ptr %b, i64 16");
+            g.line("%lb = load i64, ptr %lbp");
+            g.line("%res = alloca i1");
+            g.line("store i1 true, ptr %res");
+            g.line("%leq = icmp eq i64 %la, %lb");
+            g.line("br i1 %leq, label %loop, label %ne");
+            g.label("ne");
+            g.line("store i1 false, ptr %res");
+            g.line("br label %end");
+            g.label("loop");
+            g.line("%ip = alloca i64");
+            g.line("store i64 0, ptr %ip");
+            g.line("br label %cond");
+            g.label("cond");
+            g.line("%i = load i64, ptr %ip");
+            g.line("%done = icmp sge i64 %i, %la");
+            g.line("br i1 %done, label %end, label %body");
+            g.label("body");
+            g.line(&format!("%off0 = mul i64 %i, {}", esize));
+            g.line(&format!("%off = add i64 %off0, {}", ARR_HDR_SIZE));
+            g.line("%eap = getelementptr i8, ptr %a, i64 %off");
+            g.line(&format!("%ea = load {}, ptr %eap", ell));
+            g.line("%ebp = getelementptr i8, ptr %b, i64 %off");
+            g.line(&format!("%eb = load {}, ptr %ebp", ell));
+            let eeq = emit_eq_call(&mut g, m, elem, "%ea", "%eb")?;
+            g.line(&format!("br i1 {}, label %next, label %elem_ne", eeq));
+            g.label("elem_ne");
+            g.line("store i1 false, ptr %res");
+            g.line("br label %end");
+            g.label("next");
+            g.line("%i1 = add i64 %i, 1");
+            g.line("store i64 %i1, ptr %ip");
+            g.line("br label %cond");
+            g.label("end");
+            g.line("%r = load i1, ptr %res");
+            g.line("ret i1 %r");
+        }
+        // タプル: タグ無し単一ヴァリアント。各フィールドを比較して AND。
+        Type::Con(n, args) if n == "Tuple" => {
+            let bty = block_ty(args)?;
+            let mut acc = "true".to_string();
+            for (i, fty) in args.iter().enumerate() {
+                let fll = llvm_ty(fty)?;
+                let fa = format!("%fa{}", i);
+                let fb = format!("%fb{}", i);
+                g.line(&format!("{} = getelementptr {}, ptr %a, i32 0, i32 {}", fa, bty, i + 3));
+                let va = format!("%va{}", i);
+                g.line(&format!("{} = load {}, ptr {}", va, fll, fa));
+                g.line(&format!("{} = getelementptr {}, ptr %b, i32 0, i32 {}", fb, bty, i + 3));
+                let vb = format!("%vb{}", i);
+                g.line(&format!("{} = load {}, ptr {}", vb, fll, fb));
+                let ei = emit_eq_call(&mut g, m, fty, &va, &vb)?;
+                let next = format!("%acc{}", i);
+                g.line(&format!("{} = and i1 {}, {}", next, acc, ei));
+                acc = next;
+            }
+            g.line(&format!("ret i1 {}", acc));
+        }
+        // ADT / レコード: tag を比較し、一致すればその variant のフィールドを再帰比較。
+        Type::Con(n, args) => {
+            let variants = m.type_variants.get(n).cloned().ok_or_else(|| {
+                AwaError::Unsupported(format!("等価比較できない型: {}", n))
+            })?;
+            g.line("%tap = getelementptr i8, ptr %a, i64 16");
+            g.line("%ta = load i32, ptr %tap");
+            g.line("%tbp = getelementptr i8, ptr %b, i64 16");
+            g.line("%tb = load i32, ptr %tbp");
+            g.line("%res = alloca i1");
+            g.line("store i1 false, ptr %res");
+            g.line("%teq = icmp eq i32 %ta, %tb");
+            g.line("br i1 %teq, label %cmp, label %end");
+            g.label("cmp");
+            let labels: Vec<String> = variants.iter().map(|v| format!("v{}", v.tag)).collect();
+            let arms: String = variants
+                .iter()
+                .zip(labels.iter())
+                .map(|(v, l)| format!("i32 {}, label %{}", v.tag, l))
+                .collect::<Vec<_>>()
+                .join(" ");
+            g.line(&format!("switch i32 %ta, label %end [ {} ]", arms));
+            let param_map_of = |v: &CtorInfo| -> HashMap<String, Type> {
+                v.type_params.iter().cloned().zip(args.iter().cloned()).collect()
+            };
+            for (v, l) in variants.iter().zip(labels.iter()) {
+                g.label(l);
+                let pm = param_map_of(v);
+                let field_tys: Vec<Type> = v
+                    .field_texprs
+                    .iter()
+                    .map(|t| resolve_field(t, &pm))
+                    .collect::<Result<_>>()?;
+                let bty = block_ty(&field_tys)?;
+                let mut acc = "true".to_string();
+                for (i, fty) in field_tys.iter().enumerate() {
+                    let fll = llvm_ty(fty)?;
+                    let fa = format!("%f{}a{}", v.tag, i);
+                    let fb = format!("%f{}b{}", v.tag, i);
+                    g.line(&format!("{} = getelementptr {}, ptr %a, i32 0, i32 {}", fa, bty, i + 3));
+                    let va = format!("%v{}a{}", v.tag, i);
+                    g.line(&format!("{} = load {}, ptr {}", va, fll, fa));
+                    g.line(&format!("{} = getelementptr {}, ptr %b, i32 0, i32 {}", fb, bty, i + 3));
+                    let vb = format!("%v{}b{}", v.tag, i);
+                    g.line(&format!("{} = load {}, ptr {}", vb, fll, fb));
+                    let ei = emit_eq_call(&mut g, m, fty, &va, &vb)?;
+                    let next = format!("%acc{}_{}", v.tag, i);
+                    g.line(&format!("{} = and i1 {}, {}", next, acc, ei));
+                    acc = next;
+                }
+                g.line(&format!("store i1 {}, ptr %res", acc));
+                g.line("br label %end");
+            }
+            g.label("end");
+            g.line("%r = load i1, ptr %res");
+            g.line("ret i1 %r");
+        }
+    }
+    m.funcs.push_str(&format!(
+        "define i1 @{}({} %a, {} %b) {{\n{}}}\n\n",
+        name, llty, llty, g.out
+    ));
+    Ok(name)
+}
+
 // 1 つの関数定義を生成して module.funcs に追記する。
 // シグネチャ: define <ret> @name(ptr %env, <params...>)。本体冒頭でキャプチャを env から load。
 fn gen_function(
@@ -2002,6 +2201,25 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
         }
     }
 
+    // 型名 → 全構築子（宣言順）。構造的等価生成で variant を列挙する。
+    let mut type_variants: HashMap<String, Vec<CtorInfo>> = HashMap::new();
+    for s in stmts {
+        if let TStmt::Type(def) = s {
+            let vs: Vec<CtorInfo> = def
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(tag, v)| CtorInfo {
+                    tag: tag as u32,
+                    arity: v.fields.len(),
+                    type_params: def.params.clone(),
+                    field_texprs: v.fields.clone(),
+                })
+                .collect();
+            type_variants.insert(def.name.clone(), vs);
+        }
+    }
+
     let mut m = Module {
         funcs: String::new(),
         fn_ctr: 0,
@@ -2009,9 +2227,11 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
         value_globals,
         instances: HashSet::new(),
         ctors,
+        type_variants,
         strings: String::new(),
         str_ctr: 0,
         drops: HashSet::new(),
+        eqs: HashSet::new(),
     };
 
     // 単相なトップレベル関数だけを @name で先に出力する。

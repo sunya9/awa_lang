@@ -2353,6 +2353,35 @@ mod tests {
     }
 
     #[test]
+    fn 構造的等価_native() {
+        // 複合型（タプル/配列/レコード/ADT）の ==/!= を native で構造比較。リーク 0。
+        let (out, code) = compile_run_status(
+            "type P { x: Int\n y: Int }\n\
+             type Opt { Some(Int)\n None }\n\
+             print(\"${(1, 2) == (1, 2)}\")\n\
+             print(\"${(1, \"a\") == (1, \"b\")}\")\n\
+             print(\"${[1, 2, 3] == [1, 2, 3]}\")\n\
+             print(\"${[1, 2] == [1, 2, 3]}\")\n\
+             print(\"${P { x = 1, y = 2 } == P { x = 1, y = 2 }}\")\n\
+             print(\"${Some(5) == Some(6)}\")\n\
+             print(\"${Some(5) == None}\")\n\
+             print(\"${(1, [2, 3]) != (1, [2, 3])}\")\n",
+        );
+        assert_eq!(out, "true\nfalse\ntrue\nfalse\ntrue\nfalse\nfalse\nfalse\n");
+        assert_eq!(code, 0, "リーク検出（生存ヒープ {}）", code);
+    }
+
+    #[test]
+    fn 構造的等価_interp() {
+        // インタプリタの構造比較（ネイティブの eq$ty と同じ意味論）。
+        assert_eq!(eval("(1, [2, 3]) == (1, [2, 3])"), Ok(Value::Bool(true)));
+        assert_eq!(eval("(1, [2, 3]) == (1, [2, 4])"), Ok(Value::Bool(false)));
+        // ネスト ADT（tag＋フィールド再帰）。
+        assert_eq!(eval("type T { A(Int)\n B }\nA(1) == A(1)"), Ok(Value::Bool(true)));
+        assert_eq!(eval("type T { A(Int)\n B }\nA(1) == B"), Ok(Value::Bool(false)));
+    }
+
+    #[test]
     fn std_option_do記法() {
         // do は .flatMap 連鎖へ脱糖し、Option の pub impl メソッドで解決される。
         let out = std_build_run(
