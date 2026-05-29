@@ -8,10 +8,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
     let mut tokens: Vec<Spanned<Token>> = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
-    // 丸括弧のネスト深さ。括弧の中では改行を終端にしない（複数行の関数呼び出し
-    // や式の折り返しを自然に書けるようにするため）。波括弧 {} は数えない:
-    // ブロック内では改行が文の区切りとして必要だから。
-    let mut paren_depth: i32 = 0;
+    // 開いているブラケットのスタック（'(' か '{'）。改行を終端にするかは「最も内側の
+    // ブラケット」で決まる: '(' の中では改行を無視（複数行の式・呼び出しを自然に書ける）、
+    // '{' の中では改行を文の区切りにする（ブロック・do）。これにより run(do { ... }) のように
+    // 括弧の中の波括弧ブロックでも複数行の文が書ける。
+    let mut brackets: Vec<char> = Vec::new();
 
     while i < chars.len() {
         // このトークンの開始位置。span は start..（消費後の i）。
@@ -24,7 +25,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
             // 改行: 括弧の外で、直前のトークンが式を完結しうるなら終端を挿入する。
             // それ以外（演算子の直後、括弧内など）の改行はただの空白として無視。
             '\n' => {
-                if paren_depth == 0 && tokens.last().map(|t| ends_expr(&t.node)).unwrap_or(false) {
+                // 最も内側が '(' の時だけ改行を無視。'{' 内・トップレベルでは終端候補。
+                let suppressed = matches!(brackets.last(), Some('('));
+                if !suppressed && tokens.last().map(|t| ends_expr(&t.node)).unwrap_or(false) {
                     tokens.push(Spanned::new(Token::Terminator, Span::new(start, start + 1)));
                 }
                 i += 1;
@@ -133,20 +136,26 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
             }
             '(' => {
                 tokens.push(Spanned::new(Token::LParen, Span::new(start, start + 1)));
-                paren_depth += 1;
+                brackets.push('(');
                 i += 1;
             }
             ')' => {
                 tokens.push(Spanned::new(Token::RParen, Span::new(start, start + 1)));
-                paren_depth = (paren_depth - 1).max(0);
+                if brackets.last() == Some(&'(') {
+                    brackets.pop();
+                }
                 i += 1;
             }
             '{' => {
                 tokens.push(Spanned::new(Token::LBrace, Span::new(start, start + 1)));
+                brackets.push('{');
                 i += 1;
             }
             '}' => {
                 tokens.push(Spanned::new(Token::RBrace, Span::new(start, start + 1)));
+                if brackets.last() == Some(&'{') {
+                    brackets.pop();
+                }
                 i += 1;
             }
             ',' => {

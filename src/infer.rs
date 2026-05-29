@@ -82,7 +82,57 @@ impl Checker {
         for (name, arg, ret) in builtins {
             c.env.insert(name.to_string(), mono(vec![arg], ret));
         }
+        c.seed_async();
         c
+    }
+
+    // 非同期の組込型・関数・メソッドを seed する（eval::builtins_env と名前を一致させること）。
+    // Future は組込型（arity 1）。pure/delay/run は関数、flatMap/map は Future のメソッド。
+    fn seed_async(&mut self) {
+        self.arities.insert("Future".to_string(), 1);
+        // 新しい型変数 Type::Var(id) と、その id を返す。
+        let mut fresh = || match self.vargen.fresh() {
+            Type::Var(id) => id,
+            _ => unreachable!(),
+        };
+        let future = |t: Type| Type::Con("Future".to_string(), vec![t]);
+        let scheme = |vars: Vec<u32>, params: Vec<Type>, ret: Type| Scheme {
+            vars,
+            ty: Type::Fun(params, Box::new(ret)),
+        };
+
+        // pure : ∀a. a -> Future(a)
+        let a = fresh();
+        self.env.insert(
+            "pure".to_string(),
+            scheme(vec![a], vec![Type::Var(a)], future(Type::Var(a))),
+        );
+        // delay : ∀a. (Int, a) -> Future(a)
+        let a = fresh();
+        self.env.insert(
+            "delay".to_string(),
+            scheme(vec![a], vec![Type::Int, Type::Var(a)], future(Type::Var(a))),
+        );
+        // run : ∀a. Future(a) -> a
+        let a = fresh();
+        self.env.insert(
+            "run".to_string(),
+            scheme(vec![a], vec![future(Type::Var(a))], Type::Var(a)),
+        );
+        // Future(a).flatMap : ∀a b. (Future(a), fn(a) -> Future(b)) -> Future(b)
+        let (a, b) = (fresh(), fresh());
+        let k = Type::Fun(vec![Type::Var(a)], Box::new(future(Type::Var(b))));
+        self.methods.insert(
+            ("Future".to_string(), "flatMap".to_string()),
+            scheme(vec![a, b], vec![future(Type::Var(a)), k], future(Type::Var(b))),
+        );
+        // Future(a).map : ∀a b. (Future(a), fn(a) -> b) -> Future(b)
+        let (a, b) = (fresh(), fresh());
+        let k = Type::Fun(vec![Type::Var(a)], Box::new(Type::Var(b)));
+        self.methods.insert(
+            ("Future".to_string(), "map".to_string()),
+            scheme(vec![a, b], vec![future(Type::Var(a)), k], future(Type::Var(b))),
+        );
     }
 
     // プログラム（トップレベルの文の並び）を型検査し、型付き AST（elaboration の結果）を返す。

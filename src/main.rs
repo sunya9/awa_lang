@@ -365,6 +365,54 @@ mod tests {
         Value::Int(n as i64)
     }
 
+    // ===== 非同期: 論理時間イベントループ（Phase 11）=====
+
+    #[test]
+    fn async_doで複数のdelayを合成() {
+        // do が Future の flatMap 連鎖へ脱糖され、run がイベントループを回して合成する。
+        assert_eq!(
+            eval("run(do { x <- delay(10, 1); y <- delay(5, 2); pure(x + y) })"),
+            Ok(Value::Int(3))
+        );
+    }
+
+    #[test]
+    fn async_pureは即解決() {
+        assert_eq!(eval("run(pure(42))"), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn async_mapで変換() {
+        assert_eq!(
+            eval("run(delay(3, 21).map(fn(n: Int) -> Int { n * 2 }))"),
+            Ok(Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn async_複数行のrun_doが書ける() {
+        // run( ... ) の括弧の中でも do ブロックの改行が文区切りになる。
+        let src = "run(do {\n  x <- delay(1, 10)\n  y <- delay(2, 20)\n  pure(x + y)\n})";
+        assert_eq!(eval(src), Ok(Value::Int(30)));
+    }
+
+    #[test]
+    fn example_async() {
+        let src = include_str!("../examples/async.awa");
+        let mut env = eval::builtins_env();
+        let mut checker = Checker::new();
+        let vals = run_values(src, &mut env, &mut checker).expect("型検査・評価が通るはず");
+        assert_eq!(vals.first(), Some(&Value::Int(3)));
+        assert_eq!(vals.last(), Some(&Value::Int(12)));
+    }
+
+    #[test]
+    fn async_future注釈つき関数() {
+        // Future(a) を型注釈に書ける（組込型）。delay の結果を返す関数。
+        let src = "let step = fn(n: Int) -> Future(Int) { delay(1, n + 1) }\nrun(step(41))";
+        assert_eq!(eval(src), Ok(Value::Int(42)));
+    }
+
     #[test]
     fn 演算子優先順位() {
         assert_eq!(eval("1 + 2 * 3"), Ok(num(7.0)));

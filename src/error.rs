@@ -58,6 +58,8 @@ pub enum AwaError {
     NotExported { module: String, name: String }, // 参照先がそのモジュールで pub 公開されていない
     UnknownModule(String),                        // 修飾アクセスの左がモジュールでない（未 import 等）
     PrivateMethod { ty: String, method: String }, // 非公開メソッドを他モジュールから呼んだ
+    // ----- 非同期（Phase 11） -----
+    Deadlock, // イベントループが空なのに run の Future が未解決
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -136,6 +138,10 @@ impl fmt::Display for AwaError {
                 f,
                 "メソッド {}.{} は非公開です（定義側で pub fn か pub impl にしてください）",
                 ty, method
+            ),
+            AwaError::Deadlock => write!(
+                f,
+                "イベントループがデッドロックしました（待機中の Future が解決されません）"
             ),
         }
     }

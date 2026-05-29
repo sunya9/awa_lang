@@ -25,6 +25,9 @@ pub enum Value {
     Ctor { name: String, arity: usize },
     // 構築済みの ADT 値。構築子名と引数。例: Some(3) → Data{ctor:"Some", args:[Num(3)]}。
     Data { ctor: String, args: Vec<Value> },
+    // 非同期の Future。ランタイム所有のイベントループ内のハンドル（id）への不透明参照。
+    // 中身（解決値・待ち継続）はランタイムが持ち、awa からは見えない（純粋性を保つ）。
+    Future(usize),
 }
 
 // クロージャ = 関数 + 定義時の環境。
@@ -80,6 +83,7 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{}", b),
             Value::Func(c) => write!(f, "<fn/{}>", c.params.len()),
             Value::Native(name) => write!(f, "<native {}>", name),
+            Value::Future(_) => write!(f, "<future>"),
             Value::Unit => write!(f, "Nil"),
             Value::Ctor { name, arity } => write!(f, "<ctor {}/{}>", name, arity),
             // 構築済み値は Some(3) / None / Cons(1, Nil) のように表示。
@@ -112,6 +116,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Func(_) | Value::Ctor { .. } | Value::Native(_) => "Func",
         Value::Unit => "Nil",
         Value::Data { .. } => "Data",
+        Value::Future(_) => "Future",
     }
 }
 

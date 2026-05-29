@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{Pattern, TExpr, TExprKind, TMethod, TStmt, TypeDef};
@@ -5,6 +7,9 @@ use crate::error::{AwaError, LocatedError};
 use crate::span::Span;
 use crate::token::Token;
 use crate::value::{Closure, Env, Value, type_name};
+
+// イベントループ内で継続を呼ぶときの便宜 span（位置の意味は薄い）。
+const NOSPAN: Span = Span { start: 0, end: 0 };
 
 // ===== 評価（Evaluator）=====
 
@@ -82,74 +87,14 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
             env: env.clone(),
             name: None, // 束縛時に let 側で名前を付け直す（再帰のため）
         }))),
-        // 関数呼び出し。
+        // 関数呼び出し。対象と引数を評価し、call_value へ振り分ける（関数/構築子/組込）。
         TExprKind::Call(callee, args) => {
-            // 1. 呼ぶ対象を評価する。構築子なら Data を組み立てて返す。
             let callee_val = eval_expr(callee, env)?;
-            let closure = match callee_val {
-                Value::Func(c) => c,
-                // 構築子適用: 引数を評価して Data を作る。
-                Value::Ctor { name, arity } => {
-                    if args.len() != arity {
-                        return Err(LocatedError::at(
-                            AwaError::ArityMismatch {
-                                expected: arity,
-                                found: args.len(),
-                            },
-                            span,
-                        ));
-                    }
-                    let mut arg_values = Vec::with_capacity(args.len());
-                    for arg in args {
-                        arg_values.push(eval_expr(arg, env)?);
-                    }
-                    return Ok(Value::Data {
-                        ctor: name,
-                        args: arg_values,
-                    });
-                }
-                // 組込関数（変換など）。引数を評価して native_call へ。
-                Value::Native(name) => {
-                    let mut arg_values = Vec::with_capacity(args.len());
-                    for arg in args {
-                        arg_values.push(eval_expr(arg, env)?);
-                    }
-                    return native_call(&name, arg_values);
-                }
-                other => {
-                    return Err(LocatedError::at(
-                        AwaError::NotCallable(type_name(&other)),
-                        span,
-                    ));
-                }
-            };
-            // 2. 引数の個数チェック。
-            if args.len() != closure.params.len() {
-                return Err(LocatedError::at(
-                    AwaError::ArityMismatch {
-                        expected: closure.params.len(),
-                        found: args.len(),
-                    },
-                    span,
-                ));
-            }
-            // 3. 各引数を「呼び出し側の env」で評価する（ここは呼び出し側スコープ）。
             let mut arg_values = Vec::with_capacity(args.len());
             for arg in args {
                 arg_values.push(eval_expr(arg, env)?);
             }
-            // 本体を評価する環境を作る。ベースはキャプチャした closure.env
-            // （レキシカルスコープ）で、呼び出し側 env ではない。
-            let mut call_env = closure.env.clone();
-            // 再帰のため、名前付き関数なら「名前→自分自身」を call_env に入れる。
-            if let Some(name) = &closure.name {
-                call_env.insert(name.clone(), Value::Func(closure.clone()));
-            }
-            // 仮引数に実引数を束縛する。
-            for (param, value) in closure.params.iter().zip(arg_values) {
-                call_env.insert(param.clone(), value);
-            }
-            eval_expr(&closure.body, &call_env)
+            call_value(callee_val, arg_values, span)
         }
         // ブロックは新しいスコープ。親 env をコピーして始め、抜けると破棄する
         // （ブロック内の let は外に漏れない）。値は最後の文が式ならその値、
@@ -333,9 +278,295 @@ fn num_cmp(l: &Value, r: &Value) -> std::cmp::Ordering {
     }
 }
 
-// ===== 組込関数（最小限の型変換）=====
+// 値を引数列に適用する（関数・構築子・組込の振り分け）。eval_expr の Call と
+// イベントループの継続呼び出しの両方から使う共通経路。
+fn call_value(callee: Value, arg_values: Vec<Value>, span: Span) -> Result<Value, LocatedError> {
+    match callee {
+        Value::Func(closure) => {
+            if arg_values.len() != closure.params.len() {
+                return Err(LocatedError::at(
+                    AwaError::ArityMismatch {
+                        expected: closure.params.len(),
+                        found: arg_values.len(),
+                    },
+                    span,
+                ));
+            }
+            // 本体はキャプチャ env（レキシカルスコープ）をベースに評価する。
+            let mut call_env = closure.env.clone();
+            if let Some(name) = &closure.name {
+                call_env.insert(name.clone(), Value::Func(closure.clone()));
+            }
+            for (param, value) in closure.params.iter().zip(arg_values) {
+                call_env.insert(param.clone(), value);
+            }
+            eval_expr(&closure.body, &call_env)
+        }
+        Value::Ctor { name, arity } => {
+            if arg_values.len() != arity {
+                return Err(LocatedError::at(
+                    AwaError::ArityMismatch {
+                        expected: arity,
+                        found: arg_values.len(),
+                    },
+                    span,
+                ));
+            }
+            Ok(Value::Data {
+                ctor: name,
+                args: arg_values,
+            })
+        }
+        Value::Native(name) => native_call(&name, arg_values, span),
+        other => Err(LocatedError::at(AwaError::NotCallable(type_name(&other)), span)),
+    }
+}
+
+// ===== 非同期: 論理時間イベントループ（Phase 11）=====
+// ループとキューはランタイム（この thread_local）が所有する。awa は純粋のまま、
+// Value::Future(id) という不透明ハンドルだけを扱う。継続は awa のクロージャで、
+// ランタイムが待ち行列に保持し、Future が解決した時に呼ぶ（= flatMap）。
+// 時間は論理 tick（OS 不要・完全決定的）。
+
+// 待ち継続。クロージャを直接 Box で持つと resolve の &mut 借用と絡むので enum 化する。
+enum Waiter {
+    Forward(usize),       // この Future が解決したら g も同じ値で解決
+    Bind(Value, usize),   // 解決値 x に対し k(x)=Future h を作り、h を g にリンク（flatMap）
+    Map(Value, usize),    // 解決値 x に対し g を k(x)（普通の値）で解決（map）
+}
+
+enum FutureState {
+    Resolved(Value),
+    Pending(Vec<Waiter>),
+}
+
+struct Timer {
+    tick: u64,
+    seq: u64, // 同 tick の安定順序
+    id: usize,
+    value: Value,
+}
+
+struct EventLoop {
+    next_id: usize,
+    seq: u64,
+    now: u64,
+    futures: HashMap<usize, FutureState>,
+    timers: Vec<Timer>,
+}
+
+impl EventLoop {
+    fn new() -> Self {
+        EventLoop {
+            next_id: 0,
+            seq: 0,
+            now: 0,
+            futures: HashMap::new(),
+            timers: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static LOOP: RefCell<EventLoop> = RefCell::new(EventLoop::new());
+}
+
+// プログラム実行の冒頭でループを初期化する（テスト/REPL が状態を持ち越さないように）。
+fn loop_reset() {
+    LOOP.with(|l| *l.borrow_mut() = EventLoop::new());
+}
+
+fn fut_pure(v: Value) -> usize {
+    LOOP.with(|l| {
+        let mut l = l.borrow_mut();
+        let id = l.next_id;
+        l.next_id += 1;
+        l.futures.insert(id, FutureState::Resolved(v));
+        id
+    })
+}
+
+fn fut_pending() -> usize {
+    LOOP.with(|l| {
+        let mut l = l.borrow_mut();
+        let id = l.next_id;
+        l.next_id += 1;
+        l.futures.insert(id, FutureState::Pending(Vec::new()));
+        id
+    })
+}
+
+fn fut_delay(ms: u64, v: Value) -> usize {
+    LOOP.with(|l| {
+        let mut l = l.borrow_mut();
+        let id = l.next_id;
+        l.next_id += 1;
+        l.futures.insert(id, FutureState::Pending(Vec::new()));
+        let tick = l.now + ms;
+        let seq = l.seq;
+        l.seq += 1;
+        l.timers.push(Timer { tick, seq, id, value: v });
+        id
+    })
+}
+
+// 解決済みなら値（複製）を返す。
+fn fut_resolved(id: usize) -> Option<Value> {
+    LOOP.with(|l| match l.borrow().futures.get(&id) {
+        Some(FutureState::Resolved(v)) => Some(v.clone()),
+        _ => None,
+    })
+}
+
+// Pending な Future に待ち継続を追加する。
+fn fut_wait(id: usize, w: Waiter) {
+    LOOP.with(|l| {
+        if let Some(FutureState::Pending(ws)) = l.borrow_mut().futures.get_mut(&id) {
+            ws.push(w);
+        }
+    });
+}
+
+fn expect_future(v: Value) -> Result<usize, LocatedError> {
+    match v {
+        Value::Future(id) => Ok(id),
+        other => Err(LocatedError::from(AwaError::TypeError {
+            expected: "Future",
+            found: type_name(&other),
+        })),
+    }
+}
+
+// h が解決したら g を同じ値で解決する（flatMap の内側 Future を結果へ繋ぐ）。
+fn fut_link(h: usize, g: usize) -> Result<(), LocatedError> {
+    match fut_resolved(h) {
+        Some(y) => fut_resolve(g, y),
+        None => {
+            fut_wait(h, Waiter::Forward(g));
+            Ok(())
+        }
+    }
+}
+
+// Future を値 v で解決し、待ち継続を発火する。継続呼び出し(call_value)中は
+// RefCell の借用を保持しない（再入で二重借用しないため、待ち行列を取り出してから処理）。
+fn fut_resolve(id: usize, v: Value) -> Result<(), LocatedError> {
+    let waiters = LOOP.with(|l| {
+        let mut l = l.borrow_mut();
+        match l.futures.insert(id, FutureState::Resolved(v.clone())) {
+            Some(FutureState::Pending(ws)) => ws,
+            _ => Vec::new(),
+        }
+    });
+    for w in waiters {
+        match w {
+            Waiter::Forward(g) => fut_resolve(g, v.clone())?,
+            Waiter::Bind(k, g) => {
+                let h = expect_future(call_value(k, vec![v.clone()], NOSPAN)?)?;
+                fut_link(h, g)?;
+            }
+            Waiter::Map(k, g) => {
+                let y = call_value(k, vec![v.clone()], NOSPAN)?;
+                fut_resolve(g, y)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// flatMap: f が解決したら k(x)=Future を作り結果 g に繋ぐ。
+fn fut_flatmap(f: usize, k: Value) -> Result<usize, LocatedError> {
+    let g = fut_pending();
+    match fut_resolved(f) {
+        Some(x) => {
+            let h = expect_future(call_value(k, vec![x], NOSPAN)?)?;
+            fut_link(h, g)?;
+        }
+        None => fut_wait(f, Waiter::Bind(k, g)),
+    }
+    Ok(g)
+}
+
+// map: f が解決したら g を k(x)（普通の値）で解決。
+fn fut_map(f: usize, k: Value) -> Result<usize, LocatedError> {
+    let g = fut_pending();
+    match fut_resolved(f) {
+        Some(x) => {
+            let y = call_value(k, vec![x], NOSPAN)?;
+            fut_resolve(g, y)?;
+        }
+        None => fut_wait(f, Waiter::Map(k, g)),
+    }
+    Ok(g)
+}
+
+// run: f が解決するまでイベントループを回す。最早タイマーを時刻順に処理し、
+// キューが空で未解決ならデッドロック。
+fn fut_run(f: usize, span: Span) -> Result<Value, LocatedError> {
+    loop {
+        if let Some(v) = fut_resolved(f) {
+            return Ok(v);
+        }
+        let timer = LOOP.with(|l| {
+            let mut l = l.borrow_mut();
+            if l.timers.is_empty() {
+                return None;
+            }
+            // 最早 (tick, seq) のタイマーを選ぶ。
+            let mut mi = 0;
+            for i in 1..l.timers.len() {
+                if (l.timers[i].tick, l.timers[i].seq) < (l.timers[mi].tick, l.timers[mi].seq) {
+                    mi = i;
+                }
+            }
+            let t = l.timers.swap_remove(mi);
+            l.now = t.tick;
+            Some(t)
+        });
+        match timer {
+            Some(t) => fut_resolve(t.id, t.value)?,
+            None => return Err(LocatedError::at(AwaError::Deadlock, span)),
+        }
+    }
+}
+
+// ===== 組込関数（型変換 + 非同期）=====
 // 名前で識別される native 関数。型検査済みなので引数の型は保証されている。
-fn native_call(name: &str, args: Vec<Value>) -> Result<Value, LocatedError> {
+fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, LocatedError> {
+    // 非同期の組込（イベントループに触れる / 継続を呼ぶ）。
+    match name {
+        "pure" => {
+            let v = args.into_iter().next().expect("pure の引数");
+            return Ok(Value::Future(fut_pure(v)));
+        }
+        "delay" => {
+            let mut it = args.into_iter();
+            let ms = match it.next() {
+                Some(Value::Int(n)) => n.max(0) as u64,
+                _ => unreachable!("delay の第1引数は Int"),
+            };
+            let v = it.next().expect("delay の第2引数");
+            return Ok(Value::Future(fut_delay(ms, v)));
+        }
+        "run" => {
+            let f = expect_future(args.into_iter().next().expect("run の引数"))?;
+            return fut_run(f, span);
+        }
+        "Future#flatMap" => {
+            let mut it = args.into_iter();
+            let f = expect_future(it.next().expect("flatMap レシーバ"))?;
+            let k = it.next().expect("flatMap の関数");
+            return Ok(Value::Future(fut_flatmap(f, k)?));
+        }
+        "Future#map" => {
+            let mut it = args.into_iter();
+            let f = expect_future(it.next().expect("map レシーバ"))?;
+            let k = it.next().expect("map の関数");
+            return Ok(Value::Future(fut_map(f, k)?));
+        }
+        _ => {}
+    }
+    // 型変換の組込（単項）。
     let arg = args.into_iter().next();
     let v = match (name, arg) {
         ("int_to_float", Some(Value::Int(n))) => Value::Float(n as f64),
@@ -360,6 +591,12 @@ pub fn builtins_env() -> Env {
         "long_to_int",
         "int_to_string",
         "float_to_string",
+        // 非同期: イベントループ組込（型側は Checker::new が seed）。
+        "pure",
+        "delay",
+        "run",
+        "Future#flatMap",
+        "Future#map",
     ] {
         env.insert(name.to_string(), Value::Native(name.to_string()));
     }
@@ -369,6 +606,7 @@ pub fn builtins_env() -> Env {
 // プログラム（文の並び）を順に評価し、各文の値を順に返す。
 // env は呼び出し側が所有して渡す（REPL は行をまたいで使い回す）。
 pub fn eval_program(stmts: &[TStmt], env: &mut Env) -> Result<Vec<Value>, LocatedError> {
+    loop_reset(); // 非同期イベントループを初期化（前回実行の状態を持ち越さない）
     let mut results = Vec::new();
     for stmt in stmts {
         match stmt {
