@@ -144,6 +144,15 @@ impl Checker {
         self.env.insert("string_to_int".to_string(), mono(vec![Type::Str], Type::Int));
         self.env.insert("string_length".to_string(), mono(vec![Type::Str], Type::Int));
         self.env.insert("string_byte_length".to_string(), mono(vec![Type::Str], Type::Int));
+        // 数学関数（libm 委譲。std/math がラップする）。単項は Float -> Float。
+        for name in [
+            "math_sqrt", "math_sin", "math_cos", "math_tan", "math_asin", "math_acos", "math_atan",
+            "math_exp", "math_ln", "math_log10", "math_floor", "math_ceil", "math_round",
+        ] {
+            self.env.insert(name.to_string(), mono(vec![Type::Float], Type::Float));
+        }
+        self.env.insert("math_pow".to_string(), mono(vec![Type::Float, Type::Float], Type::Float));
+        self.env.insert("math_atan2".to_string(), mono(vec![Type::Float, Type::Float], Type::Float));
         // 文字単位の操作（JSON/HTTP パーサを awa で書くための土台）。
         // string_char_at: i 番目のコードポイント（範囲外は -1）。char_to_string: 1 文字 String。
         self.env.insert("string_char_at".to_string(), mono(vec![Type::Str, Type::Int], Type::Int));

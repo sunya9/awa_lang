@@ -19,6 +19,7 @@ pub const STDLIB: &[(&str, &str)] = &[
     ("std/string", include_str!("../../../std/string.awa")),
     ("std/pair", include_str!("../../../std/pair.awa")),
     ("std/dict", include_str!("../../../std/dict.awa")),
+    ("std/math", include_str!("../../../std/math.awa")),
     ("std/json", include_str!("../../../std/json.awa")),
     ("std/http", include_str!("../../../std/http.awa")),
 ];

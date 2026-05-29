@@ -1,0 +1,25 @@
+// 標準ライブラリ: 数学関数。組込（libm 委譲）を読みやすい名前でラップする。
+// すべて Float -> Float（pow/atan2 は 2 引数）。三角関数の角度はラジアン。
+pub let pi = 3.141592653589793
+pub let e = 2.718281828459045
+
+pub let sqrt = fn(x: Float) -> Float { math_sqrt(x) }
+pub let sin = fn(x: Float) -> Float { math_sin(x) }
+pub let cos = fn(x: Float) -> Float { math_cos(x) }
+pub let tan = fn(x: Float) -> Float { math_tan(x) }
+pub let asin = fn(x: Float) -> Float { math_asin(x) }
+pub let acos = fn(x: Float) -> Float { math_acos(x) }
+pub let atan = fn(x: Float) -> Float { math_atan(x) }
+pub let exp = fn(x: Float) -> Float { math_exp(x) }
+
+// 自然対数。
+pub let ln = fn(x: Float) -> Float { math_ln(x) }
+pub let log10 = fn(x: Float) -> Float { math_log10(x) }
+
+pub let floor = fn(x: Float) -> Float { math_floor(x) }
+pub let ceil = fn(x: Float) -> Float { math_ceil(x) }
+pub let round = fn(x: Float) -> Float { math_round(x) }
+
+// base の exp 乗。
+pub let pow = fn(base: Float, exp: Float) -> Float { math_pow(base, exp) }
+pub let atan2 = fn(y: Float, x: Float) -> Float { math_atan2(y, x) }

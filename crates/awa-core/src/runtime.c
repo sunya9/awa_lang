@@ -90,6 +90,15 @@ long long awa_string_length(void* strobj) {
 long long awa_string_byte_length(void* strobj) { return (long long)strlen((char*)strobj + 16); }
 // 文字列 → 浮動小数（非数値は 0.0）。
 double awa_string_to_float(void* strobj) { return atof((char*)strobj + 16); }
+// double → 最短往復表現の String（Rust の to_string と一致させるため精度を 1..17 で探す）。
+void* awa_float_str(double x) {
+  char buf[32];
+  for (int p = 1; p <= 17; p++) {
+    snprintf(buf, sizeof buf, "%.*g", p, x);
+    if (strtod(buf, 0) == x) break;
+  }
+  return awa_make_str(buf, (long)strlen(buf));
+}
 // i 番目（0 始まり）のコードポイントを返す。範囲外は -1。
 long long awa_string_char_at(void* strobj, long long idx) {
   if (idx < 0) return -1;

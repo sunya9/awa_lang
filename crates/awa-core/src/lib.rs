@@ -2231,6 +2231,30 @@ mod tests {
     }
 
     #[test]
+    fn std_math_関数() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/math\n\
+             import std/float\n\
+             io.println(float.to_string(math.sqrt(2.0)))\n\
+             io.println(float.to_string(math.pow(2.0, 10.0)))\n\
+             io.println(float.to_string(math.floor(3.7)))\n\
+             io.println(float.to_string(math.ln(math.e)))\n",
+        );
+        assert_eq!(out, "1.4142135623730951\n1024\n3\n1\n");
+    }
+
+    #[test]
+    fn codegen_floatは最短往復表現で表示される() {
+        // native の float 表示が interpreter（Rust）と一致する。
+        let (out, code) = compile_run_status(
+            "print(float_to_string(0.1))\nprint(float_to_string(1.0 / 3.0))",
+        );
+        assert_eq!(out, "0.1\n0.3333333333333333\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn std_int_float_string_追加関数() {
         let out = std_build_run(
             "import std/io\n\

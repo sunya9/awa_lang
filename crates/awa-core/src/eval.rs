@@ -775,6 +775,38 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
             }
             unreachable!("string_byte_length の引数は String");
         }
+        // 数学関数（libm 相当）。単項 Float -> Float。
+        "math_sqrt" | "math_sin" | "math_cos" | "math_tan" | "math_asin" | "math_acos"
+        | "math_atan" | "math_exp" | "math_ln" | "math_log10" | "math_floor" | "math_ceil"
+        | "math_round" => {
+            let f: fn(f64) -> f64 = match name {
+                "math_sqrt" => |x| x.sqrt(),
+                "math_sin" => |x| x.sin(),
+                "math_cos" => |x| x.cos(),
+                "math_tan" => |x| x.tan(),
+                "math_asin" => |x| x.asin(),
+                "math_acos" => |x| x.acos(),
+                "math_atan" => |x| x.atan(),
+                "math_exp" => |x| x.exp(),
+                "math_ln" => |x| x.ln(),
+                "math_log10" => |x| x.log10(),
+                "math_floor" => |x| x.floor(),
+                "math_ceil" => |x| x.ceil(),
+                _ => |x| x.round(),
+            };
+            if let Some(Value::Float(x)) = args.into_iter().next() {
+                return Ok(Value::Float(f(x)));
+            }
+            unreachable!("math 単項の引数は Float");
+        }
+        "math_pow" | "math_atan2" => {
+            let mut it = args.into_iter();
+            if let (Some(Value::Float(a)), Some(Value::Float(b))) = (it.next(), it.next()) {
+                let r = if name == "math_pow" { a.powf(b) } else { a.atan2(b) };
+                return Ok(Value::Float(r));
+            }
+            unreachable!("math 二項の引数は Float");
+        }
         "string_to_int" => {
             if let Some(Value::Str(s)) = args.into_iter().next() {
                 // 非数値は 0（C の atoll と揃える）。先頭の数値部だけを読む。
@@ -886,6 +918,21 @@ pub fn builtins_env() -> Env {
         "string_char_at",
         "char_to_string",
         "string_to_float",
+        "math_sqrt",
+        "math_sin",
+        "math_cos",
+        "math_tan",
+        "math_asin",
+        "math_acos",
+        "math_atan",
+        "math_exp",
+        "math_ln",
+        "math_log10",
+        "math_floor",
+        "math_ceil",
+        "math_round",
+        "math_pow",
+        "math_atan2",
         // OS 連携（ソケット非同期）。native ビルド専用（インタプリタは明示エラー）。
         "tcp_listen",
         "sock_port",

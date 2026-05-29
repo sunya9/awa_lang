@@ -103,6 +103,33 @@ fn is_io_builtin(name: &str) -> bool {
     )
 }
 
+// 数学組込（libm の関数を直接呼ぶ）。
+fn is_math_builtin(name: &str) -> bool {
+    name.starts_with("math_")
+}
+
+// math_<name> → libm の C 関数名。
+fn math_cname(name: &str) -> &'static str {
+    match name {
+        "math_sqrt" => "sqrt",
+        "math_sin" => "sin",
+        "math_cos" => "cos",
+        "math_tan" => "tan",
+        "math_asin" => "asin",
+        "math_acos" => "acos",
+        "math_atan" => "atan",
+        "math_exp" => "exp",
+        "math_ln" => "log",
+        "math_log10" => "log10",
+        "math_floor" => "floor",
+        "math_ceil" => "ceil",
+        "math_round" => "round",
+        "math_pow" => "pow",
+        "math_atan2" => "atan2",
+        _ => unreachable!("unknown math builtin"),
+    }
+}
+
 // OS 連携の非同期 I/O 組込（kqueue ループ／スレッドプールへ委譲する）。
 fn is_socket_builtin(name: &str) -> bool {
     matches!(
@@ -842,7 +869,7 @@ impl Gen {
     }
 
     // 組込変換関数（すべて単項）。
-    fn builtin_call(&mut self, name: &str, arg: &str, arg_ty: &Type) -> Result<String> {
+    fn builtin_call(&mut self, name: &str, arg: &str, _arg_ty: &Type) -> Result<String> {
         let r = format!("%t{}", self.fresh());
         match name {
             "int_to_float" => {
@@ -855,12 +882,13 @@ impl Gen {
             }
             // i64 ↔ i64（nominal 区別のみ）。実体は同じ。
             "int_to_long" | "long_to_int" => Ok(arg.to_string()),
-            "int_to_string" | "float_to_string" => {
-                let (fmt, llty) = if matches!(arg_ty, Type::Float) {
-                    ("@.ff", "double")
-                } else {
-                    ("@.fi", "i64")
-                };
+            "float_to_string" => {
+                // 最短往復表現（interpreter の Rust と一致させる）。
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call ptr @awa_float_str(double {})", r, arg));
+                Ok(r)
+            }
+            "int_to_string" => {
                 // ヘッダ込みで確保し、本体（obj+16）に最大 32 バイト書き込む。
                 let buf = format!("%t{}", self.fresh());
                 self.line(&format!("{} = call ptr @malloc(i64 {})", buf, HDR_SIZE + 32));
@@ -868,8 +896,8 @@ impl Gen {
                 let body = self.str_body(&buf);
                 let n = format!("%t{}", self.fresh());
                 self.line(&format!(
-                    "{} = call i32 (ptr, i64, ptr, ...) @snprintf(ptr {}, i64 32, ptr {}, {} {})",
-                    n, body, fmt, llty, arg
+                    "{} = call i32 (ptr, i64, ptr, ...) @snprintf(ptr {}, i64 32, ptr @.fi, i64 {})",
+                    n, body, arg
                 ));
                 Ok(buf)
             }
@@ -1204,6 +1232,21 @@ impl Gen {
         }
     }
 
+    // 数学組込（libm を直接呼ぶ。引数・戻り値はすべて double。ヒープ無し）。
+    fn math_call(&mut self, name: &str, args: &[TExpr], m: &mut Module) -> Result<String> {
+        let c = math_cname(name);
+        let r = format!("%t{}", self.fresh());
+        if args.len() == 1 {
+            let x = self.expr(&args[0], m)?;
+            self.line(&format!("{} = call double @{}(double {})", r, c, x));
+        } else {
+            let a = self.expr(&args[0], m)?;
+            let b = self.expr(&args[1], m)?;
+            self.line(&format!("{} = call double @{}(double {}, double {})", r, c, a, b));
+        }
+        Ok(r)
+    }
+
     fn call(&mut self, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
         // 引数の型と値。
         let mut arg_parts = Vec::with_capacity(args.len());
@@ -1217,6 +1260,9 @@ impl Gen {
             }
             if is_socket_builtin(name) {
                 return self.sock_call(name, args, m);
+            }
+            if is_math_builtin(name) {
+                return self.math_call(name, args, m);
             }
         }
         // callee が組込変換関数なら専用 IR（すべて単項）。
@@ -1364,6 +1410,7 @@ impl Gen {
                 || is_async_builtin(name)
                 || is_io_builtin(name)
                 || is_socket_builtin(name)
+                || is_math_builtin(name)
             {
                 continue;
             }
@@ -1744,6 +1791,16 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i64 @awa_string_to_int(ptr)\n");
     module.push_str("declare i64 @awa_string_length(ptr)\n");
     module.push_str("declare i64 @awa_string_byte_length(ptr)\n");
+    module.push_str("declare ptr @awa_float_str(double)\n");
+    // 数学関数（libm。macOS では libSystem に含まれ -lm 不要）。
+    for f in [
+        "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log", "log10", "floor",
+        "ceil", "round",
+    ] {
+        module.push_str(&format!("declare double @{}(double)\n", f));
+    }
+    module.push_str("declare double @pow(double, double)\n");
+    module.push_str("declare double @atan2(double, double)\n");
     module.push_str("declare i64 @awa_string_char_at(ptr, i64)\n");
     module.push_str("declare ptr @awa_char_to_string(i64)\n");
     module.push_str("declare double @awa_string_to_float(ptr)\n");
@@ -1934,11 +1991,13 @@ fn emit_print(g: &mut Gen, operand: &str, ty: &Type) -> Result<()> {
             ));
         }
         Type::Float => {
+            // 最短往復表現で表示（float_to_string・interpreter と一致）。
+            let s = format!("%t{}", g.fresh());
+            g.line(&format!("{} = call ptr @awa_float_str(double {})", s, operand));
+            let body = g.str_body(&s);
             let r = g.fresh();
-            g.line(&format!(
-                "%p{} = call i32 (ptr, ...) @printf(ptr @.df, double {})",
-                r, operand
-            ));
+            g.line(&format!("%p{} = call i32 (ptr, ...) @printf(ptr @.ds, ptr {})", r, body));
+            g.release(&s, &Type::Str);
         }
         Type::Bool => {
             let s = g.fresh();
