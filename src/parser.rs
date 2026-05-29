@@ -1,0 +1,262 @@
+use crate::ast::{Expr, Stmt};
+use crate::error::AwaError;
+use crate::token::Token;
+
+// ===== 構文解析（Parser）=====
+// 再帰下降パーサ。優先順位を文法の階層で表現する（上ほど緩い＝後で結合）。
+//   program    = (stmt terminator)* stmt?
+//   stmt       = 'let' Ident '=' expr | expr
+//   expr       = equality
+//   equality   = comparison (('==' | '!=') comparison)*
+//   comparison = additive  (('<' | '>' | '<=' | '>=') additive)*
+//   additive   = term      (('+' | '-') term)*
+//   term       = unary     (('*' | '/') unary)*
+//   unary      = '-' unary | call
+//   call       = factor ('(' args? ')')*
+//   args       = expr (',' expr)*
+//   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block
+//   if         = 'if' expr block 'else' block
+//   lambda     = 'fn' '(' params? ')' block
+//   block      = '{' (stmt terminator)* stmt? '}'
+//   params     = Ident (',' Ident)*
+// 文の区切り（terminator）は ; または改行（字句解析が自動挿入）。
+pub struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Parser { tokens, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<Token> {
+        let t = self.tokens.get(self.pos).cloned();
+        self.pos += 1;
+        t
+    }
+
+    // 期待するトークンを 1 つ消費する。違っていればエラー。
+    fn expect(&mut self, expected: Token) -> Result<(), AwaError> {
+        match self.next() {
+            Some(t) if t == expected => Ok(()),
+            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            None => Err(AwaError::UnexpectedEof),
+        }
+    }
+
+    // 連続する終端（; や改行由来）を読み飛ばす。空文・空行を吸収する。
+    fn skip_terminators(&mut self) {
+        while let Some(Token::Terminator) = self.peek() {
+            self.next();
+        }
+    }
+
+    // プログラム = 文の並び。文と文の間には終端が必要、末尾の終端は任意。
+    pub fn parse_program(&mut self) -> Result<Vec<Stmt>, AwaError> {
+        let mut stmts = Vec::new();
+        self.skip_terminators();
+        while self.peek().is_some() {
+            stmts.push(self.parse_stmt()?);
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                None => break, // 末尾の終端は省略可
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            }
+        }
+        Ok(stmts)
+    }
+
+    // ブロック { 文; ...; 式 }。'{' は呼び出し側が消費済みとして '}' まで読む。
+    // プログラムと同じ「文 + 終端」の繰り返しだが、終わりが } になる。
+    fn parse_block(&mut self) -> Result<Expr, AwaError> {
+        let mut stmts = Vec::new();
+        self.skip_terminators();
+        while self.peek() != Some(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(AwaError::UnexpectedEof);
+            }
+            stmts.push(self.parse_stmt()?);
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                Some(Token::RBrace) => break, // } の直前の終端は省略可
+                None => return Err(AwaError::UnexpectedEof),
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(Expr::Block(stmts))
+    }
+
+    // 文 = `let ident = expr`（束縛）または `expr`（式文）。
+    fn parse_stmt(&mut self) -> Result<Stmt, AwaError> {
+        if let Some(Token::Let) = self.peek() {
+            self.next(); // 'let' を消費
+            let name = match self.next() {
+                Some(Token::Ident(name)) => name,
+                Some(other) => return Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+                None => return Err(AwaError::UnexpectedEof),
+            };
+            self.expect(Token::Equal)?;
+            let value = self.parse_expr()?;
+            Ok(Stmt::Let(name, value))
+        } else {
+            Ok(Stmt::Expr(self.parse_expr()?))
+        }
+    }
+
+    // expr のエントリ。最も緩い等価比較から始める。
+    fn parse_expr(&mut self) -> Result<Expr, AwaError> {
+        self.parse_equality()
+    }
+
+    // == / != （最も緩い）。左結合。
+    fn parse_equality(&mut self) -> Result<Expr, AwaError> {
+        let mut left = self.parse_comparison()?;
+        while let Some(Token::EqEq | Token::NotEq) = self.peek() {
+            let op = self.next().unwrap();
+            let right = self.parse_comparison()?;
+            left = Expr::BinOp(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    // < / > / <= / >= 。== より強く、+ - より弱い。左結合。
+    fn parse_comparison(&mut self) -> Result<Expr, AwaError> {
+        let mut left = self.parse_additive()?;
+        while let Some(Token::Lt | Token::Gt | Token::Le | Token::Ge) = self.peek() {
+            let op = self.next().unwrap();
+            let right = self.parse_additive()?;
+            left = Expr::BinOp(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_additive(&mut self) -> Result<Expr, AwaError> {
+        let mut left = self.parse_term()?;
+        while let Some(op) = self.peek() {
+            match op {
+                Token::Plus | Token::Minus => {
+                    let op = self.next().unwrap();
+                    let right = self.parse_term()?;
+                    left = Expr::BinOp(Box::new(left), op, Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_term(&mut self) -> Result<Expr, AwaError> {
+        let mut left = self.parse_unary()?;
+        while let Some(op) = self.peek() {
+            match op {
+                Token::Star | Token::Slash => {
+                    let op = self.next().unwrap();
+                    let right = self.parse_unary()?;
+                    left = Expr::BinOp(Box::new(left), op, Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+
+    // 単項マイナス。右再帰なので `--3`（= 3）のような連続適用も自然に扱える。
+    // factor より高い優先順位: `-3 * 2` は `(-3) * 2`、`-2 + 1` は `(-2) + 1`。
+    fn parse_unary(&mut self) -> Result<Expr, AwaError> {
+        if let Some(Token::Minus) = self.peek() {
+            self.next(); // '-' を消費
+            let operand = self.parse_unary()?;
+            Ok(Expr::Neg(Box::new(operand)))
+        } else {
+            self.parse_call()
+        }
+    }
+
+    // 呼び出し層。factor を読んだ後、続く ( ... ) を貪欲に呼び出しとして畳む。
+    // f(1)(2) のような連鎖（高階関数の戻り値を即呼び出す）も自然に扱える。
+    fn parse_call(&mut self) -> Result<Expr, AwaError> {
+        let mut expr = self.parse_factor()?;
+        while let Some(Token::LParen) = self.peek() {
+            self.next(); // '(' を消費
+            let mut args = Vec::new();
+            // 引数が無い呼び出し f() を許す。次が ')' でなければ引数列を読む。
+            if self.peek() != Some(&Token::RParen) {
+                loop {
+                    args.push(self.parse_expr()?);
+                    match self.peek() {
+                        Some(Token::Comma) => {
+                            self.next(); // ',' を消費して次の引数へ
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            self.expect(Token::RParen)?;
+            expr = Expr::Call(Box::new(expr), args);
+        }
+        Ok(expr)
+    }
+
+    fn parse_factor(&mut self) -> Result<Expr, AwaError> {
+        match self.next() {
+            Some(Token::Num(n)) => Ok(Expr::Num(n)),
+            Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
+            Some(Token::Ident(name)) => Ok(Expr::Var(name)),
+            // 無名関数 fn(引数, ...) { 本体ブロック }。
+            Some(Token::Fn) => {
+                self.expect(Token::LParen)?;
+                let mut params = Vec::new();
+                if self.peek() != Some(&Token::RParen) {
+                    loop {
+                        match self.next() {
+                            Some(Token::Ident(name)) => params.push(name),
+                            Some(other) => {
+                                return Err(AwaError::UnexpectedToken(format!("{:?}", other)));
+                            }
+                            None => return Err(AwaError::UnexpectedEof),
+                        }
+                        match self.peek() {
+                            Some(Token::Comma) => {
+                                self.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                let body = self.parse_block()?;
+                Ok(Expr::Lambda(params, Box::new(body)))
+            }
+            // if 条件 { ブロック } else { ブロック }。各腕はブロック式。
+            Some(Token::If) => {
+                let cond = self.parse_expr()?;
+                self.expect(Token::LBrace)?;
+                let then_branch = self.parse_block()?;
+                self.expect(Token::Else)?;
+                self.expect(Token::LBrace)?;
+                let else_branch = self.parse_block()?;
+                Ok(Expr::If(
+                    Box::new(cond),
+                    Box::new(then_branch),
+                    Box::new(else_branch),
+                ))
+            }
+            // 単独のブロック式 { ... }。
+            Some(Token::LBrace) => self.parse_block(),
+            Some(Token::LParen) => {
+                let e = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                Ok(e)
+            }
+            Some(other) => Err(AwaError::UnexpectedToken(format!("{:?}", other))),
+            None => Err(AwaError::UnexpectedEof),
+        }
+    }
+}
