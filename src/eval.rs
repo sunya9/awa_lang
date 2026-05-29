@@ -621,6 +621,14 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
                 .unwrap_or(0);
             return Ok(Value::Int(ms));
         }
+        // ソケットはネイティブの kqueue ランタイム専用。インタプリタでは未対応。
+        "tcp_listen" | "sock_port" | "accept" | "sock_read" | "sock_write" | "sock_close"
+        | "tcp_connect" => {
+            return Err(LocatedError::at(
+                AwaError::Io(format!("{} はネイティブビルド（awa build）専用です", name)),
+                span,
+            ));
+        }
         _ => {}
     }
     // 型変換の組込（単項）。
@@ -660,6 +668,14 @@ pub fn builtins_env() -> Env {
         "read_file",
         "write_file",
         "now",
+        // OS 連携（ソケット非同期）。native ビルド専用（インタプリタは明示エラー）。
+        "tcp_listen",
+        "sock_port",
+        "accept",
+        "sock_read",
+        "sock_write",
+        "sock_close",
+        "tcp_connect",
     ] {
         env.insert(name.to_string(), Value::Native(name.to_string()));
     }

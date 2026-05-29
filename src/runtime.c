@@ -11,6 +11,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/event.h>   // kqueue（mac/BSD のレディネス通知）
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 static long now_ms(void) {
   struct timespec ts;
@@ -133,17 +139,115 @@ long awa_future_map(long f, ContFn fn, void* state) {
   else { Waiter* w = (Waiter*)malloc(sizeof(Waiter)); w->kind = 2; w->g = g; w->fn = fn; w->state = state; w->next = futs[f].waiters; futs[f].waiters = w; }
   return g;
 }
+// ===== OS 連携: ソケット非同期（kqueue でレディネスを待つ）=====
+// Socket は fd（i64）。accept/read は「読めるようになったら」kqueue が通知し、
+// その時に accept()/read() を実行して Future を解決する。write は小データ前提で同期書き込み。
+static int kq = -1;
+static void ensure_kq(void) { if (kq < 0) kq = kqueue(); }
+static void set_nonblock(int fd) { int fl = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, fl | O_NONBLOCK); }
+
+enum { ACT_ACCEPT = 1, ACT_READ = 2, ACT_CONNECT = 3 };
+typedef struct { int fd; int action; long future; int active; } FdW;
+static FdW* fdws = 0;
+static long fdws_cap = 0, fdws_len = 0;
+
+// fd に対する非同期待ちを登録し、解決待ちの Future を返す。
+static long add_fdw(int fd, int action) {
+  ensure_kq();
+  long g = new_future(0, 0);
+  if (fdws_len == fdws_cap) { fdws_cap = fdws_cap ? fdws_cap * 2 : 16; fdws = (FdW*)realloc(fdws, fdws_cap * sizeof(FdW)); }
+  fdws[fdws_len].fd = fd; fdws[fdws_len].action = action; fdws[fdws_len].future = g; fdws[fdws_len].active = 1; fdws_len++;
+  int filter = (action == ACT_CONNECT) ? EVFILT_WRITE : EVFILT_READ;
+  struct kevent ch;
+  EV_SET(&ch, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, 0);
+  kevent(kq, &ch, 1, NULL, 0, NULL);
+  return g;
+}
+
+long awa_tcp_listen(Word port) {
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in a; memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((unsigned short)port);
+  if (bind(s, (struct sockaddr*)&a, sizeof a) < 0) { perror("bind"); exit(74); }
+  if (listen(s, 16) < 0) { perror("listen"); exit(74); }
+  set_nonblock(s);
+  return s; // Socket = fd
+}
+long awa_sock_port(Word fd) {
+  struct sockaddr_in a; socklen_t al = sizeof a;
+  getsockname((int)fd, (struct sockaddr*)&a, &al);
+  return ntohs(a.sin_port);
+}
+long awa_accept(Word fd) { return add_fdw((int)fd, ACT_ACCEPT); }
+long awa_sock_read(Word fd) { return add_fdw((int)fd, ACT_READ); }
+long awa_sock_write(Word fd, Word strobj) {
+  const char* b = (char*)strobj + 16;
+  long n = (long)strlen(b), off = 0;
+  while (off < n) { long w = write((int)fd, b + off, n - off); if (w <= 0) break; off += w; }
+  return new_future(1, 0); // Future(Nil)
+}
+void awa_sock_close(Word fd) { close((int)fd); }
+long awa_tcp_connect(Word hostobj, Word port) {
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  set_nonblock(s);
+  struct sockaddr_in a; memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
+  inet_pton(AF_INET, (char*)hostobj + 16, &a.sin_addr);
+  connect(s, (struct sockaddr*)&a, sizeof a); // 非ブロッキング → EINPROGRESS
+  return add_fdw(s, ACT_CONNECT);
+}
+
+// fd が ready になった時の処理（accept/read/connect を実行して Future を解決）。
+static void perform_fdw(long idx) {
+  FdW* w = &fdws[idx];
+  w->active = 0;
+  if (w->action == ACT_ACCEPT) {
+    int c = accept(w->fd, NULL, NULL);
+    if (c >= 0) set_nonblock(c);
+    resolve(w->future, (Word)c);
+  } else if (w->action == ACT_READ) {
+    char buf[65536];
+    long n = read(w->fd, buf, sizeof buf);
+    if (n < 0) n = 0;
+    void* o = awa_make_str(buf, n);
+    resolve(w->future, (Word)o);
+  } else { // ACT_CONNECT
+    resolve(w->future, (Word)w->fd);
+  }
+}
+
 Word awa_future_run(long f) {
+  ensure_kq();
   while (!futs[f].resolved) {
-    if (timers_len == 0) exit(70); // deadlock
+    // 最早タイマー。
+    int have_timer = timers_len > 0;
     long mi = 0;
-    for (long i = 1; i < timers_len; i++)
-      if (timers[i].tick < timers[mi].tick || (timers[i].tick == timers[mi].tick && timers[i].seq < timers[mi].seq)) mi = i;
-    Timer t = timers[mi];
-    timers[mi] = timers[timers_len - 1];
-    timers_len--;
-    sleep_ms(t.tick - now_ms()); // 締切まで実時間で待つ
-    resolve(t.id, t.value);
+    if (have_timer)
+      for (long i = 1; i < timers_len; i++)
+        if (timers[i].tick < timers[mi].tick || (timers[i].tick == timers[mi].tick && timers[i].seq < timers[mi].seq)) mi = i;
+    int have_fd = 0;
+    for (long i = 0; i < fdws_len; i++) if (fdws[i].active) { have_fd = 1; break; }
+    if (!have_timer && !have_fd) exit(70); // deadlock
+    // kqueue で「タイマー締切まで」または「fd が ready になるまで」待つ。
+    struct timespec ts, *tsp = NULL;
+    if (have_timer) {
+      long wait = timers[mi].tick - now_ms();
+      if (wait < 0) wait = 0;
+      ts.tv_sec = wait / 1000; ts.tv_nsec = (wait % 1000) * 1000000; tsp = &ts;
+    }
+    struct kevent ev;
+    int n = kevent(kq, NULL, 0, &ev, 1, tsp);
+    if (n > 0) {
+      int fd = (int)ev.ident;
+      for (long i = 0; i < fdws_len; i++)
+        if (fdws[i].active && fdws[i].fd == fd) { perform_fdw(i); break; }
+    } else if (have_timer) { // タイムアウト → 締切のタイマーを発火
+      Timer t = timers[mi];
+      timers[mi] = timers[timers_len - 1];
+      timers_len--;
+      resolve(t.id, t.value);
+    }
   }
   return futs[f].value;
 }

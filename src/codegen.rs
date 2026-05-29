@@ -46,8 +46,8 @@ fn llvm_ty(ty: &Type) -> Result<String> {
         Type::Bool => Ok("i1".into()),
         Type::Str => Ok("ptr".into()),
         Type::Fun(..) => Ok(CLOSURE_TY.into()),
-        // Future はランタイム所有のイベントループ内のハンドル（i64 id）。
-        Type::Con(name, _) if name == "Future" => Ok("i64".into()),
+        // Future（イベントループの id）と Socket（fd）はランタイムのハンドル＝i64。
+        Type::Con(name, _) if name == "Future" || name == "Socket" => Ok("i64".into()),
         Type::Con(..) => Ok("ptr".into()),
         // Unit は値を持たないが、I/O 等の戻り値として流れるのでダミーの i8 で表す。
         Type::Unit => Ok("i8".into()),
@@ -76,6 +76,14 @@ fn is_async_builtin(name: &str) -> bool {
 // OS 連携の同期 I/O 組込（C ランタイムへ委譲する）。
 fn is_io_builtin(name: &str) -> bool {
     matches!(name, "print" | "read_line" | "read_file" | "write_file" | "now")
+}
+
+// OS 連携のソケット組込（kqueue イベントループへ委譲する）。
+fn is_socket_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "tcp_listen" | "sock_port" | "accept" | "sock_read" | "sock_write" | "sock_close" | "tcp_connect"
+    )
 }
 
 // 呼び出し対象の戻り型（callee.ty = Fun(params, ret) の ret）。
@@ -473,7 +481,8 @@ impl Gen {
     // 文字列(M2a)・ADT(M2b) は ptr 直接、クロージャ(M2c) は env ptr に対して行う。
     fn retain(&mut self, val: &str, ty: &Type) {
         match ty {
-            Type::Str | Type::Con(..) => {
+            // Future/Socket は i64 ハンドル（ヒープでない）→ RC 対象外。
+            Type::Str | Type::Con(..) if is_heap(ty) => {
                 self.line(&format!("call void @awa_retain(ptr {})", val));
             }
             Type::Fun(..) => {
@@ -487,7 +496,7 @@ impl Gen {
     // 値の所有権を 1 減らす（スコープ脱出・値の破棄）。0 で解放。
     fn release(&mut self, val: &str, ty: &Type) {
         match ty {
-            Type::Str | Type::Con(..) => {
+            Type::Str | Type::Con(..) if is_heap(ty) => {
                 self.line(&format!("call void @awa_release(ptr {})", val));
             }
             Type::Fun(..) => {
@@ -905,44 +914,53 @@ impl Gen {
     }
 
     // 値を均一な i64 ワードへボックス化（Future のペイロードはランタイムで型消去されるため）。
+    // LLVM 表現で分岐: i64（Int/Long/Socket/Future）はそのまま、i1/double/ptr は変換。
     fn box_word(&mut self, operand: &str, ty: &Type) -> Result<String> {
         let r = format!("%t{}", self.fresh());
-        match ty {
-            Type::Int | Type::Long => Ok(operand.to_string()),
-            Type::Bool => {
+        match llvm_ty(ty)?.as_str() {
+            "i64" => Ok(operand.to_string()),
+            "i1" => {
                 self.line(&format!("{} = zext i1 {} to i64", r, operand));
                 Ok(r)
             }
-            Type::Float => {
+            "i8" => {
+                self.line(&format!("{} = zext i8 {} to i64", r, operand));
+                Ok(r)
+            }
+            "double" => {
                 self.line(&format!("{} = bitcast double {} to i64", r, operand));
                 Ok(r)
             }
-            Type::Str | Type::Con(..) => {
+            "ptr" => {
                 self.line(&format!("{} = ptrtoint ptr {} to i64", r, operand));
                 Ok(r)
             }
-            other => unsupported(format!("Future に積めない型: {}", other)),
+            other => unsupported(format!("Future に積めない型表現: {}", other)),
         }
     }
 
     // i64 ワードを本来の型へアンボックス。
     fn unbox_word(&mut self, operand: &str, ty: &Type) -> Result<String> {
         let r = format!("%t{}", self.fresh());
-        match ty {
-            Type::Int | Type::Long => Ok(operand.to_string()),
-            Type::Bool => {
+        match llvm_ty(ty)?.as_str() {
+            "i64" => Ok(operand.to_string()),
+            "i1" => {
                 self.line(&format!("{} = trunc i64 {} to i1", r, operand));
                 Ok(r)
             }
-            Type::Float => {
+            "i8" => {
+                self.line(&format!("{} = trunc i64 {} to i8", r, operand));
+                Ok(r)
+            }
+            "double" => {
                 self.line(&format!("{} = bitcast i64 {} to double", r, operand));
                 Ok(r)
             }
-            Type::Str | Type::Con(..) => {
+            "ptr" => {
                 self.line(&format!("{} = inttoptr i64 {} to ptr", r, operand));
                 Ok(r)
             }
-            other => unsupported(format!("Future から取り出せない型: {}", other)),
+            other => unsupported(format!("Future から取り出せない型表現: {}", other)),
         }
     }
 
@@ -1061,6 +1079,53 @@ impl Gen {
         }
     }
 
+    // OS 連携のソケット組込（C ランタイム呼び出し）。Socket/Future は i64 ハンドル。
+    fn sock_call(&mut self, name: &str, args: &[TExpr], m: &mut Module) -> Result<String> {
+        let r = format!("%t{}", self.fresh());
+        match name {
+            "tcp_listen" => {
+                let p = self.expr(&args[0], m)?;
+                self.line(&format!("{} = call i64 @awa_tcp_listen(i64 {})", r, p));
+                Ok(r)
+            }
+            "sock_port" => {
+                let s = self.expr(&args[0], m)?;
+                self.line(&format!("{} = call i64 @awa_sock_port(i64 {})", r, s));
+                Ok(r)
+            }
+            "accept" => {
+                let s = self.expr(&args[0], m)?;
+                self.line(&format!("{} = call i64 @awa_accept(i64 {})", r, s));
+                Ok(r)
+            }
+            "sock_read" => {
+                let s = self.expr(&args[0], m)?;
+                self.line(&format!("{} = call i64 @awa_sock_read(i64 {})", r, s));
+                Ok(r)
+            }
+            "sock_write" => {
+                let s = self.expr(&args[0], m)?;
+                let data = self.expr(&args[1], m)?;
+                self.line(&format!("{} = call i64 @awa_sock_write(i64 {}, ptr {})", r, s, data));
+                self.release(&data, &args[1].ty); // String 引数を consume
+                Ok(r)
+            }
+            "sock_close" => {
+                let s = self.expr(&args[0], m)?;
+                self.line(&format!("call void @awa_sock_close(i64 {})", s));
+                Ok("0".to_string()) // Unit
+            }
+            "tcp_connect" => {
+                let host = self.expr(&args[0], m)?;
+                let port = self.expr(&args[1], m)?;
+                self.line(&format!("{} = call i64 @awa_tcp_connect(ptr {}, i64 {})", r, host, port));
+                self.release(&host, &args[0].ty); // String 引数を consume
+                Ok(r)
+            }
+            _ => unsupported(format!("ソケット組込 {}", name)),
+        }
+    }
+
     fn call(&mut self, callee: &TExpr, args: &[TExpr], m: &mut Module) -> Result<String> {
         // 引数の型と値。
         let mut arg_parts = Vec::with_capacity(args.len());
@@ -1071,6 +1136,9 @@ impl Gen {
             }
             if is_io_builtin(name) {
                 return self.io_call(name, args, m);
+            }
+            if is_socket_builtin(name) {
+                return self.sock_call(name, args, m);
             }
         }
         // callee が組込変換関数なら専用 IR（すべて単項）。
@@ -1185,7 +1253,7 @@ impl Gen {
         // 決定的な順序で（名前順でなくスロット順は問わないが安定させる）。
         locals.sort_by(|a, b| a.0.cmp(&b.0));
         for (slot, ty) in locals {
-            if matches!(ty, Type::Str | Type::Con(..) | Type::Fun(..)) {
+            if is_heap(&ty) {
                 let llty = llvm_ty(&ty)?;
                 let v = format!("%t{}", self.fresh());
                 self.line(&format!("{} = load {}, ptr {}", v, llty, slot));
@@ -1217,6 +1285,7 @@ impl Gen {
                 || is_builtin(name)
                 || is_async_builtin(name)
                 || is_io_builtin(name)
+                || is_socket_builtin(name)
             {
                 continue;
             }
@@ -1283,8 +1352,13 @@ impl Gen {
     }
 }
 
+// RC 管理するヒープ型か。Future/Socket は i64 ハンドル（ランタイム所有）なので対象外。
 fn is_heap(t: &Type) -> bool {
-    matches!(t, Type::Str | Type::Con(..) | Type::Fun(..))
+    match t {
+        Type::Str | Type::Fun(..) => true,
+        Type::Con(name, _) => name != "Future" && name != "Socket",
+        _ => false,
+    }
 }
 
 // ヒープオブジェクトの drop_fn を生成（メモ化）。ヒープ型の構成要素を release してから戻る。
@@ -1585,6 +1659,14 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare ptr @awa_read_file(ptr)\n");
     module.push_str("declare void @awa_write_file(ptr, ptr)\n");
     module.push_str("declare i64 @awa_now()\n");
+    // OS 連携: ソケット非同期（async_runtime.c が定義）。
+    module.push_str("declare i64 @awa_tcp_listen(i64)\n");
+    module.push_str("declare i64 @awa_sock_port(i64)\n");
+    module.push_str("declare i64 @awa_accept(i64)\n");
+    module.push_str("declare i64 @awa_sock_read(i64)\n");
+    module.push_str("declare i64 @awa_sock_write(i64, ptr)\n");
+    module.push_str("declare void @awa_sock_close(i64)\n");
+    module.push_str("declare i64 @awa_tcp_connect(ptr, i64)\n");
     // 生存ヒープオブジェクト数（リーク検出用）。init_header と awa_make_str で ++、awa_release で --。
     module.push_str("@awa_live = global i64 0\n");
     // 書式・定数文字列。
@@ -1713,7 +1795,7 @@ fn compile_main(stmts: &[TStmt], m: &mut Module) -> Result<String> {
         .collect();
     vg.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, ty) in vg {
-        if matches!(ty, Type::Str | Type::Con(..) | Type::Fun(..)) {
+        if is_heap(&ty) {
             let v = format!("%t{}", g.fresh());
             g.line(&format!("{} = load {}, ptr @{}", v, llvm_ty(&ty)?, name));
             g.release(&v, &ty);

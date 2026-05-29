@@ -1,0 +1,20 @@
+// ===== TCP エコーサーバ（非同期・kqueue）=====
+// ephemeral port で listen し、ポート番号をファイルに書き出す。
+// 1 接続を accept → 受信 → そのまま送り返す（echo）。
+//   tcp_listen : Int -> Socket          // 0 で OS 割り当て
+//   sock_port  : Socket -> Int
+//   accept     : Socket -> Future(Socket)   // kqueue が「接続来た」を待つ
+//   sock_read  : Socket -> Future(String)
+//   sock_write : (Socket, String) -> Future(Nil)
+// awa build examples/echo_server.awa && ./examples/echo_server
+//   別端末: nc 127.0.0.1 <port>   ← port は /tmp/awa_echo_port.txt
+let server = tcp_listen(0)
+let _ = write_file("/tmp/awa_echo_port.txt", int_to_string(sock_port(server)))
+let _ = print("listening; port written to /tmp/awa_echo_port.txt")
+
+run(do {
+  client <- accept(server)
+  msg <- sock_read(client)
+  _ <- sock_write(client, msg)
+  pure(0)
+})

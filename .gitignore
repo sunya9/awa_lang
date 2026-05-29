@@ -2,6 +2,9 @@
 
 # codegen artifacts
 examples/*.ll
+examples/*.async_rt.c
 examples/native
+examples/async
+examples/echo_server
 examples/modules/*.ll
 examples/modules/main

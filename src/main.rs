@@ -1729,6 +1729,56 @@ mod tests {
     }
 
     #[test]
+    fn socket_echoサーバがネイティブで接続を処理する() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_sock_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pf = dir.join("port.txt");
+        let pf_s = pf.to_string_lossy().replace('\\', "/");
+        // ephemeral port で listen → ポートを書く → 1 接続を accept して echo。
+        let src = format!(
+            "let server = tcp_listen(0)\n\
+             let _ = write_file(\"{pf_s}\", int_to_string(sock_port(server)))\n\
+             run(do {{ c <- accept(server); m <- sock_read(c); _ <- sock_write(c, m); pure(0) }})\n"
+        );
+        let ir = compile_to_llvm(&src).expect("コンパイルが通る");
+        let ll = dir.join("echo.ll");
+        let rt = dir.join("async_rt.c");
+        let exe = dir.join("echo");
+        std::fs::write(&ll, &ir).unwrap();
+        std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
+        let st = std::process::Command::new("clang")
+            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang");
+        assert!(st.success(), "clang が失敗");
+        let mut child = std::process::Command::new(&exe).spawn().expect("起動");
+        // ポートファイルが書かれるまで待つ。
+        let mut port = String::new();
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pf) {
+                if !s.trim().is_empty() {
+                    port = s.trim().to_string();
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let echoed = (|| {
+            let port: u16 = port.parse().ok()?;
+            let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+            s.write_all(b"hello awa socket").ok()?;
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).ok()?;
+            Some(String::from_utf8_lossy(&buf[..n]).to_string())
+        })();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(echoed.as_deref(), Some("hello awa socket"));
+    }
+
+    #[test]
     fn codegen_io_がネイティブ実行される() {
         // write_file→read_file→print が native で動き、RC が釣り合って終了コード 0。
         let id = std::process::id();
