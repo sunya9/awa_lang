@@ -1,0 +1,18 @@
+// 標準ライブラリ: Option（値があるかもしれない）。純粋に awa で書ける＝組込でなく stdlib。
+pub type Option(a) { Some(a); None }
+
+// 中身に関数を適用する（None はそのまま）。
+pub let map: fn(Option(a), fn(a) -> b) -> Option(b) = fn(o, f) {
+  case o {
+    Some(x) -> Some(f(x))
+    None -> None
+  }
+}
+
+// 中身、無ければ既定値。
+pub let unwrap_or: fn(Option(a), a) -> a = fn(o, default) {
+  case o {
+    Some(x) -> x
+    None -> default
+  }
+}

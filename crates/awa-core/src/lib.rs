@@ -15,7 +15,7 @@ pub mod types;
 pub mod value;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ast::TStmt;
 use error::{LocatedError, report};
@@ -78,19 +78,26 @@ pub fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
 // エントリファイルから import を辿って全モジュールを読み込み、依存順（依存先が先）に並べる。
 // import パスは root（= 既定でカレントディレクトリ）からの相対 `seg/seg.awa`。
 // 循環 import は検出してエラー。各ファイルは自分のソースで構文エラーを報告（位置を保てる）。
-pub fn load_program(root: &PathBuf, entry_path: &str) -> Result<Vec<LoadedModule>, String> {
+// root: プロジェクトのルート（エントリの親）。stdlib: 標準ライブラリのルート（`std/` を含むディレクトリ）。
+// `import std/...` は stdlib から、それ以外は root から解決する。
+pub fn load_program(
+    root: &PathBuf,
+    stdlib: Option<&Path>,
+    entry_path: &str,
+) -> Result<Vec<LoadedModule>, String> {
     // エントリのモジュールパス: ".awa" を外して "/" で分割。
     let rel = entry_path.strip_suffix(".awa").unwrap_or(entry_path);
     let entry_segs: Vec<String> = rel.split('/').map(|s| s.to_string()).collect();
     let mut loaded: Vec<LoadedModule> = Vec::new();
     let mut done: HashSet<String> = HashSet::new();
     let mut in_progress: HashSet<String> = HashSet::new();
-    load_module(root, &entry_segs, true, &mut loaded, &mut done, &mut in_progress)?;
+    load_module(root, stdlib, &entry_segs, true, &mut loaded, &mut done, &mut in_progress)?;
     Ok(loaded)
 }
 
 fn load_module(
     root: &PathBuf,
+    stdlib: Option<&Path>,
     segs: &[String],
     is_entry: bool,
     loaded: &mut Vec<LoadedModule>,
@@ -104,8 +111,12 @@ fn load_module(
     if !in_progress.insert(key.clone()) {
         return Err(format!("import が循環しています: {}", key));
     }
-    // ファイルパス root/seg/seg.awa を組み立てる。
-    let mut path = root.clone();
+    // `std/...` は stdlib ルートから、それ以外はプロジェクトルートから解決する。
+    let is_std = segs.first().map(|s| s.as_str()) == Some("std");
+    let mut path = match (is_std, stdlib) {
+        (true, Some(s)) => s.to_path_buf(),
+        _ => root.clone(),
+    };
     for s in segs {
         path.push(s);
     }
@@ -120,7 +131,7 @@ fn load_module(
     .map_err(|e| report(&e, &source))?;
     // 依存先を先に読み込む（post-order で依存順に並ぶ）。
     for imp in &parsed.imports {
-        load_module(root, &imp.path, false, loaded, done, in_progress)?;
+        load_module(root, stdlib, &imp.path, false, loaded, done, in_progress)?;
     }
     in_progress.remove(&key);
     done.insert(key);
@@ -1109,7 +1120,7 @@ mod tests {
             }
             std::fs::write(&p, content).unwrap();
         }
-        let modules = load_program(&dir, entry).expect("モジュール読み込み成功");
+        let modules = load_program(&dir, None, entry).expect("モジュール読み込み成功");
         let ir = compile_modules_to_ir(&modules).expect("コンパイル成功");
         let ll = dir.join("out.ll");
         let rt = dir.join("async_rt.c");
@@ -1147,7 +1158,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("util.awa"), "let secret = fn(n: Int) -> Int { n }\n").unwrap();
         std::fs::write(dir.join("main.awa"), "import util\nutil.secret(1)\n").unwrap();
-        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let modules = load_program(&dir, None, "main").expect("読み込み成功");
         let err = check_program_modules(&modules).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(err.contains("公開されていません"), "実際のエラー: {}", err);
@@ -1310,7 +1321,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shapes.awa"), shapes).unwrap();
         std::fs::write(dir.join("main.awa"), "import shapes\nshapes.Circle(6).r2(3)\n").unwrap();
-        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let modules = load_program(&dir, None, "main").expect("読み込み成功");
         let err = check_program_modules(&modules).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(err.contains("非公開"), "実際のエラー: {}", err);
@@ -1329,7 +1340,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("main.awa"), "import shapes\nshapes.Circle(5).area()\n").unwrap();
-        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let modules = load_program(&dir, None, "main").expect("読み込み成功");
         let err = check_program_modules(&modules).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(err.contains("非公開"), "実際のエラー: {}", err);
@@ -1361,7 +1372,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("util.awa"), "pub let bad = fn(n: Int) -> Int { n + true }\n").unwrap();
         std::fs::write(dir.join("main.awa"), "import util\nutil.bad(1)\n").unwrap();
-        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let modules = load_program(&dir, None, "main").expect("読み込み成功");
         let err = check_program_modules(&modules).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         // ファイル名 util と該当ソース行＋キャレットが含まれること。
@@ -1378,7 +1389,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.awa"), "import b\npub let f = fn(n: Int) -> Int { n }\n").unwrap();
         std::fs::write(dir.join("b.awa"), "import a\npub let g = fn(n: Int) -> Int { n }\n").unwrap();
-        let err = load_program(&dir, "a").unwrap_err();
+        let err = load_program(&dir, None, "a").unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(err.contains("循環"), "実際のエラー: {}", err);
     }
@@ -1714,6 +1725,40 @@ mod tests {
         assert_eq!(echoed.as_deref(), Some("hello awa socket"));
         // 継続 env も解放されるのでサーバは終了コード 0（リークなし）。
         assert_eq!(code, Some(0), "サーバが正常終了していない");
+    }
+
+    #[test]
+    fn std_ライブラリがimportできる() {
+        // import std/io・std/option・std/result。stdlib ルートはリポジトリ（std/ を含む）。
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_std_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.awa"),
+            "import std/io\n\
+             import std/option\n\
+             import std/result\n\
+             io.println(\"from std\")\n\
+             option.unwrap_or(option.Some(42), 0)\n\
+             result.unwrap_or(result.Err(\"e\"), 5)\n",
+        )
+        .unwrap();
+        let stdlib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let modules = load_program(&dir, Some(&stdlib), "main").expect("読み込み成功");
+        let ir = compile_modules_to_ir(&modules).expect("コンパイル成功");
+        let ll = dir.join("out.ll");
+        let rt = dir.join("async_rt.c");
+        let exe = dir.join("out");
+        std::fs::write(&ll, &ir).unwrap();
+        std::fs::write(&rt, codegen::ASYNC_RUNTIME_C).unwrap();
+        let st = std::process::Command::new("clang")
+            .arg(&rt).arg(&ll).arg("-o").arg(&exe).status().expect("clang");
+        assert!(st.success(), "clang が失敗");
+        let out = std::process::Command::new(&exe).output().expect("実行");
+        let _ = std::fs::remove_dir_all(&dir);
+        // io.println→"from std"、option.unwrap_or(Some(42))→42、result.unwrap_or(Err)→5。
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "from std\n42\n5\n");
     }
 
     #[test]

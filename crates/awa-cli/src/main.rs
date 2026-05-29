@@ -30,10 +30,25 @@ fn entry_root_and_name(path: &str) -> (PathBuf, String) {
     (root, name)
 }
 
+// 標準ライブラリ（`std/` を含むディレクトリ）の場所。
+//   1) 環境変数 AWA_STDLIB（インストール先などを明示）
+//   2) カレントディレクトリに std/ があればそれ（リポジトリルートでの開発用）
+fn stdlib_root() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("AWA_STDLIB") {
+        return Some(PathBuf::from(p));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    if cwd.join("std").is_dir() {
+        Some(cwd)
+    } else {
+        None
+    }
+}
+
 // エントリパスからローダを走らせて全モジュールを得る。失敗したら整形済みメッセージを出して終了。
 fn load_or_exit(path: &str) -> Vec<LoadedModule> {
     let (root, name) = entry_root_and_name(path);
-    load_program(&root, &name).unwrap_or_else(|msg| {
+    load_program(&root, stdlib_root().as_deref(), &name).unwrap_or_else(|msg| {
         eprintln!("{}", msg);
         std::process::exit(1);
     })

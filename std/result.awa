@@ -1,0 +1,18 @@
+// 標準ライブラリ: Result（成功 Ok か失敗 Err）。純粋 awa＝stdlib。
+pub type Result(a, e) { Ok(a); Err(e) }
+
+// Ok の中身に関数を適用する（Err はそのまま伝播）。
+pub let map: fn(Result(a, e), fn(a) -> b) -> Result(b, e) = fn(r, f) {
+  case r {
+    Ok(x) -> Ok(f(x))
+    Err(e) -> Err(e)
+  }
+}
+
+// Ok の中身、Err なら既定値。
+pub let unwrap_or: fn(Result(a, e), a) -> a = fn(r, default) {
+  case r {
+    Ok(x) -> x
+    Err(e) -> default
+  }
+}

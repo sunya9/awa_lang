@@ -51,7 +51,9 @@ fn llvm_ty(ty: &Type) -> Result<String> {
         Type::Con(..) => Ok("ptr".into()),
         // Unit は値を持たないが、I/O 等の戻り値として流れるのでダミーの i8 で表す。
         Type::Unit => Ok("i8".into()),
-        other => unsupported(format!("型 {}", other)),
+        // 未制約の型変数（例: result.Ok(7) の e は Err を使わず確定しない）は Unit 相当に
+        // デフォルトする。その値は実行時に使われない（取り出されない）ので安全。
+        Type::Var(_) => Ok("i8".into()),
     }
 }
 
