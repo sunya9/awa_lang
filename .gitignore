@@ -8,3 +8,4 @@ examples/async
 examples/echo_server
 examples/modules/*.ll
 examples/modules/main
+examples/concurrency

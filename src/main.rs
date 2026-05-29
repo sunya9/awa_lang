@@ -458,6 +458,19 @@ mod tests {
     }
 
     #[test]
+    fn async_all_でfutureのリストを並行に待つ() {
+        // awa 自身で書いた汎用・再帰の all（List(Future(a)) -> Future(List(a))）。
+        // Future は構築時にスケジュール済みなので、順に await しても実時間は並行。
+        // 注釈付き再帰関数なので all(rest) の戻り型（Future）が確定しメソッド解決できる。
+        let src = "type List(a) { Cons(a, List(a)); Nil }\n\
+                   let all: fn(List(Future(a))) -> Future(List(a)) = fn(fs: List(Future(a))) -> Future(List(a)) { \
+                     case fs { Nil -> pure(Nil); Cons(f, rest) -> do { x <- f; xs <- all(rest); pure(Cons(x, xs)) } } }\n\
+                   let sum = fn(xs: List(Int)) -> Int { case xs { Nil -> 0; Cons(h, t) -> h + sum(t) } }\n\
+                   sum(run(all(Cons(delay(10, 1), Cons(delay(5, 2), Cons(pure(3), Nil))))))";
+        assert_eq!(eval(src), Ok(Value::Int(6)));
+    }
+
+    #[test]
     fn async_future注釈つき関数() {
         // Future(a) を型注釈に書ける（組込型）。delay の結果を返す関数。
         let src = "let step = fn(n: Int) -> Future(Int) { delay(1, n + 1) }\nrun(step(41))";

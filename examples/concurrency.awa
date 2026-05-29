@@ -1,0 +1,20 @@
+// ===== 並行性: all で Future のリストを待つ =====
+// Future は構築した時点でスケジュールされる（delay はタイマー登録、accept は kqueue 登録）。
+// なので「先に全部の Future を作ってから all で待つ」と、順に await しても実時間は並行
+// （合計 = 最も遅い Future ≒ max、逐次の sum ではない）。
+// all は型クラス不要・awa 自身で書ける汎用コンビネータ（flatMap/do で合成）。
+//   注: 再帰関数が自分の戻り値をメソッドレシーバに使うので、let とラムダの両方に型注釈が要る
+//       （awa は双方向型推論を持たないため）。
+type List(a) { Cons(a, List(a)); Nil }
+
+let all: fn(List(Future(a))) -> Future(List(a)) = fn(fs: List(Future(a))) -> Future(List(a)) {
+  case fs {
+    Nil -> pure(Nil)
+    Cons(f, rest) -> do { x <- f; xs <- all(rest); pure(Cons(x, xs)) }
+  }
+}
+
+let sum = fn(xs: List(Int)) -> Int { case xs { Nil -> 0; Cons(h, t) -> h + sum(t) } }
+
+// 3 つの Future を並行に待ち、合計（1 + 2 + 3 = 6）。
+sum(run(all(Cons(delay(10, 1), Cons(delay(5, 2), Cons(pure(3), Nil))))))

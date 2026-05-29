@@ -619,7 +619,17 @@ fn infer_let(
     arities: &Arities,
     methods: &MethodEnv,
 ) -> Result<TExpr, LocatedError> {
-    let placeholder = vargen.fresh();
+    // 再帰の placeholder。注釈があればその型を使う（再帰呼び出しが宣言された型＝戻り型を
+    // 持てるので、`all(rest).flatMap(..)` のようにメソッドのレシーバ型が確定する）。
+    // 注釈が無ければ従来どおり fresh 型変数（単相 placeholder）。
+    let ann_ty = match annotation {
+        Some(ann) => {
+            let mut vars = HashMap::new();
+            Some(resolve_annotation(ann, &mut vars, vargen, arities)?)
+        }
+        None => None,
+    };
+    let placeholder = ann_ty.clone().unwrap_or_else(|| vargen.fresh());
     env.insert(name.to_string(), Scheme::mono(placeholder.clone()));
     let te = infer_expr(expr, env, subst, vargen, arities, methods)?;
     let span = te.span;
@@ -629,9 +639,8 @@ fn infer_let(
     env.remove(name);
     // 型注釈があれば突き合わせる。エラーは束縛値の式 span に寄せる。
     if let Some(ann) = annotation {
-        // (1) 制約: 注釈型と推論型を unify。噛み合わない型（Num と Bool 等）はここで CannotUnify。
-        let mut vars = HashMap::new();
-        let ann_ty = resolve_annotation(ann, &mut vars, vargen, arities)?;
+        // (1) 制約: 注釈型と推論型を unify（placeholder は既に注釈型なので再確認）。
+        let ann_ty = ann_ty.clone().unwrap();
         at(unify(subst, &placeholder, &ann_ty), span)?;
         // (2) subsumption: 注釈が推論された principal 型より一般的すぎないか。
         // principal を instantiate し、注釈を skolem 化して別 subst 上で unify する。
