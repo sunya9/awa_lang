@@ -126,10 +126,157 @@ fn env_struct_ty(caps: &[(String, Type)]) -> Result<String> {
 struct Module {
     funcs: String,                          // 全関数定義
     fn_ctr: usize,                          // 匿名関数 @fnN の採番
-    globals: HashMap<String, (Vec<Type>, Type)>, // トップレベル関数名 → (引数型, 戻り型)
+    globals: HashMap<String, GlobalFn>,     // トップレベル関数名 → 定義（本体つき）
+    instances: HashSet<String>,             // 発行済みの特殊化インスタンス（マングル名）
     ctors: HashMap<String, CtorInfo>,       // 構築子名 → 情報
     strings: String,                        // 文字列リテラルのグローバル定義
     str_ctr: usize,
+}
+
+// トップレベル関数の定義（単相化で本体を特殊化するため本体も持つ）。
+#[derive(Clone)]
+struct GlobalFn {
+    param_names: Vec<String>,
+    param_tys: Vec<Type>,
+    ret: Type,
+    body: TExpr,
+}
+
+impl GlobalFn {
+    fn is_generic(&self) -> bool {
+        self.param_tys.iter().any(has_var) || has_var(&self.ret)
+    }
+}
+
+fn has_var(t: &Type) -> bool {
+    match t {
+        Type::Var(_) => true,
+        Type::Fun(ps, r) => ps.iter().any(has_var) || has_var(r),
+        Type::Con(_, args) => args.iter().any(has_var),
+        _ => false,
+    }
+}
+
+// 総称シグネチャ（型変数つき）を具体型に照合して置換を作る。
+fn match_types(g: &Type, c: &Type, s: &mut crate::types::Subst) {
+    match (g, c) {
+        (Type::Var(id), _) => {
+            s.insert(*id, c.clone());
+        }
+        (Type::Fun(gp, gr), Type::Fun(cp, cr)) => {
+            for (a, b) in gp.iter().zip(cp.iter()) {
+                match_types(a, b, s);
+            }
+            match_types(gr, cr, s);
+        }
+        (Type::Con(_, ga), Type::Con(_, ca)) => {
+            for (a, b) in ga.iter().zip(ca.iter()) {
+                match_types(a, b, s);
+            }
+        }
+        _ => {}
+    }
+}
+
+// 型を LLVM 記号に使える短い名前へ（特殊化のマングル用）。
+fn mangle_ty(t: &Type) -> String {
+    match t {
+        Type::Int => "Int".into(),
+        Type::Long => "Long".into(),
+        Type::Float => "Float".into(),
+        Type::Str => "String".into(),
+        Type::Bool => "Bool".into(),
+        Type::Unit => "Nil".into(),
+        Type::Var(_) => "_".into(),
+        Type::Fun(..) => "fn".into(),
+        Type::Con(n, args) => {
+            if args.is_empty() {
+                n.clone()
+            } else {
+                format!("{}_{}", n, args.iter().map(mangle_ty).collect::<Vec<_>>().join("_"))
+            }
+        }
+    }
+}
+
+fn mangle(name: &str, params: &[Type], ret: &Type) -> String {
+    let mut parts: Vec<String> = params.iter().map(mangle_ty).collect();
+    parts.push(mangle_ty(ret));
+    format!("{}${}", name, parts.join("$"))
+}
+
+// 型付き AST の全ノードの型に置換を適用する（特殊化＝総称本体を具体化する）。
+fn subst_types(te: &mut TExpr, s: &crate::types::Subst) {
+    te.ty = crate::types::apply(s, &te.ty);
+    match &mut te.kind {
+        TExprKind::Int(_)
+        | TExprKind::Long(_)
+        | TExprKind::Float(_)
+        | TExprKind::Str(_)
+        | TExprKind::Bool(_)
+        | TExprKind::Var(_) => {}
+        TExprKind::Neg(x) => subst_types(x, s),
+        TExprKind::BinOp(l, _, r) => {
+            subst_types(l, s);
+            subst_types(r, s);
+        }
+        TExprKind::If(c, t, e) => {
+            subst_types(c, s);
+            subst_types(t, s);
+            subst_types(e, s);
+        }
+        TExprKind::Lambda(_, b) => subst_types(b, s),
+        TExprKind::Call(c, args) => {
+            subst_types(c, s);
+            for a in args {
+                subst_types(a, s);
+            }
+        }
+        TExprKind::Block(stmts) => {
+            for st in stmts {
+                match st {
+                    TStmt::Let(_, e) | TStmt::Expr(e) => subst_types(e, s),
+                    TStmt::Type(_) | TStmt::Impl(_) => {}
+                }
+            }
+        }
+        TExprKind::Case(subj, arms) => {
+            subst_types(subj, s);
+            for (_, b) in arms {
+                subst_types(b, s);
+            }
+        }
+    }
+}
+
+// 呼び出し対象のトップレベル関数を具体型で特殊化し、呼ぶべき LLVM 名を返す。
+// 単相関数は @name（pass2 で発行済み）。総称関数は @name$型... を遅延発行（メモ）。
+fn ensure_instance(m: &mut Module, name: &str, params: &[Type], ret: &Type) -> Result<String> {
+    let gf = m.globals.get(name).expect("known top-level function").clone();
+    if !gf.is_generic() {
+        return Ok(name.to_string());
+    }
+    let mangled = mangle(name, params, ret);
+    if m.instances.contains(&mangled) {
+        return Ok(mangled);
+    }
+    m.instances.insert(mangled.clone());
+    // 総称シグネチャ → 具体型の置換を作り、本体に適用して特殊化。
+    let mut s = crate::types::Subst::new();
+    for (g, c) in gf.param_tys.iter().zip(params.iter()) {
+        match_types(g, c, &mut s);
+    }
+    match_types(&gf.ret, ret, &mut s);
+    let mut body = gf.body.clone();
+    subst_types(&mut body, &s);
+    let typed_params: Vec<(String, Type)> = gf
+        .param_names
+        .iter()
+        .cloned()
+        .zip(params.iter().cloned())
+        .collect();
+    gen_function(m, &mangled, &[], &typed_params, ret, &body)?;
+    Ok(mangled)
 }
 
 impl Module {
@@ -195,7 +342,7 @@ impl Gen {
             TExprKind::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
             // 文字列リテラル → グローバル定数への ptr。
             TExprKind::Str(s) => Ok(m.intern_string(s)),
-            TExprKind::Var(name) => self.var(name, m),
+            TExprKind::Var(name) => self.var(name, &e.ty, m),
             TExprKind::Neg(x) => {
                 let v = self.expr(x, m)?;
                 let r = format!("%t{}", self.fresh());
@@ -327,9 +474,9 @@ impl Gen {
     }
 
     // 変数参照: ローカル/キャプチャ → load、ヌル構築子 → 構築、トップレベル関数 → クロージャ値。
-    fn var(&mut self, name: &str, m: &Module) -> Result<String> {
-        if let Some((slot, ty)) = self.scope.get(name).cloned() {
-            let llty = llvm_ty(&ty)?;
+    fn var(&mut self, name: &str, ty: &Type, m: &mut Module) -> Result<String> {
+        if let Some((slot, vty)) = self.scope.get(name).cloned() {
+            let llty = llvm_ty(&vty)?;
             let r = format!("%t{}", self.fresh());
             self.line(&format!("{} = load {}, ptr {}", r, llty, slot));
             Ok(r)
@@ -340,11 +487,15 @@ impl Gen {
                 unsupported(format!("構築子を値として使う: {}", name))
             }
         } else if m.globals.contains_key(name) {
-            // トップレベル関数を値として使う → クロージャ {@name, null}。
+            // トップレベル関数を値として使う → 具体型で特殊化し、クロージャ {@mangled, null}。
+            let Type::Fun(params, ret) = ty else {
+                return unsupported("関数値の型が解決できない");
+            };
+            let mangled = ensure_instance(m, name, params, ret)?;
             let c0 = format!("%t{}", self.fresh());
             self.line(&format!(
                 "{} = insertvalue {} undef, ptr @{}, 0",
-                c0, CLOSURE_TY, name
+                c0, CLOSURE_TY, mangled
             ));
             let c1 = format!("%t{}", self.fresh());
             self.line(&format!(
@@ -523,11 +674,17 @@ impl Gen {
                 return self.construct(&ci, &fields);
             }
         }
-        // callee がトップレベル関数名なら直接呼び出し（env=null）。
+        // callee がトップレベル関数名なら直接呼び出し（env=null）。具体型で特殊化（単相化）。
         if let TExprKind::Var(name) = &callee.kind {
-            if let Some((params, ret)) = m.globals.get(name).cloned() {
-                let ret_ll = llvm_ty(&ret)?;
-                for (a, pty) in args.iter().zip(params.iter()) {
+            if m.globals.contains_key(name) {
+                let Type::Fun(cparams, cret) = &callee.ty else {
+                    return unsupported("関数呼び出しの型が解決できない");
+                };
+                let cparams = cparams.clone();
+                let cret = (**cret).clone();
+                let mangled = ensure_instance(m, name, &cparams, &cret)?;
+                let ret_ll = llvm_ty(&cret)?;
+                for (a, pty) in args.iter().zip(cparams.iter()) {
                     let v = self.expr(a, m)?;
                     arg_parts.push(format!("{} {}", llvm_ty(pty)?, v));
                 }
@@ -538,7 +695,7 @@ impl Gen {
                     "{} = call {} @{}({})",
                     r,
                     ret_ll,
-                    name,
+                    mangled,
                     call_args.join(", ")
                 ));
                 return Ok(r);
@@ -642,7 +799,7 @@ impl Gen {
             self.line(&format!("{} = call ptr @malloc(i64 {})", env, sz));
             // 各キャプチャを格納（現スコープから load → env に store）。
             for (i, (cname, cty)) in caps.iter().enumerate() {
-                let cv = self.var(cname, m)?;
+                let cv = self.var(cname, cty, m)?;
                 let fp = format!("%t{}", self.fresh());
                 self.line(&format!(
                     "{} = getelementptr {}, ptr {}, i32 0, i32 {}",
@@ -800,14 +957,22 @@ fn pattern_vars(p: &crate::ast::Pattern, out: &mut HashSet<String>) {
 
 // プログラム全体 → LLVM IR テキスト。
 pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
-    let mut globals: HashMap<String, (Vec<Type>, Type)> = HashMap::new();
+    let mut globals: HashMap<String, GlobalFn> = HashMap::new();
     for s in stmts {
         if let TStmt::Let(name, te) = s {
-            if let TExprKind::Lambda(_, _) = &te.kind {
+            if let TExprKind::Lambda(param_names, body) = &te.kind {
                 let Type::Fun(params, ret) = &te.ty else {
                     return unsupported("関数の型が解決できない");
                 };
-                globals.insert(name.clone(), (params.clone(), (**ret).clone()));
+                globals.insert(
+                    name.clone(),
+                    GlobalFn {
+                        param_names: param_names.clone(),
+                        param_tys: params.clone(),
+                        ret: (**ret).clone(),
+                        body: (**body).clone(),
+                    },
+                );
             }
         }
     }
@@ -834,26 +999,29 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
         funcs: String::new(),
         fn_ctr: 0,
         globals,
+        instances: HashSet::new(),
         ctors,
         strings: String::new(),
         str_ctr: 0,
     };
 
-    // トップレベル関数を @name で出力（キャプチャなし＝env は使わない）。
-    for s in stmts {
-        if let TStmt::Let(name, te) = s {
-            if let TExprKind::Lambda(param_names, body) = &te.kind {
-                let Type::Fun(param_tys, ret) = &te.ty else {
-                    unreachable!()
-                };
-                let typed_params: Vec<(String, Type)> = param_names
-                    .iter()
-                    .cloned()
-                    .zip(param_tys.iter().cloned())
-                    .collect();
-                gen_function(&mut m, name, &[], &typed_params, ret, body)?;
-            }
-        }
+    // 単相なトップレベル関数だけを @name で先に出力する。
+    // 総称関数は使用箇所の具体型ごとに ensure_instance が遅延発行する。
+    let mono: Vec<String> = m
+        .globals
+        .iter()
+        .filter(|(_, gf)| !gf.is_generic())
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in mono {
+        let gf = m.globals.get(&name).unwrap().clone();
+        let typed_params: Vec<(String, Type)> = gf
+            .param_names
+            .iter()
+            .cloned()
+            .zip(gf.param_tys.iter().cloned())
+            .collect();
+        gen_function(&mut m, &name, &[], &typed_params, &gf.ret, &gf.body)?;
     }
 
     // main。

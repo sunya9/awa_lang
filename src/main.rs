@@ -984,6 +984,25 @@ mod tests {
     }
 
     #[test]
+    fn codegen_単相化() {
+        // 総称関数 id を Int と Bool で使う → それぞれ特殊化されてネイティブ実行。
+        let out = compile_and_run("let id = fn(x) { x }; id(5)\nid(7)");
+        assert_eq!(out, "5\n7\n");
+    }
+
+    #[test]
+    fn codegen_総称関数と高階() {
+        // compose（総称）に単相関数を渡して合成。inc(dbl(10)) = 21。
+        let out = compile_and_run(
+            "let compose = fn(f, g) { fn(x) { f(g(x)) } }; \
+             let inc = fn(n: Int) -> Int { n + 1 }; \
+             let dbl = fn(n: Int) -> Int { n * 2 }; \
+             let h = compose(inc, dbl); h(10)",
+        );
+        assert_eq!(out, "21\n");
+    }
+
+    #[test]
     fn codegen_文字列と変換() {
         let out = compile_and_run(
             "\"hello\" <> \" \" <> \"world\"\n\"a\" == \"a\"\nint_to_string(42)\nint_to_float(3) + 1.5",
