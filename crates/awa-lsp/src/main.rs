@@ -3,10 +3,11 @@
 // 通信は LSP（stdio・JSON-RPC）。エディタがこのバイナリを起動して話す。
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::PathBuf;
 
 use awa_core::query::{completions, definition_at, type_at};
 use awa_core::span::{line_col_to_offset, offset_to_line_col};
-use awa_core::{check_source, span::Span};
+use awa_core::{check_document, check_source, span::Span};
 use lsp_server::{Connection, Message, Notification, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics};
 use lsp_types::{
@@ -131,10 +132,19 @@ fn handle_completion(docs: &HashMap<Url, String>, params: Value) -> Value {
         Ok(p) => p,
         Err(_) => return Value::Null,
     };
-    let Some(text) = docs.get(&p.text_document_position.text_document.uri) else {
+    let uri = &p.text_document_position.text_document.uri;
+    let Some(text) = docs.get(uri) else {
         return Value::Null;
     };
-    let items: Vec<CompletionItem> = completions(text)
+    let pos = p.text_document_position.position;
+    // カーソル行が `import ...` なら、import 可能なモジュール名を提案する。
+    // そうでなければ通常の補完（キーワード/組込/トップレベル名）。
+    let labels = if is_import_line(text, pos.line) {
+        import_completions(uri)
+    } else {
+        completions(text)
+    };
+    let items: Vec<CompletionItem> = labels
         .into_iter()
         .map(|label| CompletionItem {
             label,
@@ -144,20 +154,73 @@ fn handle_completion(docs: &HashMap<Url, String>, params: Value) -> Value {
     serde_json::to_value(CompletionResponse::Array(items)).unwrap_or(Value::Null)
 }
 
+// 指定行（0 始まり）が import 文か（先頭の空白を除いて "import" で始まる）。
+fn is_import_line(text: &str, line: u32) -> bool {
+    text.lines()
+        .nth(line as usize)
+        .map(|l| l.trim_start().starts_with("import"))
+        .unwrap_or(false)
+}
+
+// import 可能なモジュールパス: 焼き込み済みの std/* と、文書と同じディレクトリの兄弟 .awa。
+fn import_completions(uri: &Url) -> Vec<String> {
+    let mut paths: Vec<String> = awa_core::stdlib::STDLIB
+        .iter()
+        .map(|(p, _)| p.to_string())
+        .collect();
+    if let Ok(path) = uri.to_file_path() {
+        let self_stem = path.file_stem().map(|s| s.to_os_string());
+        if let Some(dir) = path.parent() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("awa")
+                        && p.file_stem().map(|s| s.to_os_string()) != self_stem
+                    {
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            paths.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 // テキストを検査して診断を publish する。
 fn publish(conn: &Connection, uri: Url, text: &str) {
     let params = PublishDiagnosticsParams {
+        diagnostics: diagnostics_for(&uri, text),
         uri,
-        diagnostics: diagnostics_for(text),
         version: None,
     };
     let not = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
     let _ = conn.sender.send(Message::Notification(not));
 }
 
-// awa-core の check_source を呼び、エラーがあれば 1 個の Diagnostic にする（awa は最初のエラーで止まる）。
-fn diagnostics_for(text: &str) -> Vec<Diagnostic> {
-    match check_source(text) {
+// 文書を検査して診断にする（awa は最初のエラーで止まるので最大 1 個）。
+// ファイル URI なら import を解決して検査（check_document＝バッファを上書きしてロード）。
+// それ以外（untitled 等）はファイルパスが無いので単一ファイル検査にフォールバックする。
+fn diagnostics_for(uri: &Url, text: &str) -> Vec<Diagnostic> {
+    let result = match uri.to_file_path() {
+        Ok(path) => {
+            let root = path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // stdlib=None＝焼き込みの std を使う（cwd/環境に非依存）。
+            check_document(&root, None, &name, text)
+        }
+        Err(_) => check_source(text),
+    };
+    match result {
         Ok(()) => Vec::new(),
         Err(e) => {
             let range = match e.span {
@@ -180,14 +243,18 @@ mod tests {
     use super::*;
     use lsp_types::{TextDocumentItem, notification::DidOpenTextDocument};
 
+    fn uri() -> Url {
+        Url::parse("file:///t.awa").unwrap()
+    }
+
     #[test]
     fn 正しいプログラムは診断なし() {
-        assert!(diagnostics_for("let f = fn(x: Int) -> Int { x + 1 }\nf(2)").is_empty());
+        assert!(diagnostics_for(&uri(), "let f = fn(x: Int) -> Int { x + 1 }\nf(2)").is_empty());
     }
 
     #[test]
     fn 型エラーは診断1個() {
-        let d = diagnostics_for("true + 1");
+        let d = diagnostics_for(&uri(), "true + 1");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(d[0].range.start, Position::new(0, 0));
@@ -195,9 +262,30 @@ mod tests {
 
     #[test]
     fn 複数行のエラー位置() {
-        let d = diagnostics_for("let x = 1\nnope");
+        let d = diagnostics_for(&uri(), "let x = 1\nnope");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn import_std_は未定義にならない() {
+        // 焼き込みの std を解決するので、io.println は未定義扱いされない。
+        let src = "import std/io\nio.println(\"hi\")\n";
+        assert!(
+            diagnostics_for(&uri(), src).is_empty(),
+            "import 解決後は診断なしのはず"
+        );
+    }
+
+    #[test]
+    fn import行ではモジュールが補完される() {
+        assert!(is_import_line("import std/io", 0));
+        assert!(is_import_line("  import foo", 0));
+        assert!(!is_import_line("let x = 1", 0));
+        // std/* は焼き込みから常に提案できる。
+        let comp = import_completions(&uri());
+        assert!(comp.iter().any(|c| c == "std/io"));
+        assert!(comp.iter().any(|c| c == "std/list"));
     }
 
     #[test]

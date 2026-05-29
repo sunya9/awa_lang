@@ -15,11 +15,11 @@ pub mod token;
 pub mod types;
 pub mod value;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ast::TStmt;
-use error::{LocatedError, report};
+use error::{AwaError, LocatedError, report};
 use eval::eval_program;
 use infer::Checker;
 use parser::Parser;
@@ -86,21 +86,36 @@ pub fn load_program(
     stdlib: Option<&Path>,
     entry_path: &str,
 ) -> Result<Vec<LoadedModule>, String> {
+    load_program_with_overrides(root, stdlib, entry_path, &HashMap::new())
+}
+
+// load_program と同じだが、モジュールキー（"seg/seg"）→ソースの上書きを受け取る。
+// LSP がディスク未保存のバッファ内容で検査するために使う（該当モジュールはディスクを読まない）。
+pub fn load_program_with_overrides(
+    root: &PathBuf,
+    stdlib: Option<&Path>,
+    entry_path: &str,
+    overrides: &HashMap<String, String>,
+) -> Result<Vec<LoadedModule>, String> {
     // エントリのモジュールパス: ".awa" を外して "/" で分割。
     let rel = entry_path.strip_suffix(".awa").unwrap_or(entry_path);
     let entry_segs: Vec<String> = rel.split('/').map(|s| s.to_string()).collect();
     let mut loaded: Vec<LoadedModule> = Vec::new();
     let mut done: HashSet<String> = HashSet::new();
     let mut in_progress: HashSet<String> = HashSet::new();
-    load_module(root, stdlib, &entry_segs, true, &mut loaded, &mut done, &mut in_progress)?;
+    load_module(
+        root, stdlib, &entry_segs, true, overrides, &mut loaded, &mut done, &mut in_progress,
+    )?;
     Ok(loaded)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_module(
     root: &PathBuf,
     stdlib: Option<&Path>,
     segs: &[String],
     is_entry: bool,
+    overrides: &HashMap<String, String>,
     loaded: &mut Vec<LoadedModule>,
     done: &mut HashSet<String>,
     in_progress: &mut HashSet<String>,
@@ -122,9 +137,11 @@ fn load_module(
         path.push(s);
     }
     path.set_extension("awa");
-    // std モジュールはバイナリ焼き込みのソースを既定で使う（cwd/環境に非依存）。
-    // ただし実ファイルが見つかればそれを優先する＝標準ライブラリ自体を開発するときの上書き。
-    let source = if is_std {
+    // 上書き（LSP のバッファ）が最優先。次に std はバイナリ焼き込み（cwd/環境に非依存。
+    // ただし実ファイルがあればそれを優先＝標準ライブラリ開発の上書き）。最後に通常のディスク読み。
+    let source = if let Some(buf) = overrides.get(&key) {
+        buf.clone()
+    } else if is_std {
         match std::fs::read_to_string(&path) {
             Ok(disk) => disk,
             Err(disk_err) => stdlib::embedded_source(segs).map(str::to_string).ok_or_else(|| {
@@ -143,7 +160,7 @@ fn load_module(
     .map_err(|e| report(&e, &source))?;
     // 依存先を先に読み込む（post-order で依存順に並ぶ）。
     for imp in &parsed.imports {
-        load_module(root, stdlib, &imp.path, false, loaded, done, in_progress)?;
+        load_module(root, stdlib, &imp.path, false, overrides, loaded, done, in_progress)?;
     }
     in_progress.remove(&key);
     done.insert(key);
@@ -175,6 +192,68 @@ pub fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, Str
     // 型検査後にメソッド可視性を検査（非公開メソッドの越境呼び出しを弾く）。
     resolve::check_visibility(&typed, &resolved).map_err(|e| format_error(&e, modules))?;
     Ok(typed)
+}
+
+// LSP 向け: 1 つの開いている文書を、その import を解決した上で型検査する。
+// entry_source はバッファ内容（ディスク未保存でも検査できるよう上書きする）。
+// 返すエラーの span は「その文書内のローカル offset」なので、そのまま範囲に変換できる。
+// import 先（std や兄弟ファイル）で起きたエラーは、この文書には出しようがないので span なし。
+pub fn check_document(
+    root: &PathBuf,
+    stdlib: Option<&Path>,
+    entry_path: &str,
+    entry_source: &str,
+) -> Result<(), LocatedError> {
+    let rel = entry_path.strip_suffix(".awa").unwrap_or(entry_path);
+    let entry_key = rel.split('/').collect::<Vec<_>>().join("/");
+    let mut overrides = HashMap::new();
+    overrides.insert(entry_key.clone(), entry_source.to_string());
+
+    let modules = match load_program_with_overrides(root, stdlib, entry_path, &overrides) {
+        Ok(m) => m,
+        Err(msg) => {
+            // ロード失敗の典型は「編集中の文書自身の字句/構文エラー」。バッファを
+            // 直接解析して span 付きで返す（ローカル offset なのでそのまま使える）。
+            let tokens = lexer::tokenize(entry_source)?;
+            Parser::new(tokens).parse_module()?;
+            // 文書自身は解析できた＝欠落 import や依存先の問題。span なしで概要を返す。
+            return Err(LocatedError {
+                error: AwaError::Io(msg),
+                span: None,
+            });
+        }
+    };
+
+    // resolve→型検査→可視性。エラーは連結後のグローバル span なので、文書ローカルへ畳む。
+    let localize = |e: LocatedError| localize_to_entry(e, &modules);
+    let resolved = resolve::resolve(&modules).map_err(localize)?;
+    let mut checker = Checker::new();
+    let typed = checker.check_program(&resolved.stmts).map_err(localize)?;
+    resolve::check_visibility(&typed, &resolved).map_err(localize)?;
+    Ok(())
+}
+
+// 連結後のグローバル span を、エントリ文書内のローカル offset へ変換する。
+// エントリは prefix == "" の唯一のモジュール。span がエントリ範囲外（依存先）なら span を落とす。
+fn localize_to_entry(e: LocatedError, modules: &[LoadedModule]) -> LocatedError {
+    let Some(span) = e.span else { return e };
+    if let Some(i) = modules.iter().position(|m| m.prefix.is_empty()) {
+        let base = resolve::module_base(modules, i);
+        let len = modules[i].source.chars().count();
+        if span.start >= base && span.start <= base + len {
+            return LocatedError {
+                error: e.error,
+                span: Some(span::Span::new(
+                    span.start - base,
+                    span.end.saturating_sub(base),
+                )),
+            };
+        }
+    }
+    LocatedError {
+        error: e.error,
+        span: None,
+    }
 }
 
 // エラー整形: 連結後の span がどのモジュールの座標かを逆引きし、そのファイルのソース＋
