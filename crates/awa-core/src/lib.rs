@@ -2231,6 +2231,21 @@ mod tests {
     }
 
     #[test]
+    fn std_int_float_string_追加関数() {
+        let out = std_build_run(
+            "import std/io\n\
+             import std/int\n\
+             import std/string\n\
+             io.println(\"${int.clamp(15, 0, 10)} ${int.pow(2, 10)} ${int.sign(-3)}\")\n\
+             io.println(\"${int.is_even(4)}\")\n\
+             io.println(\"[${string.trim(\"  hi  \")}]\")\n\
+             io.println(string.repeat(\"ab\", 3))\n\
+             io.println(string.reverse(\"abcあ\"))\n",
+        );
+        assert_eq!(out, "10 1024 -1\ntrue\n[hi]\nababab\nあcba\n");
+    }
+
+    #[test]
     fn std_option_result_コンビネータ() {
         let out = std_build_run(
             "import std/io\n\

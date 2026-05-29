@@ -22,3 +22,42 @@ pub let min: fn(Int, Int) -> Int = fn(a, b) {
     false -> b
   }
 }
+
+// n を [lo, hi] に収める。
+pub let clamp: fn(Int, Int, Int) -> Int = fn(n, lo, hi) {
+  case n < lo {
+    true -> lo
+    false -> case n > hi {
+      true -> hi
+      false -> n
+    }
+  }
+}
+
+// 累乗（exp < 0 は 0）。
+pub let pow: fn(Int, Int) -> Int = fn(base, exp) {
+  case exp <= 0 {
+    true -> case exp == 0 {
+      true -> 1
+      false -> 0
+    }
+    false -> base * pow(base, exp - 1)
+  }
+}
+
+pub let is_even = fn(n: Int) -> Bool { n - n / 2 * 2 == 0 }
+
+pub let is_odd = fn(n: Int) -> Bool { n - n / 2 * 2 != 0 }
+
+// 符号（負 -1 / 零 0 / 正 1）。
+pub let sign: fn(Int) -> Int = fn(n) {
+  case n < 0 {
+    true -> -1
+    false -> case n > 0 {
+      true -> 1
+      false -> 0
+    }
+  }
+}
+
+pub let to_float = fn(n: Int) -> Float { int_to_float(n) }

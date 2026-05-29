@@ -22,3 +22,16 @@ pub let min: fn(Float, Float) -> Float = fn(a, b) {
     false -> b
   }
 }
+
+pub let to_int = fn(x: Float) -> Int { float_to_int(x) }
+
+// x を [lo, hi] に収める。
+pub let clamp: fn(Float, Float, Float) -> Float = fn(x, lo, hi) {
+  case x < lo {
+    true -> lo
+    false -> case x > hi {
+      true -> hi
+      false -> x
+    }
+  }
+}

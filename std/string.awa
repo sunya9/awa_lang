@@ -131,3 +131,50 @@ let join_from = fn(xs, sep, first) {
 }
 
 pub let join = fn(xs: list.List(String), sep: String) -> String { join_from(xs, sep, true) }
+
+// ----- トリム・繰り返し・反転 -----
+let is_ws = fn(c) { c == 32 || c == 9 || c == 10 || c == 13 }
+
+let trim_start_from = fn(s, i) {
+  case is_ws(string_char_at(s, i)) {
+    true -> trim_start_from(s, i + 1)
+    false -> slice(s, i, string_length(s))
+  }
+}
+
+// 先頭の空白（空白/タブ/改行/復帰）を除去。
+pub let trim_start = fn(s: String) -> String { trim_start_from(s, 0) }
+
+let trim_end_to = fn(s, n) {
+  case n <= 0 {
+    true -> 0
+    false -> case is_ws(string_char_at(s, n - 1)) {
+      true -> trim_end_to(s, n - 1)
+      false -> n
+    }
+  }
+}
+
+// 末尾の空白を除去。
+pub let trim_end = fn(s: String) -> String { slice(s, 0, trim_end_to(s, string_length(s))) }
+
+// 両端の空白を除去。
+pub let trim = fn(s: String) -> String { trim_start(trim_end(s)) }
+
+// s を n 回繰り返した文字列。
+pub let repeat = fn(s: String, n: Int) -> String {
+  case n <= 0 {
+    true -> ""
+    false -> s <> repeat(s, n - 1)
+  }
+}
+
+let reverse_from = fn(s, i) {
+  case i < 0 {
+    true -> ""
+    false -> char_to_string(string_char_at(s, i)) <> reverse_from(s, i - 1)
+  }
+}
+
+// 文字列を反転（コードポイント単位）。
+pub let reverse = fn(s: String) -> String { reverse_from(s, string_length(s) - 1) }
