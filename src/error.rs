@@ -57,6 +57,7 @@ pub enum AwaError {
     // ----- モジュール（Phase 10） -----
     NotExported { module: String, name: String }, // 参照先がそのモジュールで pub 公開されていない
     UnknownModule(String),                        // 修飾アクセスの左がモジュールでない（未 import 等）
+    PrivateMethod { ty: String, method: String }, // 非公開メソッドを他モジュールから呼んだ
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -131,6 +132,11 @@ impl fmt::Display for AwaError {
             AwaError::UnknownModule(name) => {
                 write!(f, "モジュールではありません（未 import の可能性）: {}", name)
             }
+            AwaError::PrivateMethod { ty, method } => write!(
+                f,
+                "メソッド {}.{} は非公開です（定義モジュールで pub impl にしてください）",
+                ty, method
+            ),
         }
     }
 }

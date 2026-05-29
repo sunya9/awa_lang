@@ -176,6 +176,7 @@ pub struct ImplBlock {
     pub type_name: String,       // "Option" / "Num" など（メソッドを生やす型の頭）
     pub params: Vec<String>,     // 型パラメータ（ADT なら ["a"]、組込なら空）
     pub methods: Vec<Method>,
+    pub is_pub: bool,            // pub impl なら全メソッドを他モジュールへ公開
 }
 
 // 1 つのメソッド。params[0] がレシーバ（self）。

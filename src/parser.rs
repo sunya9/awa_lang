@@ -166,9 +166,12 @@ impl Parser {
             } else {
                 false
             };
-            let stmt = self.parse_stmt()?;
+            let mut stmt = self.parse_stmt()?;
             if is_pub {
-                if let Some(name) = stmt_name(&stmt) {
+                // pub impl は全メソッドを公開（impl は名前を持たないので個別処理）。
+                if let Stmt::Impl(b) = &mut stmt {
+                    b.is_pub = true;
+                } else if let Some(name) = stmt_name(&stmt) {
                     module.exports.insert(name.to_string());
                 }
             }
@@ -309,6 +312,7 @@ impl Parser {
             type_name,
             params,
             methods,
+            is_pub: false, // pub は parse_module 側で設定する
         })
     }
 

@@ -9,9 +9,33 @@
 //   ＝「名前が util.double のような長い文字列になっただけ」と見なせる。
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, ExprKind, Import, Pattern, Stmt, TypeExpr};
+use crate::ast::{Expr, ExprKind, Import, Pattern, Stmt, TExpr, TExprKind, TStmt, TypeExpr};
 use crate::error::{AwaError, LocatedError};
 use crate::span::Span;
+
+// 名前解決の結果。フラットな完全修飾プログラムに加え、メソッド可視性の検査に要る情報を持つ。
+pub struct Resolved {
+    pub stmts: Vec<Stmt>,
+    // メソッドのマングル名 "型頭#名" → (定義モジュールの接頭辞, pub か)。
+    pub method_vis: HashMap<String, (String, bool)>,
+    // (グローバル開始位置, モジュール接頭辞) を base 昇順で。span からモジュールを逆引きする。
+    pub module_ranges: Vec<(usize, String)>,
+}
+
+impl Resolved {
+    // グローバル span 位置がどのモジュール（接頭辞）に属するか。
+    fn module_of(&self, offset: usize) -> &str {
+        let mut found = "";
+        for (base, prefix) in &self.module_ranges {
+            if *base <= offset {
+                found = prefix;
+            } else {
+                break;
+            }
+        }
+        found
+    }
+}
 
 // 連結後の「グローバル座標」での各モジュールの開始位置（文字単位）。
 // モジュール i は [base, base + 文字数) を占める。エラー整形側が span からファイルを逆引きする。
@@ -50,7 +74,7 @@ fn effective_exports(m: &LoadedModule) -> HashSet<String> {
 }
 
 // 依存順（依存先が先）に並んだモジュール列を、完全修飾された 1 つの Stmt 列へ畳み込む。
-pub fn resolve(modules: &[LoadedModule]) -> Result<Vec<Stmt>, LocatedError> {
+pub fn resolve(modules: &[LoadedModule]) -> Result<Resolved, LocatedError> {
     // モジュールパス文字列 → (接頭辞, 公開名集合)。
     let mut registry: HashMap<String, (String, HashSet<String>)> = HashMap::new();
     for m in modules {
@@ -58,8 +82,11 @@ pub fn resolve(modules: &[LoadedModule]) -> Result<Vec<Stmt>, LocatedError> {
     }
 
     let mut out = Vec::new();
+    let mut method_vis: HashMap<String, (String, bool)> = HashMap::new();
+    let mut module_ranges: Vec<(usize, String)> = Vec::new();
     for (index, m) in modules.iter().enumerate() {
         let base = module_base(modules, index);
+        module_ranges.push((base, m.prefix.clone()));
         // import 修飾子 → (対象接頭辞, 対象公開名集合)。
         let mut imap: HashMap<String, (String, HashSet<String>)> = HashMap::new();
         for imp in &m.imports {
@@ -87,6 +114,23 @@ pub fn resolve(modules: &[LoadedModule]) -> Result<Vec<Stmt>, LocatedError> {
                 _ => {}
             }
         }
+        // メソッド可視性: マングル名 "修飾型頭#名" → (このモジュール接頭辞, pub か)。
+        // 型頭は impl 対象が自モジュール型なら接頭辞付き（チェッカの head と一致させる）。
+        for s in &m.stmts {
+            if let Stmt::Impl(b) = s {
+                let head = if types.contains(&b.type_name) {
+                    format!("{}{}", m.prefix, b.type_name)
+                } else {
+                    b.type_name.clone()
+                };
+                for meth in &b.methods {
+                    method_vis.insert(
+                        format!("{}#{}", head, meth.name),
+                        (m.prefix.clone(), b.is_pub),
+                    );
+                }
+            }
+        }
         let r = Resolver {
             base,
             prefix: &m.prefix,
@@ -99,7 +143,80 @@ pub fn resolve(modules: &[LoadedModule]) -> Result<Vec<Stmt>, LocatedError> {
             out.push(r.stmt(s)?);
         }
     }
-    Ok(out)
+    Ok(Resolved {
+        stmts: out,
+        method_vis,
+        module_ranges,
+    })
+}
+
+// 型検査後のメソッド可視性パス。チェッカが `recv.m()` を Call(Var("型頭#名"), ..) へ lower
+// 済みなので、その Var 名から定義モジュール・公開可否を、ノードの span から呼び出し元モジュールを
+// 得て、非公開メソッドの越境呼び出しを弾く。
+pub fn check_visibility(stmts: &[TStmt], r: &Resolved) -> Result<(), LocatedError> {
+    for s in stmts {
+        match s {
+            TStmt::Let(_, te) | TStmt::Expr(te) => check_vis_expr(te, r)?,
+            TStmt::Impl(methods) => {
+                for m in methods {
+                    check_vis_expr(&m.body, r)?;
+                }
+            }
+            TStmt::Type(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_vis_expr(te: &TExpr, r: &Resolved) -> Result<(), LocatedError> {
+    if let TExprKind::Var(name) = &te.kind {
+        if let Some((owner, is_pub)) = r.method_vis.get(name) {
+            if !is_pub && r.module_of(te.span.start) != owner {
+                let (ty, method) = name.split_once('#').unwrap_or(("", name.as_str()));
+                return Err(LocatedError::at(
+                    AwaError::PrivateMethod {
+                        ty: ty.to_string(),
+                        method: method.to_string(),
+                    },
+                    te.span,
+                ));
+            }
+        }
+    }
+    // 子ノードを再帰。
+    match &te.kind {
+        TExprKind::Int(_)
+        | TExprKind::Long(_)
+        | TExprKind::Float(_)
+        | TExprKind::Str(_)
+        | TExprKind::Bool(_)
+        | TExprKind::Var(_) => {}
+        TExprKind::Neg(x) => check_vis_expr(x, r)?,
+        TExprKind::BinOp(l, _, rr) => {
+            check_vis_expr(l, r)?;
+            check_vis_expr(rr, r)?;
+        }
+        TExprKind::If(c, t, e) => {
+            check_vis_expr(c, r)?;
+            check_vis_expr(t, r)?;
+            check_vis_expr(e, r)?;
+        }
+        TExprKind::Lambda(_, body) => check_vis_expr(body, r)?,
+        TExprKind::Call(callee, args) => {
+            check_vis_expr(callee, r)?;
+            for a in args {
+                check_vis_expr(a, r)?;
+            }
+        }
+        TExprKind::Block(stmts) => check_visibility(stmts, r)?,
+        TExprKind::Case(subj, arms) => {
+            check_vis_expr(subj, r)?;
+            for (_, body) in arms {
+                check_vis_expr(body, r)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 struct Resolver<'a> {

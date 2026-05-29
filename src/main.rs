@@ -227,11 +227,14 @@ fn load_module(
 // ローダ＋名前解決＋型検査を通し、フラットな型付きプログラムを返す。
 // エラーは整形済み文字列で返す（単一モジュールなら位置つき、複数なら簡易表示）。
 fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, String> {
-    let stmts = resolve::resolve(modules).map_err(|e| format_error(&e, modules))?;
+    let resolved = resolve::resolve(modules).map_err(|e| format_error(&e, modules))?;
     let mut checker = Checker::new();
-    checker
-        .check_program(&stmts)
-        .map_err(|e| format_error(&e, modules))
+    let typed = checker
+        .check_program(&resolved.stmts)
+        .map_err(|e| format_error(&e, modules))?;
+    // 型検査後にメソッド可視性を検査（非公開メソッドの越境呼び出しを弾く）。
+    resolve::check_visibility(&typed, &resolved).map_err(|e| format_error(&e, modules))?;
+    Ok(typed)
 }
 
 // エラー整形: 連結後の span がどのモジュールの座標かを逆引きし、そのファイルのソース＋
@@ -1247,7 +1250,7 @@ mod tests {
     fn module_越境do記法() {
         // 別モジュールの Opt とその flatMap を import して do を書く（成功と短絡の両方）。
         let opt = "pub type Opt(a) { Some(a); None }\n\
-                   impl Opt(a) { fn flatMap(self, f: fn(a) -> Opt(b)) -> Opt(b) { case self { Some(x) -> f(x); None -> None } } }\n";
+                   pub impl Opt(a) { fn flatMap(self, f: fn(a) -> Opt(b)) -> Opt(b) { case self { Some(x) -> f(x); None -> None } } }\n";
         let (ok, code1) = compile_modules_status(
             &[
                 ("opt.awa", opt),
@@ -1287,7 +1290,7 @@ mod tests {
                 (
                     "shapes.awa",
                     "pub type Shape { Circle(Int); Square(Int) }\n\
-                     impl Shape { fn area(self) -> Int { case self { Circle(r) -> r * r; Square(w) -> w * w } } }\n",
+                     pub impl Shape { fn area(self) -> Int { case self { Circle(r) -> r * r; Square(w) -> w * w } } }\n",
                 ),
                 (
                     "main.awa",
@@ -1299,6 +1302,42 @@ mod tests {
             "main",
         );
         assert_eq!(out, "100\n16\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn module_非公開メソッドの越境呼び出しはエラー() {
+        // pub なし impl のメソッドを他モジュールから呼ぶと PrivateMethod。
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_mod_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("shapes.awa"),
+            "pub type Shape { Circle(Int) }\nimpl Shape { fn area(self) -> Int { case self { Circle(r) -> r * r } } }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.awa"), "import shapes\nshapes.Circle(5).area()\n").unwrap();
+        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let err = check_program_modules(&modules).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("非公開"), "実際のエラー: {}", err);
+    }
+
+    #[test]
+    fn module_pub_implなら越境呼び出しできる() {
+        // 同じ内容でも pub impl にすれば越境呼び出しが通る。同一モジュールの private メソッドは可。
+        let (out, code) = compile_modules_status(
+            &[
+                (
+                    "shapes.awa",
+                    "pub type Shape { Circle(Int) }\npub impl Shape { fn area(self) -> Int { case self { Circle(r) -> r * r } } }\n",
+                ),
+                ("main.awa", "import shapes\nshapes.Circle(5).area()\n"),
+            ],
+            "main",
+        );
+        assert_eq!(out, "25\n");
         assert_eq!(code, 0);
     }
 
