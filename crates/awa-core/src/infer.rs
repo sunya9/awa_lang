@@ -174,6 +174,50 @@ impl Checker {
         self.env.insert("tcp_connect".to_string(), mono(vec![Type::Str, Type::Int], fut(socket)));
         // ファイル擬似非同期（native はスレッドプール、インタプリタは同期読み→即解決 Future）。
         self.env.insert("read_file_async".to_string(), mono(vec![Type::Str], fut(Type::Str)));
+
+        // ===== 配列プリミティブ（不変・永続 Array(a)）=====
+        // std/array が at→Option・map/filter/fold などの高水準 API を組む土台。すべて多相。
+        self.arities.insert("Array".to_string(), 1);
+        let array = |t: Type| Type::Con("Array".to_string(), vec![t]);
+        // 多相プリミティブごとに新しい型変数 a を割り当てて scheme を作る。
+        let mut afresh = || match self.vargen.fresh() {
+            Type::Var(id) => id,
+            _ => unreachable!(),
+        };
+        // array_empty : ∀a. () -> Array(a)
+        let a = afresh();
+        self.env.insert(
+            "array_empty".to_string(),
+            scheme(vec![a], vec![], array(Type::Var(a))),
+        );
+        // array_length : ∀a. Array(a) -> Int
+        let a = afresh();
+        self.env.insert(
+            "array_length".to_string(),
+            scheme(vec![a], vec![array(Type::Var(a))], Type::Int),
+        );
+        // array_get : ∀a. (Array(a), Int) -> a（無検査。std/array.at が範囲を守る）
+        let a = afresh();
+        self.env.insert(
+            "array_get".to_string(),
+            scheme(vec![a], vec![array(Type::Var(a)), Type::Int], Type::Var(a)),
+        );
+        // array_set : ∀a. (Array(a), Int, a) -> Array(a)（永続更新）
+        let a = afresh();
+        self.env.insert(
+            "array_set".to_string(),
+            scheme(
+                vec![a],
+                vec![array(Type::Var(a)), Type::Int, Type::Var(a)],
+                array(Type::Var(a)),
+            ),
+        );
+        // array_push : ∀a. (Array(a), a) -> Array(a)（永続更新）
+        let a = afresh();
+        self.env.insert(
+            "array_push".to_string(),
+            scheme(vec![a], vec![array(Type::Var(a)), Type::Var(a)], array(Type::Var(a))),
+        );
     }
 
     // プログラム（トップレベルの文の並び）を型検査し、型付き AST（elaboration の結果）を返す。
@@ -294,6 +338,11 @@ fn resolve_texpr(te: &mut TExpr, subst: &Subst) {
                 resolve_texpr(body, subst);
             }
         }
+        TExprKind::ArrayLit(elems) => {
+            for e in elems {
+                resolve_texpr(e, subst);
+            }
+        }
     }
 }
 
@@ -365,6 +414,7 @@ fn check_numeric(te: &TExpr) -> Result<(), LocatedError> {
             check_numeric(subject)?;
             arms.iter().try_for_each(|(_, b)| check_numeric(b))
         }
+        TExprKind::ArrayLit(elems) => elems.iter().try_for_each(check_numeric),
     }
 }
 
@@ -876,6 +926,19 @@ fn infer_expr(
             let (tstmts, ty) = infer_stmts(stmts, &mut block_env, subst, vargen, arities, methods)?;
             (TExprKind::Block(tstmts), ty)
         }
+        // 配列リテラル [e1, ...]: 全要素を 1 つの要素型 elem に unify し、Array(elem) を返す。
+        // 空 [] は elem が fresh のまま多相（Array(a)）になる。
+        ExprKind::ArrayLit(elems) => {
+            let elem = vargen.fresh();
+            let mut telems = Vec::with_capacity(elems.len());
+            for e in elems {
+                let te = infer_expr(e, env, subst, vargen, arities, methods)?;
+                at(unify(subst, &te.ty, &elem), e.span)?;
+                telems.push(te);
+            }
+            let ty = Type::Con("Array".to_string(), vec![apply(subst, &elem)]);
+            (TExprKind::ArrayLit(telems), ty)
+        }
         // パターンマッチ: 主語の型に各腕のパターン型を unify、全腕の本体型を互いに unify。
         ExprKind::Case(subject, arms) => {
             let st = infer_expr(subject, env, subst, vargen, arities, methods)?;
@@ -996,6 +1059,18 @@ fn infer_pattern(
                 bindings.extend(sbind);
             }
             Ok((result, bindings))
+        }
+        // 配列パターン [a, b, ...]: 主語は Array(elem)。各要素パターンを elem に unify する。
+        Pattern::Array(subs) => {
+            let elem = vargen.fresh();
+            let mut bindings = Vec::new();
+            for sub in subs {
+                let (sty, sbind) = infer_pattern(sub, env, subst, vargen)?;
+                unify(subst, &sty, &elem)?;
+                bindings.extend(sbind);
+            }
+            let ty = Type::Con("Array".to_string(), vec![apply(subst, &elem)]);
+            Ok((ty, bindings))
         }
         // or パターン: 全選択肢を同じ型に unify し、束縛変数の集合が一致することを確かめる
         // （本体がどの選択肢でマッチしても同じ変数を参照できるように）。

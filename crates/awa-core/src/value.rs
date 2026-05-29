@@ -28,6 +28,9 @@ pub enum Value {
     // 非同期の Future。ランタイム所有のイベントループ内のハンドル（id）への不透明参照。
     // 中身（解決値・待ち継続）はランタイムが持ち、awa からは見えない（純粋性を保つ）。
     Future(usize),
+    // 不変・永続なインデックス配列 Array(a)。Rc で包んで複製を安価にし、更新系
+    // （set/push）は新しい Vec を作って返す（永続データ構造）。
+    Array(Rc<Vec<Value>>),
 }
 
 // クロージャ = 関数 + 定義時の環境。
@@ -61,6 +64,8 @@ impl PartialEq for Value {
                 Value::Data { ctor: c1, args: a1 },
                 Value::Data { ctor: c2, args: a2 },
             ) => c1 == c2 && a1 == a2,
+            // 配列は要素ごとに構造比較。
+            (Value::Array(a), Value::Array(b)) => a == b,
             _ => false,
         }
     }
@@ -84,6 +89,17 @@ impl fmt::Display for Value {
             Value::Func(c) => write!(f, "<fn/{}>", c.params.len()),
             Value::Native(name) => write!(f, "<native {}>", name),
             Value::Future(_) => write!(f, "<future>"),
+            // 配列は [1, 2, 3] のように表示する。
+            Value::Array(xs) => {
+                write!(f, "[")?;
+                for (i, x) in xs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", x)?;
+                }
+                write!(f, "]")
+            }
             Value::Unit => write!(f, "Nil"),
             Value::Ctor { name, arity } => write!(f, "<ctor {}/{}>", name, arity),
             // 構築済み値は Some(3) / None / Cons(1, Nil) のように表示。
@@ -117,6 +133,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Unit => "Nil",
         Value::Data { .. } => "Data",
         Value::Future(_) => "Future",
+        Value::Array(_) => "Array",
     }
 }
 

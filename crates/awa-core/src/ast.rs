@@ -39,6 +39,9 @@ pub enum ExprKind {
     // 修飾アクセス receiver.member（括弧なし）。モジュール名前解決でのみ意味を持ち、
     // resolve が Var("mod.member") へ潰す（型付き AST には現れない）。単一ファイルでは無効。
     Field(Box<Expr>, String),
+    // 配列リテラル [e1, e2, ...]。不変・永続なインデックス配列 Array(a) を構築する。
+    // 連結リスト（list.Cons）とは別物。空 [] も含む。
+    ArrayLit(Vec<Expr>),
 }
 
 // ===== パターン（case の腕の左辺）=====
@@ -51,6 +54,9 @@ pub enum Pattern {
     Int(i64),                    // 整数リテラルパターン
     Str(String),                 // 文字列リテラルパターン
     Ctor(String, Vec<Pattern>),  // 構築子 Some(x), Cons(h, t), None（部分パターンは入れ子）
+    // 配列パターン [a, b, ...]（固定長）。主語が Array(a) で長さがちょうど一致すれば成立。
+    // 配列は不変だが任意長なので、配列パターンは網羅的になり得ない（常に _ 等の既定腕が要る）。
+    Array(Vec<Pattern>),
     // or パターン A | B | ...。どれかに当たれば成立。各選択肢は同じ変数を束縛する必要がある。
     Or(Vec<Pattern>),
 }
@@ -107,6 +113,8 @@ pub enum TExprKind {
     Call(Box<TExpr>, Vec<TExpr>),
     Block(Vec<TStmt>),
     Case(Box<TExpr>, Vec<(Pattern, TExpr)>),
+    // 配列リテラル [e1, ...]（要素型は自身の ty=Con("Array",[elem]) に入っている）。
+    ArrayLit(Vec<TExpr>),
 }
 
 #[derive(Debug, Clone)]

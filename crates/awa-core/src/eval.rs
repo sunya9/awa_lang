@@ -110,6 +110,14 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
             // どの腕にも当たらなかった（網羅性チェックは Phase 3b で静的に防ぐ）。
             Err(LocatedError::at(AwaError::NoMatch, span))
         }
+        // 配列リテラル [e1, ...]: 各要素を評価して不変配列にまとめる。
+        TExprKind::ArrayLit(elems) => {
+            let mut vals = Vec::with_capacity(elems.len());
+            for e in elems {
+                vals.push(eval_expr(e, env)?);
+            }
+            Ok(Value::Array(Rc::new(vals)))
+        }
     }
 }
 
@@ -137,6 +145,17 @@ fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)
                 let mut bindings = Vec::new();
                 for (sub, arg) in subs.iter().zip(args.iter()) {
                     bindings.extend(match_pattern(sub, arg)?);
+                }
+                Some(bindings)
+            }
+            _ => None,
+        },
+        // 配列パターン [a, b, ...]: 長さがちょうど一致したとき各要素を照合する。
+        Pattern::Array(subs) => match value {
+            Value::Array(xs) if xs.len() == subs.len() => {
+                let mut bindings = Vec::new();
+                for (sub, x) in subs.iter().zip(xs.iter()) {
+                    bindings.extend(match_pattern(sub, x)?);
                 }
                 Some(bindings)
             }
@@ -865,6 +884,57 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
             }
             unreachable!("read_file_async の引数は String");
         }
+        // ===== 配列プリミティブ（不変・永続 Array(a)） =====
+        // 空配列。std/array が map/filter の初期値などに使う。
+        "array_empty" => {
+            return Ok(Value::Array(Rc::new(Vec::new())));
+        }
+        // 長さ（O(1)）。
+        "array_length" => {
+            if let Some(Value::Array(xs)) = args.into_iter().next() {
+                return Ok(Value::Int(xs.len() as i64));
+            }
+            unreachable!("array_length の引数は Array");
+        }
+        // 無検査の要素取り出し（O(1)）。範囲外は std 側で防ぐ前提（at が Option を返す）。
+        "array_get" => {
+            let mut it = args.into_iter();
+            if let (Some(Value::Array(xs)), Some(Value::Int(i))) = (it.next(), it.next()) {
+                if i >= 0 && (i as usize) < xs.len() {
+                    return Ok(xs[i as usize].clone());
+                }
+                return Err(LocatedError::at(
+                    AwaError::Io(format!("array_get: 範囲外 index {}（長さ {}）", i, xs.len())),
+                    span,
+                ));
+            }
+            unreachable!("array_get の引数は (Array, Int)");
+        }
+        // i 番目を v に差し替えた新しい配列を返す（永続更新・O(n) コピー）。範囲外は元の配列を返す。
+        "array_set" => {
+            let mut it = args.into_iter();
+            if let (Some(Value::Array(xs)), Some(Value::Int(i)), Some(v)) =
+                (it.next(), it.next(), it.next())
+            {
+                if i < 0 || (i as usize) >= xs.len() {
+                    return Ok(Value::Array(xs));
+                }
+                let mut new = (*xs).clone();
+                new[i as usize] = v;
+                return Ok(Value::Array(Rc::new(new)));
+            }
+            unreachable!("array_set の引数は (Array, Int, a)");
+        }
+        // 末尾に v を加えた新しい配列を返す（永続更新・O(n) コピー）。
+        "array_push" => {
+            let mut it = args.into_iter();
+            if let (Some(Value::Array(xs)), Some(v)) = (it.next(), it.next()) {
+                let mut new = (*xs).clone();
+                new.push(v);
+                return Ok(Value::Array(Rc::new(new)));
+            }
+            unreachable!("array_push の引数は (Array, a)");
+        }
         // ソケットはネイティブの kqueue ランタイム専用。インタプリタでは未対応。
         "tcp_listen" | "sock_port" | "accept" | "sock_read" | "sock_write" | "sock_close"
         | "tcp_connect" => {
@@ -960,6 +1030,12 @@ pub fn builtins_env() -> Env {
         "sock_close",
         "tcp_connect",
         "read_file_async",
+        // 配列プリミティブ。std/array が高水準 API（map/filter/at→Option…）を組む土台。
+        "array_empty",
+        "array_length",
+        "array_get",
+        "array_set",
+        "array_push",
     ] {
         env.insert(name.to_string(), Value::Native(name.to_string()));
     }

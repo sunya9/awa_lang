@@ -245,6 +245,19 @@ fn tokenize_collecting(
                 }
                 i += 1;
             }
+            // [ ] はリストリテラル。'(' と同じく中では改行を無視（複数行リテラル可）。
+            '[' => {
+                tokens.push(Spanned::new(Token::LBracket, Span::new(start, start + 1)));
+                brackets.push('(');
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Spanned::new(Token::RBracket, Span::new(start, start + 1)));
+                if brackets.last() == Some(&'(') {
+                    brackets.pop();
+                }
+                i += 1;
+            }
             ',' => {
                 tokens.push(Spanned::new(Token::Comma, Span::new(start, start + 1)));
                 i += 1;

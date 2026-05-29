@@ -77,6 +77,83 @@ long long awa_now(void) {
   clock_gettime(CLOCK_REALTIME, &ts);
   return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+
+// ===== 配列（不変・永続 Array(a)）=====
+// レイアウト: [i64 rc][ptr drop][i64 len][i64 elem_size][i64 elem_heap][要素...]。
+// 要素は offset 40 から elem_size バイト刻み。elem_heap が真なら各要素は ptr で、
+// drop/コピー時に awa_retain/awa_release で参照カウントを管理する。RC 関数は codegen が
+// LLVM IR で定義する（C からは extern で呼ぶ）。
+extern void awa_retain(void* o);
+extern void awa_release(void* o);
+#define AWA_ARR_HDR 40
+
+void awa_array_drop(void* o); // 前方宣言（alloc が drop ポインタに使う）
+
+// len 個・要素 elem_size バイト・elem_heap 種別の配列を確保（rc=1）。
+void* awa_array_alloc(long long len, long long elem_size, long long elem_heap) {
+  long long bytes = AWA_ARR_HDR + len * elem_size;
+  char* o = (char*)malloc(bytes > 0 ? bytes : AWA_ARR_HDR);
+  *(long long*)(o + 0) = 1;                                          // rc
+  *(void**)(o + 8) = elem_heap ? (void*)awa_array_drop : (void*)0;   // drop
+  *(long long*)(o + 16) = len;
+  *(long long*)(o + 24) = elem_size;
+  *(long long*)(o + 32) = elem_heap;
+  awa_live++;
+  return o;
+}
+
+// 解放前のフック: ヒープ要素（ptr）を 1 つずつ release する。
+void awa_array_drop(void* o) {
+  long long len = *(long long*)((char*)o + 16);
+  long long heap = *(long long*)((char*)o + 32);
+  if (!heap) return;
+  void** data = (void**)((char*)o + AWA_ARR_HDR);
+  for (long long i = 0; i < len; i++) awa_release(data[i]);
+}
+
+long long awa_array_length(void* o) { return *(long long*)((char*)o + 16); }
+
+// idx 番目を out へコピー。ヒープ要素なら retain（呼び出し側が新たな所有者になる）。
+void awa_array_get(void* o, long long idx, void* out) {
+  long long es = *(long long*)((char*)o + 24);
+  long long heap = *(long long*)((char*)o + 32);
+  memcpy(out, (char*)o + AWA_ARR_HDR + idx * es, es);
+  if (heap) awa_retain(*(void**)out);
+}
+
+// 末尾に *vptr を加えた新配列を返す（永続更新）。元要素と v をすべて retain する
+//（呼び出し側が元配列と v を release して所有権を新配列へ移す）。
+void* awa_array_push(void* o, const void* vptr) {
+  long long len = *(long long*)((char*)o + 16);
+  long long es = *(long long*)((char*)o + 24);
+  long long heap = *(long long*)((char*)o + 32);
+  void* n = awa_array_alloc(len + 1, es, heap);
+  char* dst = (char*)n + AWA_ARR_HDR;
+  memcpy(dst, (char*)o + AWA_ARR_HDR, len * es);
+  memcpy(dst + len * es, vptr, es);
+  if (heap) {
+    void** d = (void**)dst;
+    for (long long i = 0; i < len + 1; i++) awa_retain(d[i]);
+  }
+  return n;
+}
+
+// idx 番目を *vptr に差し替えた新配列を返す（永続更新）。範囲外は idx をはみ出さない前提
+//（std/array.set が境界を守る）。元要素と v をすべて retain する。
+void* awa_array_set(void* o, long long idx, const void* vptr) {
+  long long len = *(long long*)((char*)o + 16);
+  long long es = *(long long*)((char*)o + 24);
+  long long heap = *(long long*)((char*)o + 32);
+  void* n = awa_array_alloc(len, es, heap);
+  char* dst = (char*)n + AWA_ARR_HDR;
+  memcpy(dst, (char*)o + AWA_ARR_HDR, len * es);
+  memcpy(dst + idx * es, vptr, es);
+  if (heap) {
+    void** d = (void**)dst;
+    for (long long i = 0; i < len; i++) awa_retain(d[i]);
+  }
+  return n;
+}
 // 文字列 → 整数（非数値は 0）。
 long long awa_string_to_int(void* strobj) { return atoll((char*)strobj + 16); }
 // 文字数（UTF-8 コードポイント数。継続バイト 10xxxxxx を除いて数える＝インタプリタの chars() と一致）。

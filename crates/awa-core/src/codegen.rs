@@ -20,9 +20,38 @@ const CLOSURE_TY: &str = "{ ptr, ptr }";
 // rc = 参照カウント（負値はリテラル等の「不滅」）、drop_fn = 解放前に子を release する関数。
 // 物理レイアウトは rc=offset 0、drop=offset 8。文字列本体やフィールドはこの後ろに続く。
 const HDR_SIZE: i64 = 16;
+// 配列のヘッダ: { i64 rc, ptr drop, i64 len, i64 elem_size, i64 elem_heap }（40 バイト）。
+// 要素はこの後ろ（offset 40）から elem_size バイト刻みで並ぶ。len/elem_size/elem_heap を
+// 持つことで get/set/push/drop を要素型に依存しない単一の C 関数群で賄える。
+const ARR_HDR_SIZE: i64 = 40;
 
 fn unsupported<T>(what: impl Into<String>) -> Result<T> {
     Err(AwaError::Unsupported(what.into()))
+}
+
+// LLVM 型文字列から、配列要素 1 個分の格納サイズ（バイト）。
+// i1/i8 は 1、i64/double/ptr は 8。memcpy・要素オフセット計算に使う。
+fn elem_size_of(elem_ll: &str) -> i64 {
+    match elem_ll {
+        "i1" | "i8" => 1,
+        _ => 8, // i64 / double / ptr
+    }
+}
+
+// 配列リテラル/パターンの要素型を取り出す（ty = Con("Array", [elem])）。
+fn array_elem_ty(ty: &Type) -> Result<Type> {
+    match ty {
+        Type::Con(name, args) if name == "Array" && args.len() == 1 => Ok(args[0].clone()),
+        _ => unsupported("配列でない型に配列操作"),
+    }
+}
+
+// 配列組込（不変・永続 Array(a) の C ランタイムヘルパへ委譲）。
+fn is_array_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "array_empty" | "array_length" | "array_get" | "array_set" | "array_push"
+    )
 }
 
 // awa のグローバル名を LLVM の `@`-シンボル token にする。`#`（メソッドのマングル "型頭#名"）など
@@ -258,6 +287,10 @@ fn expand_pattern(p: &Pattern) -> Vec<Pattern> {
                 .map(|c| Pattern::Ctor(name.clone(), c))
                 .collect()
         }
+        Pattern::Array(subs) => {
+            let ex: Vec<Vec<Pattern>> = subs.iter().map(expand_pattern).collect();
+            cartesian(&ex).into_iter().map(Pattern::Array).collect()
+        }
         other => vec![other.clone()],
     }
 }
@@ -421,6 +454,11 @@ fn subst_types(te: &mut TExpr, s: &crate::types::Subst) {
             subst_types(subj, s);
             for (_, b) in arms {
                 subst_types(b, s);
+            }
+        }
+        TExprKind::ArrayLit(elems) => {
+            for e in elems {
+                subst_types(e, s);
             }
         }
     }
@@ -602,6 +640,127 @@ impl Gen {
             TExprKind::Block(stmts) => self.block(stmts, m),
             TExprKind::Lambda(params, body) => self.lambda(params, body, &e.ty, m),
             TExprKind::Case(subject, arms) => self.compile_case(subject, arms, m),
+            TExprKind::ArrayLit(elems) => self.array_lit(elems, &e.ty, m),
+        }
+    }
+
+    // 配列リテラル [e0, e1, ...] → ヒープ配列を確保し各要素を移動格納してその ptr を返す。
+    // 要素値は self.expr が産んだ所有値で、配列へ所有権が移る（retain/release しない＝construct と同様）。
+    fn array_lit(&mut self, elems: &[TExpr], ty: &Type, m: &mut Module) -> Result<String> {
+        let elem_ty = array_elem_ty(ty)?;
+        let elem_ll = llvm_ty(&elem_ty)?;
+        let esize = elem_size_of(&elem_ll);
+        let eheap = if is_heap(&elem_ty) { 1 } else { 0 };
+        // 先に全要素を評価（評価順を保つ）。
+        let mut vals = Vec::with_capacity(elems.len());
+        for e in elems {
+            vals.push(self.expr(e, m)?);
+        }
+        let arr = format!("%t{}", self.fresh());
+        self.line(&format!(
+            "{} = call ptr @awa_array_alloc(i64 {}, i64 {}, i64 {})",
+            arr,
+            elems.len(),
+            esize,
+            eheap
+        ));
+        // 要素を offset 40 + i*esize に格納（i は定数なのでバイトオフセットを直接計算）。
+        for (i, v) in vals.iter().enumerate() {
+            let off = ARR_HDR_SIZE + (i as i64) * esize;
+            let ep = format!("%t{}", self.fresh());
+            self.line(&format!("{} = getelementptr i8, ptr {}, i64 {}", ep, arr, off));
+            self.line(&format!("store {} {}, ptr {}", elem_ll, v, ep));
+        }
+        Ok(arr)
+    }
+
+    // 配列組込（C ランタイム委譲）。empty は要素型から elem_size/elem_heap を決めて確保する。
+    fn array_call(
+        &mut self,
+        name: &str,
+        callee: &TExpr,
+        args: &[TExpr],
+        m: &mut Module,
+    ) -> Result<String> {
+        match name {
+            // array_empty() : Array(a)。戻り型から要素メタを決めて空配列を確保。
+            "array_empty" => {
+                let ret = callee_ret(callee)?;
+                let elem_ty = array_elem_ty(&ret)?;
+                let elem_ll = llvm_ty(&elem_ty)?;
+                let esize = elem_size_of(&elem_ll);
+                let eheap = if is_heap(&elem_ty) { 1 } else { 0 };
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call ptr @awa_array_alloc(i64 0, i64 {}, i64 {})",
+                    r, esize, eheap
+                ));
+                Ok(r)
+            }
+            // array_length(arr) : Int
+            "array_length" => {
+                let a = self.expr(&args[0], m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i64 @awa_array_length(ptr {})", r, a));
+                self.release(&a, &args[0].ty);
+                Ok(r)
+            }
+            // array_get(arr, i) : a。out スロットへコピー（C が heap 要素を retain）。
+            "array_get" => {
+                let a = self.expr(&args[0], m)?;
+                let i = self.expr(&args[1], m)?;
+                let elem_ty = array_elem_ty(&args[0].ty)?;
+                let elem_ll = llvm_ty(&elem_ty)?;
+                let out = format!("%v{}", self.fresh());
+                self.line(&format!("{} = alloca {}", out, elem_ll));
+                self.line(&format!(
+                    "call void @awa_array_get(ptr {}, i64 {}, ptr {})",
+                    a, i, out
+                ));
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = load {}, ptr {}", r, elem_ll, out));
+                self.release(&a, &args[0].ty);
+                Ok(r)
+            }
+            // array_set(arr, i, v) : Array(a)。v をスロットに置いて ptr 渡し。
+            "array_set" => {
+                let a = self.expr(&args[0], m)?;
+                let i = self.expr(&args[1], m)?;
+                let v = self.expr(&args[2], m)?;
+                let elem_ty = array_elem_ty(&args[0].ty)?;
+                let elem_ll = llvm_ty(&elem_ty)?;
+                let vslot = format!("%v{}", self.fresh());
+                self.line(&format!("{} = alloca {}", vslot, elem_ll));
+                self.line(&format!("store {} {}, ptr {}", elem_ll, v, vslot));
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call ptr @awa_array_set(ptr {}, i64 {}, ptr {})",
+                    r, a, i, vslot
+                ));
+                // arr と v は consume（C 側で新配列が retain 済み）。
+                self.release(&a, &args[0].ty);
+                self.release(&v, &elem_ty);
+                Ok(r)
+            }
+            // array_push(arr, v) : Array(a)
+            "array_push" => {
+                let a = self.expr(&args[0], m)?;
+                let v = self.expr(&args[1], m)?;
+                let elem_ty = array_elem_ty(&args[0].ty)?;
+                let elem_ll = llvm_ty(&elem_ty)?;
+                let vslot = format!("%v{}", self.fresh());
+                self.line(&format!("{} = alloca {}", vslot, elem_ll));
+                self.line(&format!("store {} {}, ptr {}", elem_ll, v, vslot));
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call ptr @awa_array_push(ptr {}, ptr {})",
+                    r, a, vslot
+                ));
+                self.release(&a, &args[0].ty);
+                self.release(&v, &elem_ty);
+                Ok(r)
+            }
+            _ => unsupported(format!("配列組込 {}", name)),
         }
     }
 
@@ -688,6 +847,25 @@ impl Gen {
             }
             // or は compile_case で展開済み（ここには来ない）。
             Pattern::Or(_) => unsupported("or パターン（展開漏れ）"),
+            // 配列パターン [a, b, ...]: 長さがちょうど一致するか検査し、各要素を束縛。
+            Pattern::Array(subs) => {
+                let len = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call i64 @awa_array_length(ptr {})", len, value));
+                self.eq_or_fail("i64", &len, &subs.len().to_string(), fail);
+                let elem_ty = array_elem_ty(value_ty)?;
+                let elem_ll = llvm_ty(&elem_ty)?;
+                let esize = elem_size_of(&elem_ll);
+                for (i, sub) in subs.iter().enumerate() {
+                    // 要素 i を offset 40 + i*esize から load（retain しない＝Var 部分が retain する）。
+                    let off = ARR_HDR_SIZE + (i as i64) * esize;
+                    let ep = format!("%t{}", self.fresh());
+                    self.line(&format!("{} = getelementptr i8, ptr {}, i64 {}", ep, value, off));
+                    let ev = format!("%t{}", self.fresh());
+                    self.line(&format!("{} = load {}, ptr {}", ev, elem_ll, ep));
+                    self.match_pattern_ir(sub, &ev, &elem_ty, fail, m)?;
+                }
+                Ok(())
+            }
             Pattern::Ctor(name, subs) => {
                 let ci = m
                     .ctors
@@ -1271,6 +1449,9 @@ impl Gen {
             if is_math_builtin(name) {
                 return self.math_call(name, args, m);
             }
+            if is_array_builtin(name) {
+                return self.array_call(name, callee, args, m);
+            }
         }
         // callee が組込変換関数なら専用 IR（すべて単項）。
         if let TExprKind::Var(name) = &callee.kind {
@@ -1369,7 +1550,8 @@ impl Gen {
         self.scope = saved;
         match last {
             Some((v, _)) => Ok(v),
-            None => unsupported("値を持たないブロック"),
+            // 末尾が式でない（空 or 末尾が let）ブロックは Unit。Unit 値は i8 0 で表す。
+            None => Ok("0".to_string()),
         }
     }
 
@@ -1418,6 +1600,7 @@ impl Gen {
                 || is_io_builtin(name)
                 || is_socket_builtin(name)
                 || is_math_builtin(name)
+                || is_array_builtin(name)
             {
                 continue;
             }
@@ -1657,6 +1840,11 @@ fn fv(e: &TExpr, bound: &HashSet<String>, free: &mut Vec<String>) {
                 fv(body, &b2, free);
             }
         }
+        TExprKind::ArrayLit(elems) => {
+            for e in elems {
+                fv(e, bound, free);
+            }
+        }
     }
 }
 
@@ -1666,7 +1854,7 @@ fn pattern_vars(p: &crate::ast::Pattern, out: &mut HashSet<String>) {
         Pattern::Var(n) => {
             out.insert(n.clone());
         }
-        Pattern::Ctor(_, subs) | Pattern::Or(subs) => {
+        Pattern::Ctor(_, subs) | Pattern::Or(subs) | Pattern::Array(subs) => {
             for s in subs {
                 pattern_vars(s, out);
             }
@@ -1812,6 +2000,12 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare i64 @awa_string_char_at(ptr, i64)\n");
     module.push_str("declare ptr @awa_char_to_string(i64)\n");
     module.push_str("declare double @awa_string_to_float(ptr)\n");
+    // 配列（不変・永続 Array(a)。async_runtime.c が定義）。
+    module.push_str("declare ptr @awa_array_alloc(i64, i64, i64)\n");
+    module.push_str("declare i64 @awa_array_length(ptr)\n");
+    module.push_str("declare void @awa_array_get(ptr, i64, ptr)\n");
+    module.push_str("declare ptr @awa_array_set(ptr, i64, ptr)\n");
+    module.push_str("declare ptr @awa_array_push(ptr, ptr)\n");
     // OS 連携: ソケット非同期（async_runtime.c が定義）。
     module.push_str("declare i64 @awa_tcp_listen(i64)\n");
     module.push_str("declare i64 @awa_sock_port(i64)\n");

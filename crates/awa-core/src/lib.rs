@@ -2150,6 +2150,91 @@ mod tests {
     }
 
     #[test]
+    fn 配列リテラルとプリミティブ_interp() {
+        // [..] は不変配列 Array(a) へ脱糖。length/get は O(1)、push/set は永続更新。
+        assert_eq!(eval("array_length([1, 2, 3])"), Ok(Value::Int(3)));
+        assert_eq!(eval("array_get([10, 20, 30], 2)"), Ok(Value::Int(30)));
+        assert_eq!(eval("array_length(array_push([1], 2))"), Ok(Value::Int(2)));
+        assert_eq!(eval("array_get(array_set([7, 8], 0, 9), 0)"), Ok(Value::Int(9)));
+        // 不変性: 元配列は変わらない。
+        assert_eq!(
+            eval("let xs = [1, 2]; let _ = array_push(xs, 3); array_length(xs)"),
+            Ok(Value::Int(2))
+        );
+        assert_eq!(eval("array_length([])"), Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn 配列パターン_interp() {
+        // 固定長パターン。長さがちょうど一致したときだけ成立。
+        assert_eq!(eval("case [1, 2] { [a, b] -> a + b; _ -> 0 }"), Ok(Value::Int(3)));
+        assert_eq!(eval("case [5] { [x] -> x; _ -> 0 }"), Ok(Value::Int(5)));
+        assert_eq!(eval("case [] { [] -> 1; _ -> 0 }"), Ok(Value::Int(1)));
+        // 長さ違いは次の腕へ。
+        assert_eq!(eval("case [1, 2, 3] { [a, b] -> 0; _ -> 99 }"), Ok(Value::Int(99)));
+    }
+
+    #[test]
+    fn 配列_native() {
+        // ネイティブで配列リテラル・プリミティブ・パターン。終了コード=リーク数=0。
+        let (out, code) = compile_run_status(
+            "let xs = [1, 2, 3]\n\
+             print(\"${array_length(xs)}\")\n\
+             print(\"${array_get(xs, 1)}\")\n\
+             print(\"${array_length(array_push(xs, 4))}\")\n\
+             let describe = fn(a: Array(Int)) {\n\
+               case a { [] -> 0; [x] -> x; [p, q] -> p + q; _ -> 99 }\n\
+             }\n\
+             print(\"${describe([])}\")\n\
+             print(\"${describe([5])}\")\n\
+             print(\"${describe([3, 4])}\")\n\
+             print(\"${describe([1, 2, 3])}\")\n",
+        );
+        assert_eq!(out, "3\n2\n4\n0\n5\n7\n99\n");
+        assert_eq!(code, 0, "リーク検出（生存ヒープ {}）", code);
+    }
+
+    #[test]
+    fn 配列_文字列要素_native_リーク無し() {
+        // ヒープ要素（String）の retain/release バランス。終了コード=リーク数=0。
+        let (out, code) = compile_run_status(
+            "let xs = [\"a\", \"b\", \"c\"]\n\
+             print(array_get(xs, 1))\n\
+             let ys = array_push(xs, \"d\")\n\
+             print(array_get(ys, 3))\n\
+             let zs = array_set(xs, 0, \"Z\")\n\
+             print(array_get(zs, 0))\n\
+             print(array_get(xs, 0))\n\
+             case [\"x\", \"y\"] { [h, t] -> print(h); _ -> print(\"?\") }\n",
+        );
+        assert_eq!(out, "b\nd\nZ\na\nx\n");
+        assert_eq!(code, 0, "リーク検出（生存ヒープ {}）", code);
+    }
+
+    #[test]
+    fn std_array_native() {
+        // std/array の高水準 API（map/filter/fold/at→Option/range/reverse/contains/each）。
+        let out = std_build_run(
+            "import std/io\n\
+             import std/array\n\
+             import std/option\n\
+             let xs = [1, 2, 3, 4, 5]\n\
+             io.println(\"${array.sum(xs)}\")\n\
+             io.println(\"${array.sum(array.map(xs, fn(n) { n * 2 }))}\")\n\
+             io.println(\"${array.sum(array.filter(xs, fn(n) { n > 2 }))}\")\n\
+             io.println(\"${array.get_or(xs, 9, 0 - 1)}\")\n\
+             io.println(\"${array.sum(array.range(0, 5))}\")\n\
+             io.println(\"${array.get_or(array.reverse(xs), 0, 0)}\")\n\
+             io.println(\"${array.contains(xs, 3)}\")\n\
+             io.println(\"${array.length(array.concat([1, 2], [3, 4]))}\")\n\
+             io.println(\"${option.unwrap_or(array.at(xs, 1), 0)}\")\n",
+        );
+        // sum=15, map sum=30, filter(>2) sum=12, oob=-1, range sum=10,
+        // reverse first=5, contains3=true, concat len=4, at(1)=2。
+        assert_eq!(out, "15\n30\n12\n-1\n10\n5\ntrue\n4\n2\n");
+    }
+
+    #[test]
     fn std_option_do記法() {
         // do は .flatMap 連鎖へ脱糖し、Option の pub impl メソッドで解決される。
         let out = std_build_run(

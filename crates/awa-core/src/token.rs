@@ -39,8 +39,10 @@ pub enum Token {
     Concat, // <>（文字列連結）
     LParen,
     RParen,
-    LBrace, // {
-    RBrace, // }
+    LBrace,   // {
+    RBrace,   // }
+    LBracket, // [（リストリテラル）
+    RBracket, // ]
     // 文の終端。明示的な ; と、改行から自動挿入されるものの両方がこれになる
     // （Scala 風: セミコロンは普段書かず、改行が区切りになる）。
     Terminator,
@@ -59,5 +61,6 @@ pub fn ends_expr(t: &Token) -> bool {
             | Token::Ident(_)
             | Token::RParen
             | Token::RBrace
+            | Token::RBracket
     )
 }

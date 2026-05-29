@@ -46,6 +46,9 @@ enum Head {
     Bool(bool),
     Int(i64),
     Str(String),
+    // 配列パターン [..] の頭。長さで区別する（[a] と [a,b] は別の頭、arity=長さ）。
+    // 配列は任意長なので無限ドメイン扱い（完全シグネチャを作れず catch-all 必須）。
+    Array(usize),
 }
 
 fn head_of(p: &Pattern) -> Option<Head> {
@@ -55,6 +58,7 @@ fn head_of(p: &Pattern) -> Option<Head> {
         Pattern::Int(n) => Some(Head::Int(*n)),
         Pattern::Str(s) => Some(Head::Str(s.clone())),
         Pattern::Ctor(name, _) => Some(Head::Ctor(name.clone())),
+        Pattern::Array(subs) => Some(Head::Array(subs.len())),
         // 行列・クエリは expand で or を除いてから組むので、ここに Or は来ない。
         Pattern::Or(_) => unreachable!("or パターンは expand 済みのはず"),
     }
@@ -70,6 +74,13 @@ fn expand(p: &Pattern) -> Vec<Pattern> {
             cartesian(&expanded)
                 .into_iter()
                 .map(|combo| Pattern::Ctor(name.clone(), combo))
+                .collect()
+        }
+        Pattern::Array(subs) => {
+            let expanded: Vec<Vec<Pattern>> = subs.iter().map(expand).collect();
+            cartesian(&expanded)
+                .into_iter()
+                .map(Pattern::Array)
                 .collect()
         }
         other => vec![other.clone()],
@@ -97,6 +108,7 @@ fn cartesian(lists: &[Vec<Pattern>]) -> Vec<Vec<Pattern>> {
 fn subpatterns(p: &Pattern) -> Vec<Pattern> {
     match p {
         Pattern::Ctor(_, subs) => subs.clone(),
+        Pattern::Array(subs) => subs.clone(),
         _ => Vec::new(),
     }
 }
@@ -107,6 +119,7 @@ fn head_to_pattern(h: &Head, subs: Vec<Pattern>) -> Pattern {
         Head::Bool(b) => Pattern::Bool(*b),
         Head::Int(n) => Pattern::Int(*n),
         Head::Str(s) => Pattern::Str(s.clone()),
+        Head::Array(_) => Pattern::Array(subs),
     }
 }
 
@@ -128,8 +141,8 @@ fn column_heads(matrix: &[Vec<Pattern>]) -> Vec<Head> {
 fn complete_signature(present: &[Head], sigs: &Sigs) -> Option<Vec<(Head, usize)>> {
     let full: Vec<(Head, usize)> = match present.first()? {
         Head::Bool(_) => vec![(Head::Bool(true), 0), (Head::Bool(false), 0)],
-        // Int/String は無限ドメインなので決して完全にならない（catch-all 必須）。
-        Head::Int(_) | Head::Str(_) => return None,
+        // Int/String/配列は無限ドメインなので決して完全にならない（catch-all 必須）。
+        Head::Int(_) | Head::Str(_) | Head::Array(_) => return None,
         Head::Ctor(name) => sigs
             .siblings(name)?
             .iter()
@@ -286,6 +299,10 @@ fn render_pattern(p: &Pattern) -> String {
                 format!("{}({})", name, inner.join(", "))
             }
         }
+        Pattern::Array(subs) => {
+            let inner: Vec<String> = subs.iter().map(render_pattern).collect();
+            format!("[{}]", inner.join(", "))
+        }
         Pattern::Or(alts) => alts
             .iter()
             .map(render_pattern)
@@ -391,5 +408,11 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
             Ok(())
         }
         ExprKind::Field(receiver, _) => check_expr(receiver, sigs),
+        ExprKind::ArrayLit(elems) => {
+            for e in elems {
+                check_expr(e, sigs)?;
+            }
+            Ok(())
+        }
     }
 }

@@ -1,0 +1,46 @@
+// 不変・永続インデックス配列 Array(a) のデモ。
+// リテラル [..] は連結リスト（std/list）ではなく Array へ脱糖される。
+// length / at は O(1)、push / set は元を変えず新しい配列を返す（永続データ構造）。
+import std/io
+import std/array
+import std/option
+
+let main = fn() {
+  let xs = [1, 2, 3, 4, 5]
+
+  // O(1) アクセスと集計。
+  io.println("length = ${array.length(xs)}")  // 5
+  io.println("sum    = ${array.sum(xs)}")  // 15
+  io.println("at(2)  = ${array.get_or(xs, 2, 0)}")  // 3
+
+  // map / filter（高階関数）。
+  let squares = array.map(xs, fn(n) { n * n })
+  io.println("squares sum = ${array.sum(squares)}")  // 55
+  let big = array.filter(xs, fn(n) { n > 3 })
+  io.println("big sum     = ${array.sum(big)}")  // 9
+
+  // 永続更新: 元の xs は変わらない。
+  let ys = array.push(xs, 6)
+  io.println("pushed len = ${array.length(ys)}")  // 6
+  io.println("orig len   = ${array.length(xs)}")  // 5
+
+  // at は範囲安全（Option を返す）。
+  case array.at(xs, 1) {
+    option.Some(v) -> io.println("at(1) = ${v}")  // 2
+    option.None -> io.println("out of range")
+  }
+
+  // 固定長パターンマッチ。
+  let shape = fn(a: Array(Int)) {
+    case a {
+      [] -> "empty"
+      [x] -> "single ${x}"
+      [p, q] -> "pair ${p},${q}"
+      _ -> "many (${array.length(a)})"
+    }
+  }
+  io.println(shape([]))  // empty
+  io.println(shape([42]))  // single 42
+  io.println(shape([1, 2]))  // pair 1,2
+  io.println(shape(xs))  // many (5)
+}

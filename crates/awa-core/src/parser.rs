@@ -567,6 +567,21 @@ impl Parser {
             Some(Token::Int(n)) => Ok(Pattern::Int(n)),
             Some(Token::Str(s)) => Ok(Pattern::Str(s)),
             Some(Token::Bool(b)) => Ok(Pattern::Bool(b)),
+            // 配列パターン [a, b, ...]（固定長）。Array(a) を長さちょうどで分解する。
+            Some(Token::LBracket) => {
+                let mut elems = Vec::new();
+                while self.peek() != Some(&Token::RBracket) {
+                    elems.push(self.parse_pattern()?);
+                    match self.peek() {
+                        Some(Token::Comma) => {
+                            self.next();
+                        }
+                        _ => break,
+                    }
+                }
+                self.expect(Token::RBracket)?;
+                Ok(Pattern::Array(elems))
+            }
             Some(Token::Ident(name)) => {
                 if name == "_" {
                     Ok(Pattern::Wildcard)
@@ -827,6 +842,21 @@ impl Parser {
             Some(Token::Str(s)) => Ok(self.finish(start, ExprKind::Str(s))),
             Some(Token::Bool(b)) => Ok(self.finish(start, ExprKind::Bool(b))),
             Some(Token::Ident(name)) => Ok(self.finish(start, ExprKind::Var(name))),
+            // 配列リテラル [e, e, ...]。不変・永続な Array(a) を構築する（連結リストとは別）。
+            Some(Token::LBracket) => {
+                let mut elems = Vec::new();
+                while self.peek() != Some(&Token::RBracket) {
+                    elems.push(self.parse_expr()?);
+                    match self.peek() {
+                        Some(Token::Comma) => {
+                            self.next();
+                        }
+                        _ => break,
+                    }
+                }
+                self.expect(Token::RBracket)?;
+                Ok(self.finish(start, ExprKind::ArrayLit(elems)))
+            }
             // 無名関数 fn(引数: 型?, ...) -> 戻り型? { 本体ブロック }。
             Some(Token::Fn) => {
                 self.expect(Token::LParen)?;

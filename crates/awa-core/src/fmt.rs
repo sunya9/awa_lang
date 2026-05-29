@@ -457,6 +457,10 @@ impl Fmt {
             ExprKind::Field(recv, name) => {
                 concat(vec![self.callee(recv), text("."), text(name.clone())])
             }
+            ExprKind::ArrayLit(elems) => {
+                let docs: Vec<D> = elems.iter().map(|x| self.expr(x)).collect();
+                concat(vec![text("["), join(docs, text(", ")), text("]")])
+            }
             ExprKind::Block(stmts) => self.block(stmts, e.span.end),
             ExprKind::Case(subj, arms) => {
                 let header = concat(vec![text("case "), self.expr(subj)]);
@@ -708,6 +712,10 @@ fn pattern_doc(p: &Pattern) -> D {
         Pattern::Bool(b) => text(if *b { "true" } else { "false" }),
         Pattern::Int(n) => text(n.to_string()),
         Pattern::Str(s) => text(quote_str(s)),
+        Pattern::Array(subs) => {
+            let s: Vec<D> = subs.iter().map(pattern_doc).collect();
+            concat(vec![text("["), join(s, text(", ")), text("]")])
+        }
         Pattern::Ctor(name, subs) => {
             if subs.is_empty() {
                 text(name.clone())

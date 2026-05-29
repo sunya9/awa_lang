@@ -211,6 +211,11 @@ fn check_vis_expr(te: &TExpr, r: &Resolved) -> Result<(), LocatedError> {
                 check_vis_expr(body, r)?;
             }
         }
+        TExprKind::ArrayLit(elems) => {
+            for e in elems {
+                check_vis_expr(e, r)?;
+            }
+        }
     }
     Ok(())
 }
@@ -336,6 +341,10 @@ impl Resolver<'_> {
                 let subs = subs.iter().map(|s| self.pattern(s)).collect::<Result<_, _>>()?;
                 Ok(Pattern::Ctor(self.ctor_name(name)?, subs))
             }
+            Pattern::Array(subs) => {
+                let subs = subs.iter().map(|s| self.pattern(s)).collect::<Result<_, _>>()?;
+                Ok(Pattern::Array(subs))
+            }
             Pattern::Or(alts) => {
                 let alts = alts.iter().map(|a| self.pattern(a)).collect::<Result<_, _>>()?;
                 Ok(Pattern::Or(alts))
@@ -443,6 +452,7 @@ impl Resolver<'_> {
                 // モジュール参照でない（= 未 import 等）。型検査側で UnknownModule になる。
                 ExprKind::Field(Box::new(self.expr(recv, locals)?), member.clone())
             }
+            ExprKind::ArrayLit(elems) => ExprKind::ArrayLit(self.exprs(elems, locals)?),
         };
         Ok(Expr { kind, span: self.at(e.span) })
     }
@@ -480,7 +490,7 @@ fn pattern_vars(p: &Pattern, out: &mut HashSet<String>) {
         Pattern::Var(n) => {
             out.insert(n.clone());
         }
-        Pattern::Ctor(_, subs) | Pattern::Or(subs) => {
+        Pattern::Ctor(_, subs) | Pattern::Or(subs) | Pattern::Array(subs) => {
             for s in subs {
                 pattern_vars(s, out);
             }

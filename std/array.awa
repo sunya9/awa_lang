@@ -1,0 +1,152 @@
+// 標準ライブラリ: 不変・永続インデックス配列 Array(a)。
+// 連結リスト（std/list）と違い length/at は O(1)。組込プリミティブ
+// （array_empty / array_length / array_get / array_set / array_push）を土台に組む。
+// 注意: map/filter/concat などは array_push の繰り返し（要素ごとに O(n) コピー）なので
+// 全体 O(n^2)。まずは単純で正しい実装。将来 RRB-tree 等で最適化する。
+// リテラル [1, 2, 3] はこの Array へ脱糖される（連結リストではない）。
+import std/option
+import std/list
+
+// 空配列。
+pub let empty: fn() -> Array(a) = fn() { array_empty() }
+
+// 要素数（O(1)）。
+pub let length: fn(Array(a)) -> Int = fn(a) { array_length(a) }
+
+// 空か。
+pub let is_empty: fn(Array(a)) -> Bool = fn(a) { array_length(a) == 0 }
+
+// i 番目（O(1)）。範囲外は None。
+pub let at: fn(Array(a), Int) -> option.Option(a) = fn(a, i) {
+  case (i >= 0) && (i < array_length(a)) {
+    true -> option.Some(array_get(a, i))
+    false -> option.None
+  }
+}
+
+// i 番目。範囲外なら既定値を返す。
+pub let get_or: fn(Array(a), Int, a) -> a = fn(a, i, default) {
+  case (i >= 0) && (i < array_length(a)) {
+    true -> array_get(a, i)
+    false -> default
+  }
+}
+
+// 末尾に v を加えた新しい配列（永続更新・O(n)）。
+pub let push: fn(Array(a), a) -> Array(a) = fn(a, v) { array_push(a, v) }
+
+// i 番目を v に差し替えた新しい配列（永続更新・O(n)）。範囲外なら元の配列。
+pub let set: fn(Array(a), Int, a) -> Array(a) = fn(a, i, v) {
+  case (i >= 0) && (i < array_length(a)) {
+    true -> array_set(a, i, v)
+    false -> a
+  }
+}
+
+// 先頭・末尾（空なら None）。
+pub let first: fn(Array(a)) -> option.Option(a) = fn(a) { at(a, 0) }
+pub let last: fn(Array(a)) -> option.Option(a) = fn(a) { at(a, array_length(a) - 1) }
+
+// 左畳み込み: acc を初期値に f(acc, 要素) を先頭から順に適用。
+let fold_go: fn(Array(a), b, fn(b, a) -> b, Int) -> b = fn(a, acc, f, i) {
+  case i < array_length(a) {
+    true -> fold_go(a, f(acc, array_get(a, i)), f, i + 1)
+    false -> acc
+  }
+}
+pub let fold: fn(Array(a), b, fn(b, a) -> b) -> b = fn(a, acc, f) { fold_go(a, acc, f, 0) }
+
+// 各要素に f を適用した新しい配列。
+pub let map: fn(Array(a), fn(a) -> b) -> Array(b) = fn(a, f) {
+  fold(a, array_empty(), fn(acc, x) { array_push(acc, f(x)) })
+}
+
+// 述語が真の要素だけ残す。
+pub let filter: fn(Array(a), fn(a) -> Bool) -> Array(a) = fn(a, pred) {
+  fold(a, array_empty(), fn(acc, x) {
+    case pred(x) {
+      true -> array_push(acc, x)
+      false -> acc
+    }
+  })
+}
+
+// 副作用のため各要素に f を適用（戻り値は捨てる）。
+let each_go: fn(Array(a), fn(a) -> b, Int) -> Nil = fn(a, f, i) {
+  case i < array_length(a) {
+    true -> {
+      let _ = f(array_get(a, i))
+      each_go(a, f, i + 1)
+    }
+    false -> { let _ = 0 }
+  }
+}
+pub let each: fn(Array(a), fn(a) -> b) -> Nil = fn(a, f) { each_go(a, f, 0) }
+
+// 2 つの配列を連結した新しい配列。
+pub let concat: fn(Array(a), Array(a)) -> Array(a) = fn(xs, ys) {
+  fold(ys, xs, fn(acc, x) { array_push(acc, x) })
+}
+
+// 逆順（末尾から積み直す）。
+let reverse_go: fn(Array(a), Int, Array(a)) -> Array(a) = fn(xs, i, acc) {
+  case i >= 0 {
+    true -> reverse_go(xs, i - 1, array_push(acc, array_get(xs, i)))
+    false -> acc
+  }
+}
+pub let reverse: fn(Array(a)) -> Array(a) = fn(xs) {
+  reverse_go(xs, array_length(xs) - 1, array_empty())
+}
+
+// [start, start+1, ..., end-1] の整数配列（start >= end なら空）。
+let range_go: fn(Int, Int, Array(Int)) -> Array(Int) = fn(i, end, acc) {
+  case i < end {
+    true -> range_go(i + 1, end, array_push(acc, i))
+    false -> acc
+  }
+}
+pub let range: fn(Int, Int) -> Array(Int) = fn(start, end) { range_go(start, end, array_empty()) }
+
+// x を n 個並べた配列。
+let repeat_go: fn(a, Int, Array(a)) -> Array(a) = fn(x, n, acc) {
+  case n > 0 {
+    true -> repeat_go(x, n - 1, array_push(acc, x))
+    false -> acc
+  }
+}
+pub let repeat: fn(a, Int) -> Array(a) = fn(x, n) { repeat_go(x, n, array_empty()) }
+
+// いずれかの要素が述語を満たすか。
+pub let any: fn(Array(a), fn(a) -> Bool) -> Bool = fn(a, pred) {
+  fold(a, false, fn(acc, x) { acc || pred(x) })
+}
+
+// すべての要素が述語を満たすか。
+pub let all: fn(Array(a), fn(a) -> Bool) -> Bool = fn(a, pred) {
+  fold(a, true, fn(acc, x) { acc && pred(x) })
+}
+
+// x を（構造等価 == で）含むか。
+pub let contains: fn(Array(a), a) -> Bool = fn(a, x) {
+  fold(a, false, fn(acc, e) { acc || (e == x) })
+}
+
+// 整数配列の総和。
+pub let sum: fn(Array(Int)) -> Int = fn(a) { fold(a, 0, fn(acc, x) { acc + x }) }
+
+// 連結リストへ変換（順序を保つ）。
+pub let to_list: fn(Array(a)) -> list.List(a) = fn(a) {
+  reverse_to_list(a, array_length(a) - 1, list.Nil)
+}
+let reverse_to_list: fn(Array(a), Int, list.List(a)) -> list.List(a) = fn(a, i, acc) {
+  case i >= 0 {
+    true -> reverse_to_list(a, i - 1, list.Cons(array_get(a, i), acc))
+    false -> acc
+  }
+}
+
+// 連結リストから配列を作る。
+pub let from_list: fn(list.List(a)) -> Array(a) = fn(xs) {
+  list.fold(xs, array_empty(), fn(acc, x) { array_push(acc, x) })
+}
