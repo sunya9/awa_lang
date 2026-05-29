@@ -1154,6 +1154,49 @@ mod tests {
     }
 
     #[test]
+    fn module_越境adtの構築と関数呼び出し() {
+        // shapes の pub 型を main が構築し、shapes 内で case する関数を呼ぶ。
+        let (out, code) = compile_modules_status(
+            &[
+                (
+                    "shapes.awa",
+                    "pub type Shape { Circle(Int); Square(Int) }\n\
+                     pub let area = fn(s: Shape) -> Int { case s { Circle(r) -> r * r; Square(w) -> w * w } }\n",
+                ),
+                (
+                    "main.awa",
+                    "import shapes\n\
+                     shapes.area(shapes.Circle(10))\n\
+                     shapes.area(shapes.Square(5))\n",
+                ),
+            ],
+            "main",
+        );
+        assert_eq!(out, "100\n25\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn module_越境型注釈とパターンとヌル構築子() {
+        // opt.Opt(Int) 注釈・opt.Some(x)/opt.None パターン・opt.Some(42)/opt.None 構築。
+        let (out, code) = compile_modules_status(
+            &[
+                ("opt.awa", "pub type Opt(a) { Some(a); None }\n"),
+                (
+                    "main.awa",
+                    "import opt\n\
+                     let f = fn(o: opt.Opt(Int)) -> Int { case o { opt.Some(x) -> x; opt.None -> 0 } }\n\
+                     f(opt.Some(42))\n\
+                     f(opt.None)\n",
+                ),
+            ],
+            "main",
+        );
+        assert_eq!(out, "42\n0\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn module_循環importはエラー() {
         let id = std::process::id() as u64 * 1_000_000
             + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);

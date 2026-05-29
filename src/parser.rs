@@ -447,27 +447,20 @@ impl Parser {
         match self.next() {
             Some(Token::Ident(name)) => {
                 if is_upper(&name) {
-                    // 構築子適用の型引数（任意）。
-                    let args = if self.peek() == Some(&Token::LParen) {
-                        self.next(); // '('
-                        let mut args = Vec::new();
-                        if self.peek() != Some(&Token::RParen) {
-                            loop {
-                                args.push(self.parse_type_expr()?);
-                                match self.peek() {
-                                    Some(Token::Comma) => {
-                                        self.next();
-                                    }
-                                    _ => break,
-                                }
-                            }
-                        }
-                        self.expect(Token::RParen)?;
-                        args
-                    } else {
-                        Vec::new()
-                    };
+                    // 型コンストラクタ Color / Opt(Int)。型引数は任意。
+                    let args = self.parse_type_args()?;
                     Ok(TypeExpr::Con(name, args))
+                } else if self.peek() == Some(&Token::Dot) {
+                    // 修飾された型 util.Color(args)。"util.Color" という 1 つの Con 名にする
+                    //（リネームパスがエイリアス util. を実モジュール接頭辞へ写す）。
+                    self.next(); // '.'
+                    let tyname = match self.next() {
+                        Some(Token::Ident(t)) if is_upper(&t) => t,
+                        Some(other) => return Err(self.unexpected(&other)),
+                        None => return Err(self.eof()),
+                    };
+                    let args = self.parse_type_args()?;
+                    Ok(TypeExpr::Con(format!("{}.{}", name, tyname), args))
                 } else {
                     Ok(TypeExpr::Var(name))
                 }
@@ -497,6 +490,28 @@ impl Parser {
         }
     }
 
+    // 型コンストラクタの引数列 `( T, ... )`（無ければ空）。
+    fn parse_type_args(&mut self) -> Result<Vec<TypeExpr>, LocatedError> {
+        if self.peek() != Some(&Token::LParen) {
+            return Ok(Vec::new());
+        }
+        self.next(); // '('
+        let mut args = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                args.push(self.parse_type_expr()?);
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.next();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok(args)
+    }
+
     // パターン。`|` で複数の選択肢を 1 つにまとめられる（A | B | ...）。
     // 各選択肢は parse_pattern_primary が読む。構築子の部分パターンも parse_pattern を
     // 通るので Some(A | B) のような入れ子の or も書ける。
@@ -524,27 +539,19 @@ impl Parser {
                 if name == "_" {
                     Ok(Pattern::Wildcard)
                 } else if is_upper(&name) {
-                    // 構築子パターン。続く ( があれば部分パターン列。
-                    let subs = if self.peek() == Some(&Token::LParen) {
-                        self.next(); // '('
-                        let mut subs = Vec::new();
-                        if self.peek() != Some(&Token::RParen) {
-                            loop {
-                                subs.push(self.parse_pattern()?);
-                                match self.peek() {
-                                    Some(Token::Comma) => {
-                                        self.next();
-                                    }
-                                    _ => break,
-                                }
-                            }
-                        }
-                        self.expect(Token::RParen)?;
-                        subs
-                    } else {
-                        Vec::new()
-                    };
+                    // 構築子パターン Some(x) / None。続く ( があれば部分パターン列。
+                    let subs = self.parse_ctor_subpatterns()?;
                     Ok(Pattern::Ctor(name, subs))
+                } else if self.peek() == Some(&Token::Dot) {
+                    // 修飾された構築子パターン util.Some(x) / util.None。
+                    self.next(); // '.'
+                    let ctor = match self.next() {
+                        Some(Token::Ident(c)) if is_upper(&c) => c,
+                        Some(other) => return Err(self.unexpected(&other)),
+                        None => return Err(self.eof()),
+                    };
+                    let subs = self.parse_ctor_subpatterns()?;
+                    Ok(Pattern::Ctor(format!("{}.{}", name, ctor), subs))
                 } else {
                     Ok(Pattern::Var(name))
                 }
@@ -552,6 +559,28 @@ impl Parser {
             Some(other) => Err(self.unexpected(&other)),
             None => Err(self.eof()),
         }
+    }
+
+    // 構築子パターンの部分パターン列 `( p, ... )`（無ければ空＝ヌル構築子）。
+    fn parse_ctor_subpatterns(&mut self) -> Result<Vec<Pattern>, LocatedError> {
+        if self.peek() != Some(&Token::LParen) {
+            return Ok(Vec::new());
+        }
+        self.next(); // '('
+        let mut subs = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                subs.push(self.parse_pattern()?);
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.next();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok(subs)
     }
 
     // expr のエントリ。最も緩いパイプから始める。
@@ -679,6 +708,8 @@ impl Parser {
                     };
                 }
                 // メソッド呼び出し recv.method(...)。
+                // 例外: `recv.Ctor`（大文字・括弧なし）は修飾されたヌル構築子 util.None として
+                // 引数なしの MethodCall にする（リネームパスが Var("util.None") へ展開）。
                 Some(Token::Dot) => {
                     self.next(); // '.'
                     let method = match self.next() {
@@ -686,8 +717,16 @@ impl Parser {
                         Some(other) => return Err(self.unexpected(&other)),
                         None => return Err(self.eof()),
                     };
-                    self.expect(Token::LParen)?;
-                    let args = self.parse_arg_list()?;
+                    let args = if self.peek() == Some(&Token::LParen) {
+                        self.next(); // '('
+                        self.parse_arg_list()?
+                    } else if is_upper(&method) {
+                        Vec::new() // 括弧なしの大文字 = ヌル構築子 util.None
+                    } else {
+                        // 小文字メソッドは括弧必須（修飾された値参照は M-mod-3）。
+                        self.expect(Token::LParen)?;
+                        self.parse_arg_list()?
+                    };
                     let span = Span::new(expr.span.start, self.last_span().end);
                     expr = Expr {
                         kind: ExprKind::MethodCall(Box::new(expr), method, args),

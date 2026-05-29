@@ -1,5 +1,18 @@
 import util
+import shapes
 
-// 修飾名 util.xxx で呼ぶ。
+// 値・関数の越境（修飾呼び出し）。
 util.double(21)
 util.inc(util.double(10))
+
+// 型・構築子の越境: 修飾構築子 shapes.Circle と、shapes 内の関数呼び出し。
+shapes.area(shapes.Circle(10))
+
+// 修飾型注釈・修飾構築子パターンを main 側で使う。
+let describe = fn(s: shapes.Shape) -> Int {
+  case s {
+    shapes.Circle(r) -> r
+    shapes.Square(w) -> w
+  }
+}
+describe(shapes.Square(7))
