@@ -1,6 +1,7 @@
 use std::io::{Write, stdout};
 
 mod ast;
+mod codegen;
 mod error;
 mod eval;
 mod infer;
@@ -101,11 +102,81 @@ fn repl() -> std::io::Result<()> {
     Ok(())
 }
 
+// ソースを型検査し、型付きプログラムを LLVM IR テキストへコンパイルする。
+fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
+    let tokens = lexer::tokenize(source)?;
+    let program = Parser::new(tokens).parse_program()?;
+    let mut checker = Checker::new();
+    let typed = checker.check_program(&program)?;
+    Ok(codegen::compile_program(&typed)?)
+}
+
+// `awa emit <file>`: LLVM IR を標準出力へ。
+fn emit_file(path: &str) {
+    let source = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("ファイルを読めません ({}): {}", path, e);
+        std::process::exit(1);
+    });
+    match compile_to_llvm(&source) {
+        Ok(ir) => print!("{}", ir),
+        Err(e) => {
+            eprintln!("{}", report(&e, &source));
+            std::process::exit(1);
+        }
+    }
+}
+
+// `awa build <file>`: IR を生成し clang でネイティブ実行ファイルを作る。
+fn build_file(path: &str) {
+    let source = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("ファイルを読めません ({}): {}", path, e);
+        std::process::exit(1);
+    });
+    let ir = match compile_to_llvm(&source) {
+        Ok(ir) => ir,
+        Err(e) => {
+            eprintln!("{}", report(&e, &source));
+            std::process::exit(1);
+        }
+    };
+    let base = path.strip_suffix(".awa").unwrap_or(path);
+    let ll_path = format!("{}.ll", base);
+    if let Err(e) = std::fs::write(&ll_path, &ir) {
+        eprintln!("IR を書けません ({}): {}", ll_path, e);
+        std::process::exit(1);
+    }
+    let status = std::process::Command::new("clang")
+        .args([&ll_path, "-o", base])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("built: {}", base),
+        Ok(s) => {
+            eprintln!("clang が失敗しました: {}", s);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("clang を起動できません: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
-    // 引数: awa <file> ならファイル実行、引数なしなら REPL。
-    // args().nth(1) は最初の引数（args[0] は実行ファイル名なので飛ばす）。
-    match std::env::args().nth(1) {
-        Some(path) => run_file(&path),
+    // 引数: awa emit/build <file> はコンパイル、awa <file> はインタプリタ実行、引数なしは REPL。
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("emit") | Some("build") => {
+            let Some(path) = args.get(2) else {
+                eprintln!("使い方: awa {} <file.awa>", &args[1]);
+                std::process::exit(1);
+            };
+            if args[1] == "emit" {
+                emit_file(path);
+            } else {
+                build_file(path);
+            }
+        }
+        Some(path) => run_file(path),
         None => {
             if let Err(e) = repl() {
                 eprintln!("REPL エラー: {}", e);
@@ -848,6 +919,54 @@ mod tests {
             eval(r#"case "yes" { "yes" -> 1; _ -> 0 }"#),
             Ok(Value::Int(1))
         );
+    }
+
+    // ===== コード生成（Phase 9）=====
+    // clang で実際にネイティブ化して実行し、標準出力を検査する（clang 前提）。
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CODEGEN_CTR: AtomicU64 = AtomicU64::new(0);
+
+    fn compile_and_run(src: &str) -> String {
+        let ir = compile_to_llvm(src).expect("コンパイルが通るはず");
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        let ll = dir.join(format!("awa_cg_{}.ll", id));
+        let exe = dir.join(format!("awa_cg_{}", id));
+        std::fs::write(&ll, &ir).unwrap();
+        let st = std::process::Command::new("clang")
+            .arg(&ll)
+            .arg("-o")
+            .arg(&exe)
+            .status()
+            .expect("clang を起動できる");
+        assert!(st.success(), "clang が失敗");
+        let out = std::process::Command::new(&exe).output().expect("実行できる");
+        let _ = std::fs::remove_file(&ll);
+        let _ = std::fs::remove_file(&exe);
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn codegen_再帰factがネイティブ実行される() {
+        let out = compile_and_run(
+            "let fact = fn(n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }; fact(5)",
+        );
+        assert_eq!(out, "120\n");
+    }
+
+    #[test]
+    fn codegen_算術と比較() {
+        // 7, true の順に出力される。
+        let out = compile_and_run("let add = fn(a: Int, b: Int) -> Int { a + b }; add(3, 4)\n1 < 2");
+        assert_eq!(out, "7\ntrue\n");
+    }
+
+    #[test]
+    fn example_native() {
+        let src = include_str!("../examples/native.awa");
+        let out = compile_and_run(src);
+        assert_eq!(out, "7\n120\n55\ntrue\n");
     }
 
     #[test]

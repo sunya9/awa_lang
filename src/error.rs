@@ -52,6 +52,8 @@ pub enum AwaError {
     // ----- 標準型（Phase 8） -----
     AmbiguousNumeric,    // 算術の数値型が定まらない（型注釈が必要）
     NotNumeric(String),  // 算術/比較の対象が数値型でない
+    // ----- コード生成（Phase 9） -----
+    Unsupported(String), // codegen がまだ対応していない構造/型
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -116,6 +118,9 @@ impl fmt::Display for AwaError {
             }
             AwaError::NotNumeric(ty) => {
                 write!(f, "型 {} は数値ではありません（算術/比較は Int/Long/Float のみ）", ty)
+            }
+            AwaError::Unsupported(what) => {
+                write!(f, "コード生成は未対応です: {}", what)
             }
         }
     }
