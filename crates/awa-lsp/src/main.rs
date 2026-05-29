@@ -22,12 +22,15 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         ..Default::default()
     })?;
     connection.initialize(capabilities)?;
-    main_loop(&connection)?;
+    // main_loop は Connection を所有して消費する。戻ると Connection が drop され、
+    // sender が閉じて writer スレッドが終わる → io_threads.join() が返れる
+    //（借用のままだと join がハングする lsp-server の定番の罠）。
+    main_loop(connection)?;
     io_threads.join()?;
     Ok(())
 }
 
-fn main_loop(conn: &Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
+fn main_loop(conn: Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
     for msg in &conn.receiver {
         match msg {
             Message::Request(req) => {
@@ -39,13 +42,13 @@ fn main_loop(conn: &Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
             Message::Notification(not) => match not.method.as_str() {
                 "textDocument/didOpen" => {
                     let p: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
-                    publish(conn, p.text_document.uri, &p.text_document.text);
+                    publish(&conn, p.text_document.uri, &p.text_document.text);
                 }
                 "textDocument/didChange" => {
                     let p: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
                     // FULL 同期なので最後の変更が全文。
                     if let Some(change) = p.content_changes.into_iter().last() {
-                        publish(conn, p.text_document.uri, &change.text);
+                        publish(&conn, p.text_document.uri, &change.text);
                     }
                 }
                 _ => {}
@@ -127,7 +130,7 @@ mod tests {
         // メモリ接続でループを駆動し、エラーのある文書を開いて診断が返るか確認。
         let (server, client) = Connection::memory();
         let handle = std::thread::spawn(move || {
-            let _ = main_loop(&server);
+            let _ = main_loop(server);
         });
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {

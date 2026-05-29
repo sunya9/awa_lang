@@ -9,3 +9,7 @@ examples/echo_server
 examples/modules/*.ll
 examples/modules/main
 examples/concurrency
+
+# vscode 拡張
+editors/vscode/node_modules
+editors/vscode/*.vsix

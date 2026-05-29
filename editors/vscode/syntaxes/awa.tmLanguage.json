@@ -1,0 +1,59 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "awa",
+  "scopeName": "source.awa",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#numbers" },
+    { "include": "#types" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.awa", "match": "//.*$" },
+        {
+          "name": "comment.block.awa",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.awa",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.awa", "match": "\\\\." }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.awa",
+          "match": "\\b(let|if|else|fn|type|case|impl|do|import|pub|as)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "name": "constant.language.awa",
+      "match": "\\b(true|false)\\b"
+    },
+    "numbers": {
+      "name": "constant.numeric.awa",
+      "match": "\\b[0-9]+(\\.[0-9]+)?L?\\b"
+    },
+    "types": {
+      "comment": "先頭大文字は型・構築子（awa の命名規約）",
+      "name": "entity.name.type.awa",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.awa",
+      "match": "(\\|>|<-|->|<>|==|!=|<=|>=|[-+*/<>=])"
+    }
+  }
+}

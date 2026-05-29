@@ -1,0 +1,40 @@
+{
+  "name": "awa-vscode",
+  "displayName": "awa language",
+  "description": "Syntax highlighting and language server for the awa language",
+  "version": "0.1.0",
+  "publisher": "awa",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "main": "./src/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "awa",
+        "aliases": ["awa"],
+        "extensions": [".awa"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "awa",
+        "scopeName": "source.awa",
+        "path": "./syntaxes/awa.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "awa",
+      "properties": {
+        "awa.serverPath": {
+          "type": "string",
+          "default": "awa-lsp",
+          "description": "Path to the awa-lsp executable (build with `cargo build -p awa-lsp`; the binary is at target/debug/awa-lsp)."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}
