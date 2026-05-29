@@ -1,0 +1,5 @@
+import util
+
+// 修飾名 util.xxx で呼ぶ。
+util.double(21)
+util.inc(util.double(10))

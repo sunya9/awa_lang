@@ -3,3 +3,5 @@
 # codegen artifacts
 examples/*.ll
 examples/native
+examples/modules/*.ll
+examples/modules/main

@@ -8,16 +8,21 @@ mod infer;
 mod lexer;
 mod match_check;
 mod parser;
+mod resolve;
 mod span;
 mod token;
 mod types;
 mod value;
+
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 use ast::TStmt;
 use error::{LocatedError, report};
 use eval::eval_program;
 use infer::Checker;
 use parser::Parser;
+use resolve::LoadedModule;
 use types::{Type, render_type};
 use value::{Env, Value};
 
@@ -47,29 +52,69 @@ fn run(
     Ok(values.into_iter().zip(types).collect())
 }
 
+// CLI のエントリパスを (root, エントリファイル名) に分解する。
+// root はエントリの親ディレクトリ（モジュール解決の基点）。`import util` は root/util.awa を指す。
+// 例: "examples/app/main.awa" → (root="examples/app", name="main.awa")。
+fn entry_root_and_name(path: &str) -> (PathBuf, String) {
+    let p = std::path::Path::new(path);
+    let root = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    (root, name)
+}
+
+// エントリパスからローダを走らせて全モジュールを得る。失敗したら整形済みメッセージを出して終了。
+fn load_or_exit(path: &str) -> Vec<LoadedModule> {
+    let (root, name) = entry_root_and_name(path);
+    load_program(&root, &name).unwrap_or_else(|msg| {
+        eprintln!("{}", msg);
+        std::process::exit(1);
+    })
+}
+
 // ===== ファイル実行 =====
-// .awa ファイルを読んで一括実行する。エラーが出たら表示して終了する
-// （REPL と違い、続行はしない）。
+// エントリ .awa を import ごと読み込み、名前解決→型検査→評価して一括実行する。
+// 表示するのはエントリモジュールの行だけ（import したモジュールの定義は出力しない）。
 fn run_file(path: &str) {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ファイルを読めません ({}): {}", path, e);
+    let modules = load_or_exit(path);
+    // エントリ（依存順で最後）の Let/Expr 文数＝表示する行数。
+    let entry_rows = modules
+        .last()
+        .map(|m| {
+            m.stmts
+                .iter()
+                .filter(|s| matches!(s, ast::Stmt::Let(..) | ast::Stmt::Expr(..)))
+                .count()
+        })
+        .unwrap_or(0);
+    let typed = match check_program_modules(&modules) {
+        Ok(t) => t,
+        Err(msg) => {
+            eprintln!("{}", msg);
             std::process::exit(1);
         }
     };
     let mut env = eval::builtins_env();
-    let mut checker = Checker::new();
-    match run(&source, &mut env, &mut checker) {
-        Ok(rows) => {
-            for (v, t) in rows {
-                println!("{} : {}", v, render_type(&t));
-            }
-        }
+    let values = match eval_program(&typed, &mut env) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("{}", report(&e, &source));
+            eprintln!("{}", format_error(&e, &modules));
             std::process::exit(1);
         }
+    };
+    let types = typed.iter().filter_map(|ts| match ts {
+        TStmt::Let(_, te) | TStmt::Expr(te) => Some(te.ty.clone()),
+        TStmt::Type(_) | TStmt::Impl(_) => None,
+    });
+    let rows: Vec<(Value, Type)> = values.into_iter().zip(types).collect();
+    let start = rows.len().saturating_sub(entry_rows);
+    for (v, t) in &rows[start..] {
+        println!("{} : {}", v, render_type(t));
     }
 }
 
@@ -102,7 +147,8 @@ fn repl() -> std::io::Result<()> {
     Ok(())
 }
 
-// ソースを型検査し、型付きプログラムを LLVM IR テキストへコンパイルする。
+// ソースを型検査し、型付きプログラムを LLVM IR テキストへコンパイルする（単一ソース・テスト用）。
+#[cfg_attr(not(test), allow(dead_code))]
 fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
     let tokens = lexer::tokenize(source)?;
     let program = Parser::new(tokens).parse_program()?;
@@ -111,16 +157,105 @@ fn compile_to_llvm(source: &str) -> Result<String, LocatedError> {
     Ok(codegen::compile_program(&typed)?)
 }
 
-// `awa emit <file>`: LLVM IR を標準出力へ。
-fn emit_file(path: &str) {
-    let source = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("ファイルを読めません ({}): {}", path, e);
-        std::process::exit(1);
+// ===== モジュールローダ（Phase 10）=====
+// エントリファイルから import を辿って全モジュールを読み込み、依存順（依存先が先）に並べる。
+// import パスは root（= 既定でカレントディレクトリ）からの相対 `seg/seg.awa`。
+// 循環 import は検出してエラー。各ファイルは自分のソースで構文エラーを報告（位置を保てる）。
+fn load_program(root: &PathBuf, entry_path: &str) -> Result<Vec<LoadedModule>, String> {
+    // エントリのモジュールパス: ".awa" を外して "/" で分割。
+    let rel = entry_path.strip_suffix(".awa").unwrap_or(entry_path);
+    let entry_segs: Vec<String> = rel.split('/').map(|s| s.to_string()).collect();
+    let mut loaded: Vec<LoadedModule> = Vec::new();
+    let mut done: HashSet<String> = HashSet::new();
+    let mut in_progress: HashSet<String> = HashSet::new();
+    load_module(root, &entry_segs, true, &mut loaded, &mut done, &mut in_progress)?;
+    Ok(loaded)
+}
+
+fn load_module(
+    root: &PathBuf,
+    segs: &[String],
+    is_entry: bool,
+    loaded: &mut Vec<LoadedModule>,
+    done: &mut HashSet<String>,
+    in_progress: &mut HashSet<String>,
+) -> Result<(), String> {
+    let key = segs.join("/");
+    if done.contains(&key) {
+        return Ok(()); // 既に読み込み済み（共有 import）
+    }
+    if !in_progress.insert(key.clone()) {
+        return Err(format!("import が循環しています: {}", key));
+    }
+    // ファイルパス root/seg/seg.awa を組み立てる。
+    let mut path = root.clone();
+    for s in segs {
+        path.push(s);
+    }
+    path.set_extension("awa");
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("モジュールを読めません ({}): {}", path.display(), e))?;
+    // 構文解析（このファイルのソースでエラー位置を出す）。
+    let parsed = (|| {
+        let tokens = lexer::tokenize(&source)?;
+        Parser::new(tokens).parse_module()
+    })()
+    .map_err(|e| report(&e, &source))?;
+    // 依存先を先に読み込む（post-order で依存順に並ぶ）。
+    for imp in &parsed.imports {
+        load_module(root, &imp.path, false, loaded, done, in_progress)?;
+    }
+    in_progress.remove(&key);
+    done.insert(key);
+    // エントリは接頭辞なし（既存の単一ファイル挙動・@main を維持）、他は "seg.seg." で修飾。
+    let prefix = if is_entry {
+        String::new()
+    } else {
+        format!("{}.", segs.join("."))
+    };
+    loaded.push(LoadedModule {
+        path: segs.to_vec(),
+        prefix,
+        imports: parsed.imports,
+        exports: parsed.exports,
+        stmts: parsed.stmts,
+        source,
     });
-    match compile_to_llvm(&source) {
+    Ok(())
+}
+
+// ローダ＋名前解決＋型検査を通し、フラットな型付きプログラムを返す。
+// エラーは整形済み文字列で返す（単一モジュールなら位置つき、複数なら簡易表示）。
+fn check_program_modules(modules: &[LoadedModule]) -> Result<Vec<TStmt>, String> {
+    let stmts = resolve::resolve(modules).map_err(|e| format_error(&e, modules))?;
+    let mut checker = Checker::new();
+    checker
+        .check_program(&stmts)
+        .map_err(|e| format_error(&e, modules))
+}
+
+// エラー整形: モジュールが 1 つなら位置つきの report、複数なら（span が連結で曖昧なので）簡易表示。
+fn format_error(e: &LocatedError, modules: &[LoadedModule]) -> String {
+    if modules.len() == 1 {
+        report(e, &modules[0].source)
+    } else {
+        format!("error: {}", e.error)
+    }
+}
+
+// 全モジュールを名前解決・型検査し、LLVM IR テキストへコンパイルする。
+fn compile_modules_to_ir(modules: &[LoadedModule]) -> Result<String, String> {
+    let typed = check_program_modules(modules)?;
+    codegen::compile_program(&typed).map_err(|e| format_error(&LocatedError::from(e), modules))
+}
+
+// `awa emit <file>`: LLVM IR を標準出力へ（import を辿って全モジュールを結合）。
+fn emit_file(path: &str) {
+    let modules = load_or_exit(path);
+    match compile_modules_to_ir(&modules) {
         Ok(ir) => print!("{}", ir),
-        Err(e) => {
-            eprintln!("{}", report(&e, &source));
+        Err(msg) => {
+            eprintln!("{}", msg);
             std::process::exit(1);
         }
     }
@@ -128,14 +263,11 @@ fn emit_file(path: &str) {
 
 // `awa build <file>`: IR を生成し clang でネイティブ実行ファイルを作る。
 fn build_file(path: &str) {
-    let source = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("ファイルを読めません ({}): {}", path, e);
-        std::process::exit(1);
-    });
-    let ir = match compile_to_llvm(&source) {
+    let modules = load_or_exit(path);
+    let ir = match compile_modules_to_ir(&modules) {
         Ok(ir) => ir,
-        Err(e) => {
-            eprintln!("{}", report(&e, &source));
+        Err(msg) => {
+            eprintln!("{}", msg);
             std::process::exit(1);
         }
     };
@@ -963,6 +1095,75 @@ mod tests {
         let _ = std::fs::remove_file(&ll);
         let _ = std::fs::remove_file(&exe);
         (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap_or(-1))
+    }
+
+    // 複数モジュールを一時ディレクトリに書き出し、ローダ経由でビルド・実行する。
+    // files = [(相対パス, 内容)]、entry = エントリのモジュールパス（"main" など）。
+    fn compile_modules_status(files: &[(&str, &str)], entry: &str) -> (String, i32) {
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_mod_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (rel, content) in files {
+            let p = dir.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, content).unwrap();
+        }
+        let modules = load_program(&dir, entry).expect("モジュール読み込み成功");
+        let ir = compile_modules_to_ir(&modules).expect("コンパイル成功");
+        let ll = dir.join("out.ll");
+        let exe = dir.join("out");
+        std::fs::write(&ll, &ir).unwrap();
+        let st = std::process::Command::new("clang")
+            .arg(&ll).arg("-o").arg(&exe).status().expect("clang を起動できる");
+        assert!(st.success(), "clang が失敗");
+        let out = std::process::Command::new(&exe).output().expect("実行できる");
+        let _ = std::fs::remove_dir_all(&dir);
+        (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap_or(-1))
+    }
+
+    #[test]
+    fn module_修飾呼び出しがネイティブ実行される() {
+        // util の pub 関数を main から util.double で呼ぶ。
+        let (out, code) = compile_modules_status(
+            &[
+                ("util.awa", "pub let double = fn(n: Int) -> Int { n * 2 }\n"),
+                ("main.awa", "import util\nutil.double(21)\n"),
+            ],
+            "main",
+        );
+        assert_eq!(out, "42\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn module_非公開関数の参照はエラー() {
+        // pub の無い関数を他モジュールから参照すると NotExported。
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_mod_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("util.awa"), "let secret = fn(n: Int) -> Int { n }\n").unwrap();
+        std::fs::write(dir.join("main.awa"), "import util\nutil.secret(1)\n").unwrap();
+        let modules = load_program(&dir, "main").expect("読み込み成功");
+        let err = check_program_modules(&modules).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("公開されていません"), "実際のエラー: {}", err);
+    }
+
+    #[test]
+    fn module_循環importはエラー() {
+        let id = std::process::id() as u64 * 1_000_000
+            + CODEGEN_CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("awa_mod_{}", id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.awa"), "import b\npub let f = fn(n: Int) -> Int { n }\n").unwrap();
+        std::fs::write(dir.join("b.awa"), "import a\npub let g = fn(n: Int) -> Int { n }\n").unwrap();
+        let err = load_program(&dir, "a").unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("循環"), "実際のエラー: {}", err);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::ast::{
-    Expr, ExprKind, ImplBlock, Method, Pattern, Stmt, TypeDef, TypeExpr, Variant,
+    Expr, ExprKind, ImplBlock, Import, Method, ParsedModule, Pattern, Stmt, TypeDef, TypeExpr,
+    Variant,
 };
 use crate::error::{AwaError, LocatedError};
 use crate::span::{Span, Spanned};
@@ -8,6 +9,15 @@ use crate::token::Token;
 // 先頭大文字なら型名／構築子、小文字なら変数／型変数（Gleam と同じ規約）。
 fn is_upper(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+// トップレベル定義が束縛する名前（pub の公開記録に使う）。式文は名前を持たない。
+fn stmt_name(stmt: &Stmt) -> Option<&str> {
+    match stmt {
+        Stmt::Let(name, _, _) => Some(name),
+        Stmt::Type(def) => Some(&def.name),
+        Stmt::Expr(_) | Stmt::Impl(_) => None,
+    }
 }
 
 // ===== 構文解析（Parser）=====
@@ -122,11 +132,47 @@ impl Parser {
     }
 
     // プログラム = 文の並び。文と文の間には終端が必要、末尾の終端は任意。
+    // 単一ファイル（モジュールなし）向け: 文の並びだけを返す。REPL/単一ファイル実行で使う。
     pub fn parse_program(&mut self) -> Result<Vec<Stmt>, LocatedError> {
-        let mut stmts = Vec::new();
+        Ok(self.parse_module()?.stmts)
+    }
+
+    // 1 モジュール（= 1 ファイル）を解析する。先頭に import 群、続いて本体の文。
+    // 各トップレベル定義の前に `pub` を置けて、その名前を公開集合に記録する。
+    pub fn parse_module(&mut self) -> Result<ParsedModule, LocatedError> {
+        let mut module = ParsedModule::default();
         self.skip_terminators();
+        // 先頭の import 群（Gleam と同じくファイル冒頭にまとめる）。
+        while self.peek() == Some(&Token::Import) {
+            module.imports.push(self.parse_import()?);
+            match self.peek() {
+                Some(Token::Terminator) => self.skip_terminators(),
+                None => return Ok(module),
+                Some(other) => {
+                    let other = other.clone();
+                    return Err(LocatedError::at(
+                        AwaError::UnexpectedToken(format!("{:?}", other)),
+                        self.span_here(),
+                    ));
+                }
+            }
+        }
+        // 本体の文。
         while self.peek().is_some() {
-            stmts.push(self.parse_stmt()?);
+            // pub 修飾子（公開）。次の定義名を exports に記録する。
+            let is_pub = if self.peek() == Some(&Token::Pub) {
+                self.next();
+                true
+            } else {
+                false
+            };
+            let stmt = self.parse_stmt()?;
+            if is_pub {
+                if let Some(name) = stmt_name(&stmt) {
+                    module.exports.insert(name.to_string());
+                }
+            }
+            module.stmts.push(stmt);
             match self.peek() {
                 Some(Token::Terminator) => self.skip_terminators(),
                 None => break, // 末尾の終端は省略可
@@ -139,7 +185,26 @@ impl Parser {
                 }
             }
         }
-        Ok(stmts)
+        Ok(module)
+    }
+
+    // import 文: `import seg1/seg2/...`。セグメントは識別子、区切りは `/`（Slash トークン）。
+    fn parse_import(&mut self) -> Result<Import, LocatedError> {
+        self.expect(Token::Import)?;
+        let mut path = Vec::new();
+        loop {
+            match self.next() {
+                Some(Token::Ident(seg)) => path.push(seg),
+                Some(other) => return Err(self.unexpected(&other)),
+                None => return Err(self.eof()),
+            }
+            if self.peek() == Some(&Token::Slash) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(Import { path })
     }
 
     // ブロック { 文; ...; 式 }。'{' は呼び出し側が消費済みとして '}' まで読む。

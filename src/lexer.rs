@@ -267,6 +267,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Spanned<Token>>, LocatedError> {
                     "case" => Token::Case,
                     "impl" => Token::Impl,
                     "do" => Token::Do,
+                    "import" => Token::Import,
+                    "pub" => Token::Pub,
                     "true" => Token::Bool(true),
                     "false" => Token::Bool(false),
                     _ => Token::Ident(word),

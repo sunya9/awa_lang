@@ -15,6 +15,8 @@ pub enum Token {
     Case,          // キーワード case（パターンマッチ）
     Impl,          // キーワード impl（メソッド定義）
     Do,            // キーワード do（モナド糖衣）
+    Import,        // キーワード import（モジュール取り込み）
+    Pub,           // キーワード pub（公開修飾子）
     Comma,         // ,
     Dot,           // .（メソッド呼び出し）
     Colon,         // :（型注釈）

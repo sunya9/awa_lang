@@ -139,6 +139,27 @@ pub enum Stmt {
     Impl(ImplBlock),
 }
 
+// import 文。`import app/util` → path = ["app","util"]。修飾子は末尾セグメント（"util"）。
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub path: Vec<String>,
+}
+
+impl Import {
+    // モジュールを参照するときの修飾子（`util.double` の "util"）。
+    pub fn qualifier(&self) -> &str {
+        self.path.last().map(|s| s.as_str()).unwrap_or("")
+    }
+}
+
+// パースした 1 モジュール（= 1 ファイル）。先頭の import 群・本体の文・pub で公開された名前。
+#[derive(Debug, Clone, Default)]
+pub struct ParsedModule {
+    pub imports: Vec<Import>,
+    pub stmts: Vec<Stmt>,
+    pub exports: std::collections::HashSet<String>,
+}
+
 // impl ブロック。ある型にメソッド群を生やす。
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
