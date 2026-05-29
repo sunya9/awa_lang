@@ -33,6 +33,8 @@ pub enum Pattern {
     Bool(bool),                  // リテラル true / false
     Num(f64),                    // リテラル数値
     Ctor(String, Vec<Pattern>),  // 構築子 Some(x), Cons(h, t), None（部分パターンは入れ子）
+    // or パターン A | B | ...。どれかに当たれば成立。各選択肢は同じ変数を束縛する必要がある。
+    Or(Vec<Pattern>),
 }
 
 // ===== 型式（ユーザーが書く型の構文表現）=====

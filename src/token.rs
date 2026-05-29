@@ -12,6 +12,7 @@ pub enum Token {
     Case,          // キーワード case（パターンマッチ）
     Comma,         // ,
     Colon,         // :（型注釈）
+    Pipe,          // |（or パターン）
     Arrow,         // ->（case の腕・関数型）
     Equal,         // =
     EqEq,          // ==

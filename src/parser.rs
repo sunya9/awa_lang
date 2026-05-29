@@ -25,7 +25,8 @@ fn is_upper(name: &str) -> bool {
 //   factor     = Num | Bool | Ident | '(' expr ')' | if | lambda | block | case
 //   case       = 'case' expr '{' (arm terminator)* arm? '}'
 //   arm        = pattern '->' expr
-//   pattern    = '_' | Ident | Num | Bool | UIdent ('(' pattern,* ')')?
+//   pattern    = primary ('|' primary)*
+//   primary    = '_' | Ident | Num | Bool | UIdent ('(' pattern,* ')')?
 //   if         = 'if' expr block 'else' block
 //   lambda     = 'fn' '(' params? ')' ('->' typeexpr)? block
 //   block      = '{' (stmt terminator)* stmt? '}'
@@ -271,9 +272,25 @@ impl Parser {
         }
     }
 
-    // パターン: _ →ワイルドカード、小文字名→束縛変数、大文字名→構築子（任意の部分パターン列）、
-    // リテラル Num/Bool。構築子は入れ子の部分パターンを持てる（Some(Cons(x, _)) など）。
+    // パターン。`|` で複数の選択肢を 1 つにまとめられる（A | B | ...）。
+    // 各選択肢は parse_pattern_primary が読む。構築子の部分パターンも parse_pattern を
+    // 通るので Some(A | B) のような入れ子の or も書ける。
     fn parse_pattern(&mut self) -> Result<Pattern, AwaError> {
+        let first = self.parse_pattern_primary()?;
+        if self.peek() != Some(&Token::Pipe) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.peek() == Some(&Token::Pipe) {
+            self.next(); // '|'
+            alts.push(self.parse_pattern_primary()?);
+        }
+        Ok(Pattern::Or(alts))
+    }
+
+    // 単一パターン: _ →ワイルドカード、小文字名→束縛変数、大文字名→構築子（任意の部分パターン列）、
+    // リテラル Num/Bool。構築子は入れ子の部分パターンを持てる（Some(Cons(x, _)) など）。
+    fn parse_pattern_primary(&mut self) -> Result<Pattern, AwaError> {
         match self.next() {
             Some(Token::Num(n)) => Ok(Pattern::Num(n)),
             Some(Token::Bool(b)) => Ok(Pattern::Bool(b)),

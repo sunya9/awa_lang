@@ -410,6 +410,26 @@ fn infer_pattern(
             }
             Ok((result, bindings))
         }
+        // or パターン: 全選択肢を同じ型に unify し、束縛変数の集合が一致することを確かめる
+        // （本体がどの選択肢でマッチしても同じ変数を参照できるように）。
+        Pattern::Or(alts) => {
+            let (ty, base) = infer_pattern(&alts[0], env, subst, vargen)?;
+            for alt in &alts[1..] {
+                let (alt_ty, alt_binds) = infer_pattern(alt, env, subst, vargen)?;
+                unify(subst, &alt_ty, &ty)?;
+                // 同じ名前の集合か、同名の型は unify できるか。
+                if alt_binds.len() != base.len() {
+                    return Err(AwaError::OrPatternBindings);
+                }
+                for (name, bty) in &alt_binds {
+                    match base.iter().find(|(n, _)| n == name) {
+                        Some((_, base_ty)) => unify(subst, bty, base_ty)?,
+                        None => return Err(AwaError::OrPatternBindings),
+                    }
+                }
+            }
+            Ok((ty, base))
+        }
     }
 }
 

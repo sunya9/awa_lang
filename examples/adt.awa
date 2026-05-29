@@ -58,6 +58,15 @@ let code = fn(c) {
 }
 code(Green)              // 2 : Num
 
+// or パターン: 複数の構築子を 1 つの腕にまとめる（A | B）。Blue も含めて網羅的。
+let warm = fn(c) {
+  case c {
+    Red | Green -> true
+    Blue -> false
+  }
+}
+warm(Red)                // true : Bool
+
 // 入れ子パターン: Some(Cons(先頭, _)) で「中身があり、その先頭」を取り出す。
 let head_or = fn(o, d) {
   case o {

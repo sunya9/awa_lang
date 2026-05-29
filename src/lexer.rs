@@ -138,6 +138,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, AwaError> {
                 tokens.push(Token::Colon);
                 i += 1;
             }
+            '|' => {
+                tokens.push(Token::Pipe);
+                i += 1;
+            }
             '0'..='9' | '.' => {
                 let start = i;
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {

@@ -39,6 +39,8 @@ pub enum AwaError {
     // ----- 網羅性・到達不能（Phase 3b） -----
     NonExhaustiveMatch { witness: String }, // case に覆えない値がある（witness=足りない例）
     UnreachablePattern(String),             // 上の腕に覆われて決して当たらない腕
+    // or パターンの選択肢が束縛する変数の集合が食い違う
+    OrPatternBindings,
 }
 
 // Display を実装すると `{}` で人間向けに表示できる（Debug の `{:?}` は開発者向け）。
@@ -78,6 +80,9 @@ impl fmt::Display for AwaError {
             }
             AwaError::UnreachablePattern(pat) => {
                 write!(f, "決して当たらないパターンです: {}", pat)
+            }
+            AwaError::OrPatternBindings => {
+                write!(f, "or パターンの各選択肢は同じ変数を束縛する必要があります")
             }
         }
     }

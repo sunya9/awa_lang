@@ -52,7 +52,42 @@ fn head_of(p: &Pattern) -> Option<Head> {
         Pattern::Bool(b) => Some(Head::Bool(*b)),
         Pattern::Num(n) => Some(Head::Num(*n)),
         Pattern::Ctor(name, _) => Some(Head::Ctor(name.clone())),
+        // 行列・クエリは expand で or を除いてから組むので、ここに Or は来ない。
+        Pattern::Or(_) => unreachable!("or パターンは expand 済みのはず"),
     }
+}
+
+// or パターンを展開して or を含まないパターンの集合にする。
+// Some(A | B) → [Some(A), Some(B)]、入れ子は直積（Two(A|B, C|D) → 4 通り）。
+fn expand(p: &Pattern) -> Vec<Pattern> {
+    match p {
+        Pattern::Or(alts) => alts.iter().flat_map(expand).collect(),
+        Pattern::Ctor(name, subs) => {
+            let expanded: Vec<Vec<Pattern>> = subs.iter().map(expand).collect();
+            cartesian(&expanded)
+                .into_iter()
+                .map(|combo| Pattern::Ctor(name.clone(), combo))
+                .collect()
+        }
+        other => vec![other.clone()],
+    }
+}
+
+// 各位置の候補リストから全組み合わせ（直積）を作る。
+fn cartesian(lists: &[Vec<Pattern>]) -> Vec<Vec<Pattern>> {
+    let mut acc = vec![Vec::new()];
+    for list in lists {
+        let mut next = Vec::new();
+        for prefix in &acc {
+            for item in list {
+                let mut row = prefix.clone();
+                row.push(item.clone());
+                next.push(row);
+            }
+        }
+        acc = next;
+    }
+    acc
 }
 
 // パターンの部分パターン（構築子なら引数列、それ以外は空）。
@@ -245,21 +280,31 @@ fn render_pattern(p: &Pattern) -> String {
                 format!("{}({})", name, inner.join(", "))
             }
         }
+        Pattern::Or(alts) => alts
+            .iter()
+            .map(render_pattern)
+            .collect::<Vec<_>>()
+            .join(" | "),
     }
 }
 
-// 1 つの case 式の腕を検査する。到達不能を先に（具体的な腕を指せる）、次に網羅性。
+// 1 つの case 式の腕を検査する。or パターンは展開して行列の複数行にしてから、
+// 到達不能を先に（具体的な腕を指せる）、次に網羅性を見る。
+// 各行は 1 列（[パターン]）。展開後は or を含まないので usefulness は or を知らない。
 fn check_case(arms: &[(Pattern, Expr)], sigs: &Sigs) -> Result<(), AwaError> {
-    // 到達不能: 各腕が「自分より上の腕の行列」に対して useful か。
-    for i in 0..arms.len() {
-        let prior: Vec<Vec<Pattern>> = arms[..i].iter().map(|(p, _)| vec![p.clone()]).collect();
-        if !useful(&prior, &[arms[i].0.clone()], sigs) {
-            return Err(AwaError::UnreachablePattern(render_pattern(&arms[i].0)));
+    // 到達不能: 腕 i の展開のどれかが「上の腕の展開全体」に対して useful なら到達可能。
+    // どの展開も useful でなければ腕全体が死んでいる。
+    let mut prior: Vec<Vec<Pattern>> = Vec::new();
+    for (pattern, _) in arms {
+        let rows: Vec<Vec<Pattern>> = expand(pattern).into_iter().map(|p| vec![p]).collect();
+        let reachable = rows.iter().any(|row| useful(&prior, row, sigs));
+        if !reachable {
+            return Err(AwaError::UnreachablePattern(render_pattern(pattern)));
         }
+        prior.extend(rows);
     }
-    // 網羅性: 全腕を行列にして、覆えない値（witness）が無いか。
-    let matrix: Vec<Vec<Pattern>> = arms.iter().map(|(p, _)| vec![p.clone()]).collect();
-    if let Some(witness) = missing(&matrix, 1, sigs) {
+    // 網羅性: 全腕の展開を集めた行列に、覆えない値（witness）が無いか。
+    if let Some(witness) = missing(&prior, 1, sigs) {
         return Err(AwaError::NonExhaustiveMatch {
             witness: render_pattern(&witness[0]),
         });

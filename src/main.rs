@@ -530,4 +530,45 @@ mod tests {
             Err(AwaError::UnknownType("Ghost".to_string()))
         );
     }
+
+    // ===== or パターン =====
+
+    #[test]
+    fn orパターンはどれかに当たる() {
+        assert_eq!(eval("case 2 { 1 | 2 | 3 -> 100; _ -> 0 }"), Ok(num(100.0)));
+        assert_eq!(eval("case 9 { 1 | 2 | 3 -> 100; _ -> 0 }"), Ok(num(0.0)));
+    }
+
+    #[test]
+    fn orで全構築子を覆えば網羅的() {
+        assert_eq!(
+            eval("type Color { Red; Green; Blue }; case Red { Red | Green | Blue -> 1 }"),
+            Ok(num(1.0))
+        );
+    }
+
+    #[test]
+    fn orが一部しか覆わないと網羅漏れ() {
+        assert_eq!(
+            eval("type Color { Red; Green; Blue }; case Red { Red | Green -> 1 }"),
+            Err(AwaError::NonExhaustiveMatch { witness: "Blue".to_string() })
+        );
+    }
+
+    #[test]
+    fn orの選択肢で束縛が食い違うとエラー() {
+        assert_eq!(
+            eval("type Opt(a) { Some(a); None }; case Some(1) { Some(x) | None -> x }"),
+            Err(AwaError::OrPatternBindings)
+        );
+    }
+
+    #[test]
+    fn or選択肢が同じ変数を束縛すれば通る() {
+        // A(x) も B(x) も x: Num を束縛 → 本体で x を使える。
+        assert_eq!(
+            eval("type T { A(Num); B(Num) }; let g = fn(t) { case t { A(x) | B(x) -> x } }; g(B(9))"),
+            Ok(num(9.0))
+        );
+    }
 }
