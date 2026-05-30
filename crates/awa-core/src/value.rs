@@ -33,6 +33,9 @@ pub enum Value {
     Array(Rc<Vec<Value>>),
     // タプル (a, b, ...)。要素ごとに型が異なる固定長の組。
     Tuple(Rc<Vec<Value>>),
+    // 可変ビルダー（transient）。std/array が O(n) 構築に使う。線形に使う前提で、
+    // push は内部 Vec を破壊的に伸ばして同じ Rc を返す（共有しなければ安全）。
+    Builder(Rc<std::cell::RefCell<Vec<Value>>>),
 }
 
 // クロージャ = 関数 + 定義時の環境。
@@ -69,6 +72,7 @@ impl PartialEq for Value {
             // 配列・タプルは要素ごとに構造比較。
             (Value::Array(a), Value::Array(b)) => a == b,
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
+            // ビルダーは可変・線形用途なので等価を定義しない。
             _ => false,
         }
     }
@@ -114,6 +118,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Builder(_) => write!(f, "<builder>"),
             Value::Unit => write!(f, "Nil"),
             Value::Ctor { name, arity } => write!(f, "<ctor {}/{}>", name, arity),
             // 構築済み値は Some(3) / None / Cons(1, Nil) のように表示。
@@ -149,6 +154,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Future(_) => "Future",
         Value::Array(_) => "Array",
         Value::Tuple(_) => "Tuple",
+        Value::Builder(_) => "Builder",
     }
 }
 

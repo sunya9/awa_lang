@@ -154,6 +154,45 @@ void* awa_array_set(void* o, long long idx, const void* vptr) {
   }
   return n;
 }
+
+// ===== 可変ビルダー（transient）=====
+// 非 RC の線形バッファ。push は同じバッファを成長させて O(1) amortized で積み、build で
+// 不変配列へ凍結する（要素は move＝retain/release しない。所有権がビルダー→配列へ移る）。
+// レイアウト: [i64 len][i64 cap][i64 elem_size][i64 elem_heap][ptr data]。
+// std/array が map/filter 等を O(n) で組むための内部用。awa_live にはカウントしない（build 後の
+// 配列だけが awa_array_alloc で +1 される）。
+typedef struct { long long len, cap, es, heap; char* data; } AwaBuilder;
+
+void* awa_builder_new(long long cap, long long elem_size, long long elem_heap) {
+  if (cap < 1) cap = 1;
+  AwaBuilder* b = (AwaBuilder*)malloc(sizeof(AwaBuilder));
+  b->len = 0;
+  b->cap = cap;
+  b->es = elem_size;
+  b->heap = elem_heap;
+  b->data = (char*)malloc(cap * elem_size);
+  return b;
+}
+
+void* awa_builder_push(void* bp, const void* vptr) {
+  AwaBuilder* b = (AwaBuilder*)bp;
+  if (b->len == b->cap) {
+    b->cap *= 2;
+    b->data = (char*)realloc(b->data, b->cap * b->es);
+  }
+  memcpy(b->data + b->len * b->es, vptr, b->es);
+  b->len++;
+  return b;
+}
+
+void* awa_build(void* bp) {
+  AwaBuilder* b = (AwaBuilder*)bp;
+  void* arr = awa_array_alloc(b->len, b->es, b->heap);
+  memcpy((char*)arr + AWA_ARR_HDR, b->data, b->len * b->es);
+  free(b->data);
+  free(b);
+  return arr;
+}
 // 文字列 → 整数（非数値は 0）。
 long long awa_string_to_int(void* strobj) { return atoll((char*)strobj + 16); }
 // 文字数（UTF-8 コードポイント数。継続バイト 10xxxxxx を除いて数える＝インタプリタの chars() と一致）。

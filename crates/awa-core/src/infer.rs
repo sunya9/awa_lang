@@ -385,6 +385,29 @@ impl Checker {
             "array_push".to_string(),
             scheme(vec![a], vec![array(Type::Var(a)), Type::Var(a)], array(Type::Var(a))),
         );
+
+        // ===== 可変ビルダー（transient）。std/array が map/filter 等を O(n) で組むのに使う =====
+        // 線形に使う前提の破壊的バッファ。push は同じバッファを成長させ同じ参照を返す。
+        self.arities.insert("Builder".to_string(), 1);
+        let builder = |t: Type| Type::Con("Builder".to_string(), vec![t]);
+        // array_builder : ∀a. Int -> Builder(a)（容量ヒント）
+        let a = afresh();
+        self.env.insert(
+            "array_builder".to_string(),
+            scheme(vec![a], vec![Type::Int], builder(Type::Var(a))),
+        );
+        // array_builder_push : ∀a. (Builder(a), a) -> Builder(a)（破壊的・同じ参照を返す）
+        let a = afresh();
+        self.env.insert(
+            "array_builder_push".to_string(),
+            scheme(vec![a], vec![builder(Type::Var(a)), Type::Var(a)], builder(Type::Var(a))),
+        );
+        // array_build : ∀a. Builder(a) -> Array(a)（凍結。ビルダーを消費）
+        let a = afresh();
+        self.env.insert(
+            "array_build".to_string(),
+            scheme(vec![a], vec![builder(Type::Var(a))], array(Type::Var(a))),
+        );
     }
 
     // プログラム（トップレベルの文の並び）を型検査し、型付き AST（elaboration の結果）を返す。

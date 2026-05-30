@@ -2235,6 +2235,23 @@ mod tests {
     }
 
     #[test]
+    fn std_array_ビルダーで大きい配列() {
+        // map/filter/range をビルダー（transient）で O(n) 構築。容量倍増(realloc)も通る。
+        // 0..1000 を 2 倍して 500 超だけ残す → 250..999 の偶数 750..1998 の和。
+        let out = std_build_run(
+            "import std/io\n\
+             import std/array\n\
+             let xs = array.range(0, 1000)\n\
+             let ys = array.map(xs, fn(n) { n * 2 })\n\
+             let zs = array.filter(ys, fn(n) { n > 1000 })\n\
+             io.println(\"${array.length(xs)} ${array.length(ys)} ${array.length(zs)} ${array.sum(zs)}\")\n",
+        );
+        // len=1000, mapped=1000, filtered(>1000: 1002..1998 step2 = 499 個), sum。
+        // 偶数 1002..1998 の和 = (1002+1998)*499/2 = 748500。
+        assert_eq!(out, "1000 1000 499 748500\n");
+    }
+
+    #[test]
     fn タプル_interp() {
         // (a, b) はヘテロな組。パターンで分解。型表示は (A, B)。
         assert_eq!(

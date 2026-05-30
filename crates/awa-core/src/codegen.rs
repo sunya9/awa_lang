@@ -38,10 +38,12 @@ fn elem_size_of(elem_ll: &str) -> i64 {
     }
 }
 
-// 配列リテラル/パターンの要素型を取り出す（ty = Con("Array", [elem])）。
+// 要素型を取り出す（ty = Con("Array"|"Builder", [elem])）。
 fn array_elem_ty(ty: &Type) -> Result<Type> {
     match ty {
-        Type::Con(name, args) if name == "Array" && args.len() == 1 => Ok(args[0].clone()),
+        Type::Con(name, args) if (name == "Array" || name == "Builder") && args.len() == 1 => {
+            Ok(args[0].clone())
+        }
         _ => unsupported("配列でない型に配列操作"),
     }
 }
@@ -50,7 +52,14 @@ fn array_elem_ty(ty: &Type) -> Result<Type> {
 fn is_array_builtin(name: &str) -> bool {
     matches!(
         name,
-        "array_empty" | "array_length" | "array_get" | "array_set" | "array_push"
+        "array_empty"
+            | "array_length"
+            | "array_get"
+            | "array_set"
+            | "array_push"
+            | "array_builder"
+            | "array_builder_push"
+            | "array_build"
     )
 }
 
@@ -804,6 +813,46 @@ impl Gen {
                 ));
                 self.release(&a, &args[0].ty);
                 self.release(&v, &elem_ty);
+                Ok(r)
+            }
+            // array_builder(cap) : Builder(a)。戻り型から要素メタを決める。非 RC。
+            "array_builder" => {
+                let ret = callee_ret(callee)?;
+                let elem_ty = array_elem_ty(&ret)?;
+                let elem_ll = llvm_ty(&elem_ty)?;
+                let esize = elem_size_of(&elem_ll);
+                let eheap = if is_heap(&elem_ty) { 1 } else { 0 };
+                let cap = self.expr(&args[0], m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call ptr @awa_builder_new(i64 {}, i64 {}, i64 {})",
+                    r, cap, esize, eheap
+                ));
+                Ok(r)
+            }
+            // array_builder_push(b, v) : Builder(a)。v はビルダーへ move（release しない）。
+            "array_builder_push" => {
+                let elem_ty = array_elem_ty(&args[0].ty)?;
+                let elem_ll = llvm_ty(&elem_ty)?;
+                let b = self.expr(&args[0], m)?;
+                let v = self.expr(&args[1], m)?;
+                let vslot = format!("%v{}", self.fresh());
+                self.line(&format!("{} = alloca {}", vslot, elem_ll));
+                self.line(&format!("store {} {}, ptr {}", elem_ll, v, vslot));
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!(
+                    "{} = call ptr @awa_builder_push(ptr {}, ptr {})",
+                    r, b, vslot
+                ));
+                // b は非 RC（同じ参照を返す）。v はビルダーが所有を取る。どちらも release しない。
+                Ok(r)
+            }
+            // array_build(b) : Array(a)。ビルダーを消費して不変配列を返す。
+            "array_build" => {
+                let b = self.expr(&args[0], m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = call ptr @awa_build(ptr {})", r, b));
+                // b は build が解放する（非 RC）。release しない。
                 Ok(r)
             }
             _ => unsupported(format!("配列組込 {}", name)),
@@ -1767,7 +1816,8 @@ impl Gen {
 fn is_heap(t: &Type) -> bool {
     match t {
         Type::Str | Type::Fun(..) => true,
-        Type::Con(name, _) => name != "Future" && name != "Socket",
+        // Future/Socket は i64 ハンドル、Builder は非 RC の線形バッファ（build で消費）。
+        Type::Con(name, _) => name != "Future" && name != "Socket" && name != "Builder",
         _ => false,
     }
 }
@@ -2301,6 +2351,9 @@ pub fn compile_program(stmts: &[TStmt]) -> Result<String> {
     module.push_str("declare void @awa_array_get(ptr, i64, ptr)\n");
     module.push_str("declare ptr @awa_array_set(ptr, i64, ptr)\n");
     module.push_str("declare ptr @awa_array_push(ptr, ptr)\n");
+    module.push_str("declare ptr @awa_builder_new(i64, i64, i64)\n");
+    module.push_str("declare ptr @awa_builder_push(ptr, ptr)\n");
+    module.push_str("declare ptr @awa_build(ptr)\n");
     // OS 連携: ソケット非同期（async_runtime.c が定義）。
     module.push_str("declare i64 @awa_tcp_listen(i64)\n");
     module.push_str("declare i64 @awa_sock_port(i64)\n");

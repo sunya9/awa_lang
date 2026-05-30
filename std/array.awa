@@ -1,9 +1,9 @@
 // 標準ライブラリ: 不変・永続インデックス配列 Array(a)。
 // 連結リスト（std/list）と違い length/at は O(1)。組込プリミティブ
 // （array_empty / array_length / array_get / array_set / array_push）を土台に組む。
-// 注意: map/filter/concat などは array_push の繰り返し（要素ごとに O(n) コピー）なので
-// 全体 O(n^2)。まずは単純で正しい実装。将来 RRB-tree 等で最適化する。
-// リテラル [1, 2, 3] はこの Array へ脱糖される（連結リストではない）。
+// map/filter/concat/range/reverse/repeat/from_list は内部の可変ビルダー（transient）で
+// O(n) 構築する（array_builder/array_builder_push/array_build）。単発の push/set は
+// 永続更新なので O(n) コピーのまま。リテラル [1, 2, 3] はこの Array へ脱糖される。
 import std/option
 import std/list
 
@@ -56,19 +56,38 @@ let fold_go: fn(Array(a), b, fn(b, a) -> b, Int) -> b = fn(a, acc, f, i) {
 }
 pub let fold: fn(Array(a), b, fn(b, a) -> b) -> b = fn(a, acc, f) { fold_go(a, acc, f, 0) }
 
-// 各要素に f を適用した新しい配列。
-pub let map: fn(Array(a), fn(a) -> b) -> Array(b) = fn(a, f) {
-  fold(a, array_empty(), fn(acc, x) { array_push(acc, f(x)) })
+// 配列の要素をビルダーへ積む（O(n)）。map/filter/concat/from_list の土台。
+// ビルダーは線形に使う前提の破壊的バッファ。acc を1本のバッファとして使い回す。
+let into_builder: fn(Array(a), Int, Builder(a)) -> Builder(a) = fn(xs, i, acc) {
+  case i < array_length(xs) {
+    true -> into_builder(xs, i + 1, array_builder_push(acc, array_get(xs, i)))
+    false -> acc
+  }
 }
 
-// 述語が真の要素だけ残す。
-pub let filter: fn(Array(a), fn(a) -> Bool) -> Array(a) = fn(a, pred) {
-  fold(a, array_empty(), fn(acc, x) {
-    case pred(x) {
-      true -> array_push(acc, x)
-      false -> acc
+// 各要素に f を適用した新しい配列（ビルダーで O(n)）。
+let map_go: fn(Array(a), fn(a) -> b, Int, Builder(b)) -> Builder(b) = fn(a, f, i, acc) {
+  case i < array_length(a) {
+    true -> map_go(a, f, i + 1, array_builder_push(acc, f(array_get(a, i))))
+    false -> acc
+  }
+}
+pub let map: fn(Array(a), fn(a) -> b) -> Array(b) = fn(a, f) {
+  array_build(map_go(a, f, 0, array_builder(array_length(a))))
+}
+
+// 述語が真の要素だけ残す（ビルダーで O(n)）。
+let filter_go: fn(Array(a), fn(a) -> Bool, Int, Builder(a)) -> Builder(a) = fn(a, pred, i, acc) {
+  case i < array_length(a) {
+    true -> case pred(array_get(a, i)) {
+      true -> filter_go(a, pred, i + 1, array_builder_push(acc, array_get(a, i)))
+      false -> filter_go(a, pred, i + 1, acc)
     }
-  })
+    false -> acc
+  }
+}
+pub let filter: fn(Array(a), fn(a) -> Bool) -> Array(a) = fn(a, pred) {
+  array_build(filter_go(a, pred, 0, array_builder(array_length(a))))
 }
 
 // 副作用のため各要素に f を適用（戻り値は捨てる）。
@@ -83,39 +102,44 @@ let each_go: fn(Array(a), fn(a) -> b, Int) -> Nil = fn(a, f, i) {
 }
 pub let each: fn(Array(a), fn(a) -> b) -> Nil = fn(a, f) { each_go(a, f, 0) }
 
-// 2 つの配列を連結した新しい配列。
+// 2 つの配列を連結した新しい配列（ビルダーで O(n + m)）。
 pub let concat: fn(Array(a), Array(a)) -> Array(a) = fn(xs, ys) {
-  fold(ys, xs, fn(acc, x) { array_push(acc, x) })
+  let b = into_builder(xs, 0, array_builder(array_length(xs) + array_length(ys)))
+  array_build(into_builder(ys, 0, b))
 }
 
-// 逆順（末尾から積み直す）。
-let reverse_go: fn(Array(a), Int, Array(a)) -> Array(a) = fn(xs, i, acc) {
+// 逆順（末尾から積み直す。ビルダーで O(n)）。
+let reverse_go: fn(Array(a), Int, Builder(a)) -> Builder(a) = fn(xs, i, acc) {
   case i >= 0 {
-    true -> reverse_go(xs, i - 1, array_push(acc, array_get(xs, i)))
+    true -> reverse_go(xs, i - 1, array_builder_push(acc, array_get(xs, i)))
     false -> acc
   }
 }
 pub let reverse: fn(Array(a)) -> Array(a) = fn(xs) {
-  reverse_go(xs, array_length(xs) - 1, array_empty())
+  array_build(reverse_go(xs, array_length(xs) - 1, array_builder(array_length(xs))))
 }
 
-// [start, start+1, ..., end-1] の整数配列（start >= end なら空）。
-let range_go: fn(Int, Int, Array(Int)) -> Array(Int) = fn(i, end, acc) {
+// [start, start+1, ..., end-1] の整数配列（start >= end なら空。ビルダーで O(n)）。
+let range_go: fn(Int, Int, Builder(Int)) -> Builder(Int) = fn(i, end, acc) {
   case i < end {
-    true -> range_go(i + 1, end, array_push(acc, i))
+    true -> range_go(i + 1, end, array_builder_push(acc, i))
     false -> acc
   }
 }
-pub let range: fn(Int, Int) -> Array(Int) = fn(start, end) { range_go(start, end, array_empty()) }
+pub let range: fn(Int, Int) -> Array(Int) = fn(start, end) {
+  array_build(range_go(start, end, array_builder(end - start)))
+}
 
-// x を n 個並べた配列。
-let repeat_go: fn(a, Int, Array(a)) -> Array(a) = fn(x, n, acc) {
+// x を n 個並べた配列（ビルダーで O(n)）。
+let repeat_go: fn(a, Int, Builder(a)) -> Builder(a) = fn(x, n, acc) {
   case n > 0 {
-    true -> repeat_go(x, n - 1, array_push(acc, x))
+    true -> repeat_go(x, n - 1, array_builder_push(acc, x))
     false -> acc
   }
 }
-pub let repeat: fn(a, Int) -> Array(a) = fn(x, n) { repeat_go(x, n, array_empty()) }
+pub let repeat: fn(a, Int) -> Array(a) = fn(x, n) {
+  array_build(repeat_go(x, n, array_builder(n)))
+}
 
 // いずれかの要素が述語を満たすか。
 pub let any: fn(Array(a), fn(a) -> Bool) -> Bool = fn(a, pred) {
@@ -146,7 +170,7 @@ let reverse_to_list: fn(Array(a), Int, list.List(a)) -> list.List(a) = fn(a, i, 
   }
 }
 
-// 連結リストから配列を作る。
+// 連結リストから配列を作る（ビルダーで O(n)）。
 pub let from_list: fn(list.List(a)) -> Array(a) = fn(xs) {
-  list.fold(xs, array_empty(), fn(acc, x) { array_push(acc, x) })
+  array_build(list.fold(xs, array_builder(0), fn(acc, x) { array_builder_push(acc, x) }))
 }

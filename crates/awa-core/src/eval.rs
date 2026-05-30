@@ -956,6 +956,31 @@ fn native_call(name: &str, args: Vec<Value>, span: Span) -> Result<Value, Locate
             }
             unreachable!("array_push の引数は (Array, a)");
         }
+        // 可変ビルダー（transient）。容量ヒント付きで空のビルダーを作る。
+        "array_builder" => {
+            let cap = match args.into_iter().next() {
+                Some(Value::Int(n)) => n.max(0) as usize,
+                _ => unreachable!("array_builder の引数は Int"),
+            };
+            return Ok(Value::Builder(Rc::new(std::cell::RefCell::new(Vec::with_capacity(cap)))));
+        }
+        // 破壊的に末尾へ追加し、同じビルダーを返す（amortized O(1)・線形使用前提）。
+        "array_builder_push" => {
+            let mut it = args.into_iter();
+            if let (Some(Value::Builder(b)), Some(v)) = (it.next(), it.next()) {
+                b.borrow_mut().push(v);
+                return Ok(Value::Builder(b));
+            }
+            unreachable!("array_builder_push の引数は (Builder, a)");
+        }
+        // ビルダーを不変配列へ凍結する（ビルダーを消費）。
+        "array_build" => {
+            if let Some(Value::Builder(b)) = args.into_iter().next() {
+                let v = b.borrow().clone();
+                return Ok(Value::Array(Rc::new(v)));
+            }
+            unreachable!("array_build の引数は Builder");
+        }
         // ソケットはネイティブの kqueue ランタイム専用。インタプリタでは未対応。
         "tcp_listen" | "sock_port" | "accept" | "sock_read" | "sock_write" | "sock_close"
         | "tcp_connect" => {
@@ -1057,6 +1082,9 @@ pub fn builtins_env() -> Env {
         "array_get",
         "array_set",
         "array_push",
+        "array_builder",
+        "array_builder_push",
+        "array_build",
     ] {
         env.insert(name.to_string(), Value::Native(name.to_string()));
     }
