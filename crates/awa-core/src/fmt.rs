@@ -149,7 +149,7 @@ fn binop_prec(t: &Token) -> u8 {
         Token::EqEq | Token::NotEq => 3,
         Token::Lt | Token::Gt | Token::Le | Token::Ge | Token::Concat => 4,
         Token::Plus | Token::Minus => 5,
-        Token::Star | Token::Slash => 6,
+        Token::Star | Token::Slash | Token::Percent => 6,
         _ => 0,
     }
 }
@@ -160,6 +160,7 @@ fn binop_str(t: &Token) -> &'static str {
         Token::Minus => "-",
         Token::Star => "*",
         Token::Slash => "/",
+        Token::Percent => "%",
         Token::EqEq => "==",
         Token::NotEq => "!=",
         Token::Lt => "<",

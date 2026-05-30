@@ -45,9 +45,9 @@ pub let pow: fn(Int, Int) -> Int = fn(base, exp) {
   }
 }
 
-pub let is_even = fn(n: Int) -> Bool { n - n / 2 * 2 == 0 }
+pub let is_even = fn(n: Int) -> Bool { n % 2 == 0 }
 
-pub let is_odd = fn(n: Int) -> Bool { n - n / 2 * 2 != 0 }
+pub let is_odd = fn(n: Int) -> Bool { n % 2 != 0 }
 
 // 符号（負 -1 / 零 0 / 正 1）。
 pub let sign: fn(Int) -> Int = fn(n) {
@@ -66,7 +66,7 @@ pub let to_float = fn(n: Int) -> Float { int_to_float(n) }
 let gcd_pos = fn(a, b) {
   case b == 0 {
     true -> a
-    false -> gcd_pos(b, a - a / b * b)
+    false -> gcd_pos(b, a % b)
   }
 }
 pub let gcd = fn(a: Int, b: Int) -> Int { gcd_pos(abs(a), abs(b)) }

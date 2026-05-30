@@ -221,6 +221,10 @@ fn tokenize_collecting(
                 tokens.push(Spanned::new(Token::Star, Span::new(start, start + 1)));
                 i += 1;
             }
+            '%' => {
+                tokens.push(Spanned::new(Token::Percent, Span::new(start, start + 1)));
+                i += 1;
+            }
             '(' => {
                 tokens.push(Spanned::new(Token::LParen, Span::new(start, start + 1)));
                 brackets.push('(');

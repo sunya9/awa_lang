@@ -263,6 +263,25 @@ fn eval_binop(l: Value, op: &Token, r: Value) -> Result<Value, AwaError> {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
             _ => unreachable!(),
         },
+        // 剰余。整数の 0 剰余は DivisionByZero、Float は IEEE（fmod）。
+        Token::Percent => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => {
+                if b == 0 {
+                    Err(AwaError::DivisionByZero)
+                } else {
+                    Ok(Value::Int(a.wrapping_rem(b)))
+                }
+            }
+            (Value::Long(a), Value::Long(b)) => {
+                if b == 0 {
+                    Err(AwaError::DivisionByZero)
+                } else {
+                    Ok(Value::Long(a.wrapping_rem(b)))
+                }
+            }
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
+            _ => unreachable!(),
+        },
         // 文字列連結。
         Token::Concat => match (l, r) {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),

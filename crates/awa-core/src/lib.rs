@@ -2389,6 +2389,32 @@ mod tests {
     }
 
     #[test]
+    fn 剰余演算子() {
+        // 整数剰余（* / と同じ優先順位、+ より強い）。
+        assert_eq!(eval("10 % 3"), Ok(Value::Int(1)));
+        assert_eq!(eval("17 % 5"), Ok(Value::Int(2)));
+        assert_eq!(eval("-7 % 3"), Ok(Value::Int(-1))); // 切り捨て（C/Rust 流）
+        assert_eq!(eval("2 + 10 % 3"), Ok(Value::Int(3))); // 2 + (10%3)
+        assert_eq!(eval("10 % 3 * 2"), Ok(Value::Int(2))); // (10%3)*2
+        // Float 剰余。
+        assert_eq!(eval("7.5 % 2.0"), Ok(Value::Float(1.5)));
+        // 整数の 0 剰余はエラー。
+        assert_eq!(eval("5 % 0"), Err(AwaError::DivisionByZero));
+    }
+
+    #[test]
+    fn 剰余演算子_native() {
+        let (out, code) = compile_run_status(
+            "print(\"${10 % 3}\")\n\
+             print(\"${17 % 5}\")\n\
+             print(\"${7.5 % 2.0}\")\n\
+             print(\"${2 + 10 % 3}\")\n",
+        );
+        assert_eq!(out, "1\n2\n1.5\n3\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn 構造的等価_interp() {
         // インタプリタの構造比較（ネイティブの eq$ty と同じ意味論）。
         assert_eq!(eval("(1, [2, 3]) == (1, [2, 3])"), Ok(Value::Bool(true)));

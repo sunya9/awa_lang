@@ -36,6 +36,7 @@ pub enum Token {
     Minus,
     Star,
     Slash,
+    Percent, // %（剰余）
     Concat, // <>（文字列連結）
     LParen,
     RParen,

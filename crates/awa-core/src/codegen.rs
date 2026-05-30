@@ -1124,8 +1124,8 @@ impl Gen {
             return Ok(eqres);
         }
         let reg = format!("%t{}", self.fresh());
-        // 整数除算は 0 除算を実行時チェック（0 ならメッセージを出して exit）。
-        if matches!(op, Token::Slash) && !float {
+        // 整数の除算・剰余は 0 除算を実行時チェック（0 ならメッセージを出して exit）。
+        if matches!(op, Token::Slash | Token::Percent) && !float {
             let c = format!("%t{}", self.fresh());
             self.line(&format!("{} = icmp eq i64 {}, 0", c, rv));
             let id = self.fresh();
@@ -1136,7 +1136,8 @@ impl Gen {
             self.line("call void @exit(i32 1)");
             self.line("unreachable");
             self.label(&ok);
-            self.line(&format!("{} = sdiv i64 {}, {}", reg, lv, rv));
+            let instr = if matches!(op, Token::Percent) { "srem" } else { "sdiv" };
+            self.line(&format!("{} = {} i64 {}, {}", reg, instr, lv, rv));
             return Ok(reg);
         }
         let arith = match op {
@@ -1144,6 +1145,8 @@ impl Gen {
             Token::Minus => Some(if float { "fsub" } else { "sub" }),
             Token::Star => Some(if float { "fmul" } else { "mul" }),
             Token::Slash => Some(if float { "fdiv" } else { "sdiv" }),
+            // 剰余: Float は frem（整数は上の 0 チェック付きで処理済み）。
+            Token::Percent => Some(if float { "frem" } else { "srem" }),
             _ => None,
         };
         if let Some(instr) = arith {

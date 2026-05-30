@@ -598,6 +598,7 @@ fn check_numeric(te: &TExpr) -> Result<(), LocatedError> {
                     | Token::Minus
                     | Token::Star
                     | Token::Slash
+                    | Token::Percent
                     | Token::Lt
                     | Token::Gt
                     | Token::Le
@@ -1480,7 +1481,7 @@ fn infer_stmts(
 // eval_binop の実行時規則と対応している。
 fn infer_binop(lt: &Type, op: &Token, rt: &Type, subst: &mut Subst) -> Result<Type, AwaError> {
     match op {
-        Token::Plus | Token::Minus | Token::Star | Token::Slash => {
+        Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent => {
             unify(subst, lt, rt)?; // 同型必須（1 + 1.0 はここで CannotUnify）
             Ok(apply(subst, lt))
         }

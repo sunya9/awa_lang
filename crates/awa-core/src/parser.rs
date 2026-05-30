@@ -923,7 +923,7 @@ impl Parser {
         let mut left = self.parse_unary()?;
         while let Some(op) = self.peek() {
             match op {
-                Token::Star | Token::Slash => {
+                Token::Star | Token::Slash | Token::Percent => {
                     let op = self.next().unwrap();
                     let right = self.parse_unary()?;
                     let span = Span::merge(left.span, right.span);
