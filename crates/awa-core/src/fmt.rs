@@ -148,8 +148,12 @@ fn binop_prec(t: &Token) -> u8 {
         Token::AndAnd => 2,
         Token::EqEq | Token::NotEq => 3,
         Token::Lt | Token::Gt | Token::Le | Token::Ge | Token::Concat => 4,
-        Token::Plus | Token::Minus => 5,
-        Token::Star | Token::Slash | Token::Percent => 6,
+        Token::Pipe => 5,
+        Token::Caret => 6,
+        Token::Amp => 7,
+        Token::Shl | Token::Shr => 8,
+        Token::Plus | Token::Minus => 9,
+        Token::Star | Token::Slash | Token::Percent => 10,
         _ => 0,
     }
 }
@@ -414,6 +418,7 @@ impl Fmt {
             ExprKind::Bool(b) => text(if *b { "true" } else { "false" }),
             ExprKind::Var(n) => text(n.clone()),
             ExprKind::Neg(x) => cat(text("-"), self.atom(x)),
+        ExprKind::BitNot(x) => cat(text("~"), self.atom(x)),
             ExprKind::BinOp(l, op, r) => {
                 // `${}` 補間（lexer が `( "a" <> __interp(e) <> "b" )` へ脱糖）を文字列へ復元する。
                 if matches!(op, Token::Concat) {

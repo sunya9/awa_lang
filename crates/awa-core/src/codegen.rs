@@ -446,7 +446,7 @@ fn subst_types(te: &mut TExpr, s: &crate::types::Subst) {
         | TExprKind::Str(_)
         | TExprKind::Bool(_)
         | TExprKind::Var(_) => {}
-        TExprKind::Neg(x) => subst_types(x, s),
+        TExprKind::Neg(x) | TExprKind::BitNot(x) => subst_types(x, s),
         TExprKind::BinOp(l, _, r) => {
             subst_types(l, s);
             subst_types(r, s);
@@ -649,6 +649,12 @@ impl Gen {
                 } else {
                     self.line(&format!("{} = sub i64 0, {}", r, v));
                 }
+                Ok(r)
+            }
+            TExprKind::BitNot(x) => {
+                let v = self.expr(x, m)?;
+                let r = format!("%t{}", self.fresh());
+                self.line(&format!("{} = xor i64 {}, -1", r, v));
                 Ok(r)
             }
             TExprKind::BinOp(l, op, r) => self.binop(l, op, r, m),
@@ -1147,6 +1153,12 @@ impl Gen {
             Token::Slash => Some(if float { "fdiv" } else { "sdiv" }),
             // 剰余: Float は frem（整数は上の 0 チェック付きで処理済み）。
             Token::Percent => Some(if float { "frem" } else { "srem" }),
+            // ビット演算（整数のみ。>> は算術右シフト ashr）。
+            Token::Amp => Some("and"),
+            Token::Pipe => Some("or"),
+            Token::Caret => Some("xor"),
+            Token::Shl => Some("shl"),
+            Token::Shr => Some("ashr"),
             _ => None,
         };
         if let Some(instr) = arith {
@@ -2128,7 +2140,7 @@ fn fv(e: &TExpr, bound: &HashSet<String>, free: &mut Vec<String>) {
                 free.push(n.clone());
             }
         }
-        TExprKind::Neg(x) => fv(x, bound, free),
+        TExprKind::Neg(x) | TExprKind::BitNot(x) => fv(x, bound, free),
         TExprKind::BinOp(l, _, r) => {
             fv(l, bound, free);
             fv(r, bound, free);

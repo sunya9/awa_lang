@@ -885,17 +885,66 @@ impl Parser {
         Ok(left)
     }
 
-    // < / > / <= / >= と文字列連結 <>。== より強く、+ - より弱い。左結合。
+    // < / > / <= / >= と文字列連結 <>。== より強く、ビット OR より弱い。左結合。
     fn parse_comparison(&mut self) -> Result<Expr, LocatedError> {
-        let mut left = self.parse_additive()?;
+        let mut left = self.parse_bitor()?;
         while let Some(Token::Lt | Token::Gt | Token::Le | Token::Ge | Token::Concat) = self.peek() {
             let op = self.next().unwrap();
-            let right = self.parse_additive()?;
+            let right = self.parse_bitor()?;
             let span = Span::merge(left.span, right.span);
             left = Expr {
                 kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)),
                 span,
             };
+        }
+        Ok(left)
+    }
+
+    // ビット OR `|`。比較より強く ^ より弱い。左結合。レコード更新 `{ base | .. }` の `|` と
+    // 曖昧なので、更新側は base を parse_bitxor で読む（`|` を食わせない）。複合 base は括弧。
+    fn parse_bitor(&mut self) -> Result<Expr, LocatedError> {
+        let mut left = self.parse_bitxor()?;
+        while self.peek() == Some(&Token::Pipe) {
+            let op = self.next().unwrap();
+            let right = self.parse_bitxor()?;
+            let span = Span::merge(left.span, right.span);
+            left = Expr { kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)), span };
+        }
+        Ok(left)
+    }
+
+    // ビット XOR `^`。| より強く & より弱い。左結合。
+    fn parse_bitxor(&mut self) -> Result<Expr, LocatedError> {
+        let mut left = self.parse_bitand()?;
+        while self.peek() == Some(&Token::Caret) {
+            let op = self.next().unwrap();
+            let right = self.parse_bitand()?;
+            let span = Span::merge(left.span, right.span);
+            left = Expr { kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)), span };
+        }
+        Ok(left)
+    }
+
+    // ビット AND `&`。^ より強くシフトより弱い。左結合。
+    fn parse_bitand(&mut self) -> Result<Expr, LocatedError> {
+        let mut left = self.parse_shift()?;
+        while self.peek() == Some(&Token::Amp) {
+            let op = self.next().unwrap();
+            let right = self.parse_shift()?;
+            let span = Span::merge(left.span, right.span);
+            left = Expr { kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)), span };
+        }
+        Ok(left)
+    }
+
+    // シフト `<<` `>>`。& より強く + - より弱い。左結合。
+    fn parse_shift(&mut self) -> Result<Expr, LocatedError> {
+        let mut left = self.parse_additive()?;
+        while let Some(Token::Shl | Token::Shr) = self.peek() {
+            let op = self.next().unwrap();
+            let right = self.parse_additive()?;
+            let span = Span::merge(left.span, right.span);
+            left = Expr { kind: ExprKind::BinOp(Box::new(left), op, Box::new(right)), span };
         }
         Ok(left)
     }
@@ -946,6 +995,12 @@ impl Parser {
             self.next(); // '-' を消費
             let operand = self.parse_unary()?;
             Ok(self.finish(start, ExprKind::Neg(Box::new(operand))))
+        } else if let Some(Token::Tilde) = self.peek() {
+            // 単項ビット反転 ~x（整数のみ）。
+            let start = self.span_here().start;
+            self.next(); // '~' を消費
+            let operand = self.parse_unary()?;
+            Ok(self.finish(start, ExprKind::BitNot(Box::new(operand))))
         } else {
             self.parse_call()
         }
@@ -1016,7 +1071,9 @@ impl Parser {
     // base 式の直後に `|` が無ければ更新ではない（None を返し、呼び出し側がブロックへ戻す）。
     fn try_record_update(&mut self, start: usize) -> Result<Option<Expr>, LocatedError> {
         let save = self.pos;
-        let base = match self.parse_expr() {
+        // base は `|`（ビット OR）を二項として食わない優先順位で読む（直後の `|` を更新の
+        // 区切りとして検出するため。base にビット OR を入れるなら括弧で囲む）。
+        let base = match self.parse_bitxor() {
             Ok(e) => e,
             Err(_) => {
                 self.pos = save;

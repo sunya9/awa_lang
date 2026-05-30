@@ -2415,6 +2415,35 @@ mod tests {
     }
 
     #[test]
+    fn ビット演算_interp() {
+        assert_eq!(eval("6 & 3"), Ok(Value::Int(2)));
+        assert_eq!(eval("6 | 1"), Ok(Value::Int(7)));
+        assert_eq!(eval("6 ^ 3"), Ok(Value::Int(5)));
+        assert_eq!(eval("1 << 4"), Ok(Value::Int(16)));
+        assert_eq!(eval("256 >> 2"), Ok(Value::Int(64)));
+        assert_eq!(eval("~0"), Ok(Value::Int(-1)));
+        assert_eq!(eval("~5"), Ok(Value::Int(-6)));
+        // & は | より強い: 1 | (2 & 3) = 3。加算はシフトより強い: (1 + 2) << 3 = 24。
+        assert_eq!(eval("1 | 2 & 3"), Ok(Value::Int(3)));
+        assert_eq!(eval("1 + 2 << 3"), Ok(Value::Int(24)));
+    }
+
+    #[test]
+    fn ビット演算_float拒否() {
+        assert!(matches!(eval("1.0 & 2.0"), Err(AwaError::NotNumeric(_))));
+    }
+
+    #[test]
+    fn ビット演算_native() {
+        let (out, code) = compile_run_status(
+            "print(\"${6 & 3} ${6 | 1} ${6 ^ 3} ${1 << 4} ${256 >> 2}\")\n\
+             print(\"${~0} ${~5} ${1 | 2 & 3} ${1 + 2 << 3}\")\n",
+        );
+        assert_eq!(out, "2 7 5 16 64\n-1 -6 3 24\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn 構造的等価_interp() {
         // インタプリタの構造比較（ネイティブの eq$ty と同じ意味論）。
         assert_eq!(eval("(1, [2, 3]) == (1, [2, 3])"), Ok(Value::Bool(true)));

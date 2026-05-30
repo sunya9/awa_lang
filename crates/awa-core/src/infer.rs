@@ -119,6 +119,7 @@ fn dsr_expr(e: &Expr) -> Result<Expr, LocatedError> {
         | ExprKind::Bool(_)
         | ExprKind::Var(_) => e.kind.clone(),
         ExprKind::Neg(x) => ExprKind::Neg(Box::new(dsr_expr(x)?)),
+        ExprKind::BitNot(x) => ExprKind::BitNot(Box::new(dsr_expr(x)?)),
         ExprKind::BinOp(l, op, r) => {
             ExprKind::BinOp(Box::new(dsr_expr(l)?), op.clone(), Box::new(dsr_expr(r)?))
         }
@@ -519,7 +520,7 @@ fn resolve_texpr(te: &mut TExpr, subst: &Subst) {
         | TExprKind::Str(_)
         | TExprKind::Bool(_)
         | TExprKind::Var(_) => {}
-        TExprKind::Neg(x) => resolve_texpr(x, subst),
+        TExprKind::Neg(x) | TExprKind::BitNot(x) => resolve_texpr(x, subst),
         TExprKind::BinOp(l, _, r) => {
             resolve_texpr(l, subst);
             resolve_texpr(r, subst);
@@ -590,6 +591,10 @@ fn check_numeric(te: &TExpr) -> Result<(), LocatedError> {
             at(require_numeric(&x.ty), x.span)?;
             check_numeric(x)
         }
+        TExprKind::BitNot(x) => {
+            at(require_integer(&x.ty), x.span)?;
+            check_numeric(x)
+        }
         TExprKind::BinOp(l, op, r) => {
             // 算術・比較はオペランドが数値であること。連結 <> と等価 == は対象外。
             if matches!(
@@ -605,6 +610,13 @@ fn check_numeric(te: &TExpr) -> Result<(), LocatedError> {
                     | Token::Ge
             ) {
                 at(require_numeric(&l.ty), l.span)?;
+            }
+            // ビット演算は整数（Int/Long）に限る。Float は弾く。
+            if matches!(
+                op,
+                Token::Amp | Token::Caret | Token::Pipe | Token::Shl | Token::Shr
+            ) {
+                at(require_integer(&l.ty), l.span)?;
             }
             check_numeric(l)?;
             check_numeric(r)
@@ -1020,6 +1032,12 @@ fn infer_expr(
             let t = infer_expr(operand, env, subst, vargen, arities, methods)?;
             let ty = apply(subst, &t.ty);
             (TExprKind::Neg(Box::new(t)), ty)
+        }
+        // ~x はビット反転。型は被演算子と同じ（整数性は check_numeric が後で検査）。
+        ExprKind::BitNot(operand) => {
+            let t = infer_expr(operand, env, subst, vargen, arities, methods)?;
+            let ty = apply(subst, &t.ty);
+            (TExprKind::BitNot(Box::new(t)), ty)
         }
         ExprKind::BinOp(left, op, right) => {
             let lt = infer_expr(left, env, subst, vargen, arities, methods)?;
@@ -1485,6 +1503,11 @@ fn infer_binop(lt: &Type, op: &Token, rt: &Type, subst: &mut Subst) -> Result<Ty
             unify(subst, lt, rt)?; // 同型必須（1 + 1.0 はここで CannotUnify）
             Ok(apply(subst, lt))
         }
+        // ビット演算（& | ^ << >>）。両辺同型・結果同型（整数性は check_numeric が検査）。
+        Token::Amp | Token::Caret | Token::Pipe | Token::Shl | Token::Shr => {
+            unify(subst, lt, rt)?;
+            Ok(apply(subst, lt))
+        }
         Token::Lt | Token::Gt | Token::Le | Token::Ge => {
             unify(subst, lt, rt)?;
             Ok(Type::Bool)
@@ -1514,6 +1537,16 @@ fn infer_binop(lt: &Type, op: &Token, rt: &Type, subst: &mut Subst) -> Result<Ty
 fn require_numeric(ty: &Type) -> Result<(), AwaError> {
     match ty {
         Type::Int | Type::Long | Type::Float => Ok(()),
+        Type::Var(_) => Err(AwaError::AmbiguousNumeric),
+        other => Err(AwaError::NotNumeric(other.to_string())),
+    }
+}
+
+// ビット演算（& | ^ << >> ~）のオペランドは整数（Int/Long）に限る。Float は弾く。
+// 未確定の型変数は require_numeric と同様 AmbiguousNumeric。
+fn require_integer(ty: &Type) -> Result<(), AwaError> {
+    match ty {
+        Type::Int | Type::Long => Ok(()),
         Type::Var(_) => Err(AwaError::AmbiguousNumeric),
         other => Err(AwaError::NotNumeric(other.to_string())),
     }

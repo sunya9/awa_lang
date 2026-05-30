@@ -192,7 +192,7 @@ fn check_vis_expr(te: &TExpr, r: &Resolved) -> Result<(), LocatedError> {
         | TExprKind::Str(_)
         | TExprKind::Bool(_)
         | TExprKind::Var(_) => {}
-        TExprKind::Neg(x) => check_vis_expr(x, r)?,
+        TExprKind::Neg(x) | TExprKind::BitNot(x) => check_vis_expr(x, r)?,
         TExprKind::BinOp(l, _, rr) => {
             check_vis_expr(l, r)?;
             check_vis_expr(rr, r)?;
@@ -394,6 +394,7 @@ impl Resolver<'_> {
                 }
             }
             ExprKind::Neg(x) => ExprKind::Neg(Box::new(self.expr(x, locals)?)),
+        ExprKind::BitNot(x) => ExprKind::BitNot(Box::new(self.expr(x, locals)?)),
             ExprKind::BinOp(l, op, r) => ExprKind::BinOp(
                 Box::new(self.expr(l, locals)?),
                 op.clone(),

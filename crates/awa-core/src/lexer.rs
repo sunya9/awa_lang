@@ -189,6 +189,10 @@ fn tokenize_collecting(
                     // <> は文字列連結。
                     tokens.push(Spanned::new(Token::Concat, Span::new(start, start + 2)));
                     i += 2;
+                } else if chars.get(i + 1) == Some(&'<') {
+                    // << は左シフト。
+                    tokens.push(Spanned::new(Token::Shl, Span::new(start, start + 2)));
+                    i += 2;
                 } else {
                     tokens.push(Spanned::new(Token::Lt, Span::new(start, start + 1)));
                     i += 1;
@@ -197,6 +201,10 @@ fn tokenize_collecting(
             '>' => {
                 if chars.get(i + 1) == Some(&'=') {
                     tokens.push(Spanned::new(Token::Ge, Span::new(start, start + 2)));
+                    i += 2;
+                } else if chars.get(i + 1) == Some(&'>') {
+                    // >> は算術右シフト。
+                    tokens.push(Spanned::new(Token::Shr, Span::new(start, start + 2)));
                     i += 2;
                 } else {
                     tokens.push(Spanned::new(Token::Gt, Span::new(start, start + 1)));
@@ -286,6 +294,18 @@ fn tokenize_collecting(
             '&' if chars.get(i + 1) == Some(&'&') => {
                 tokens.push(Spanned::new(Token::AndAnd, Span::new(start, start + 2)));
                 i += 2;
+            }
+            '&' => {
+                tokens.push(Spanned::new(Token::Amp, Span::new(start, start + 1)));
+                i += 1;
+            }
+            '^' => {
+                tokens.push(Spanned::new(Token::Caret, Span::new(start, start + 1)));
+                i += 1;
+            }
+            '~' => {
+                tokens.push(Spanned::new(Token::Tilde, Span::new(start, start + 1)));
+                i += 1;
             }
             // 数値。整数部の数字を読み、`.`+数字なら Float、続く `L` なら Long、それ以外 Int。
             // （`5.method` は Int(5)・Dot・method に分かれる＝メソッド呼び出しと両立。）

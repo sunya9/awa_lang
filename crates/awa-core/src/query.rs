@@ -219,7 +219,7 @@ fn smallest_in_expr(te: &TExpr, offset: usize, best: &mut Option<(Span, Type)>) 
     }
     // 子ノードへ（より小さい span で上書きされうる）。
     match &te.kind {
-        TExprKind::Neg(x) => smallest_in_expr(x, offset, best),
+        TExprKind::Neg(x) | TExprKind::BitNot(x) => smallest_in_expr(x, offset, best),
         TExprKind::BinOp(l, _, r) => {
             smallest_in_expr(l, offset, best);
             smallest_in_expr(r, offset, best);

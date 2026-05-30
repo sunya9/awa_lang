@@ -21,7 +21,8 @@ pub enum ExprKind {
     Str(String),    // 文字列リテラル
     Bool(bool),     // 真偽値リテラル
     Var(String),    // 変数参照
-    Neg(Box<Expr>), // 単項マイナス（例: -3, -(x + 1)）
+    Neg(Box<Expr>),    // 単項マイナス（例: -3, -(x + 1)）
+    BitNot(Box<Expr>), // 単項ビット反転 ~x（整数のみ）
     BinOp(Box<Expr>, Token, Box<Expr>),
     // 無名関数 fn(引数: 型?, ...) -> 戻り型? { 本体 }。
     // 各引数は名前と任意の型注釈、加えて任意の戻り型注釈、そして本体の式。
@@ -124,6 +125,7 @@ pub enum TExprKind {
     Bool(bool),
     Var(String),
     Neg(Box<TExpr>),
+    BitNot(Box<TExpr>),
     BinOp(Box<TExpr>, Token, Box<TExpr>),
     // 引数名のみ持つ（各引数の型は自身の ty=Fun(...) に入っている）。
     Lambda(Vec<String>, Box<TExpr>),

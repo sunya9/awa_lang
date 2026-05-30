@@ -56,6 +56,12 @@ pub fn eval_expr(expr: &TExpr, env: &Env) -> Result<Value, LocatedError> {
             Value::Float(n) => Ok(Value::Float(-n)),
             _ => unreachable!("Neg のオペランドは数値（型検査済み）"),
         },
+        // ~x はビット反転（整数のみ）。
+        TExprKind::BitNot(operand) => match eval_expr(operand, env)? {
+            Value::Int(n) => Ok(Value::Int(!n)),
+            Value::Long(n) => Ok(Value::Long(!n)),
+            _ => unreachable!("~ のオペランドは整数（型検査済み）"),
+        },
         // 論理積/和は短絡評価（右辺は必要なときだけ評価する）。
         TExprKind::BinOp(left, Token::AndAnd, right) => match eval_expr(left, env)? {
             Value::Bool(true) => eval_expr(right, env),
@@ -281,6 +287,32 @@ fn eval_binop(l: Value, op: &Token, r: Value) -> Result<Value, AwaError> {
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
             _ => unreachable!(),
+        },
+        // ビット演算（整数のみ。シフト量は 0..63 に丸める）。
+        Token::Amp => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a & b)),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a & b)),
+            _ => unreachable!("& は整数（型検査済み）"),
+        },
+        Token::Pipe => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a | b)),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a | b)),
+            _ => unreachable!("| は整数（型検査済み）"),
+        },
+        Token::Caret => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a ^ b)),
+            _ => unreachable!("^ は整数（型検査済み）"),
+        },
+        Token::Shl => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_shl(b as u32))),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a.wrapping_shl(b as u32))),
+            _ => unreachable!("<< は整数（型検査済み）"),
+        },
+        Token::Shr => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_shr(b as u32))),
+            (Value::Long(a), Value::Long(b)) => Ok(Value::Long(a.wrapping_shr(b as u32))),
+            _ => unreachable!(">> は整数（型検査済み）"),
         },
         // 文字列連結。
         Token::Concat => match (l, r) {

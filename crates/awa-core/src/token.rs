@@ -37,6 +37,11 @@ pub enum Token {
     Star,
     Slash,
     Percent, // %（剰余）
+    Amp,     // &（ビット AND）
+    Caret,   // ^（ビット XOR）
+    Tilde,   // ~（ビット NOT・単項）
+    Shl,     // <<（左シフト）
+    Shr,     // >>（算術右シフト）
     Concat, // <>（文字列連結）
     LParen,
     RParen,

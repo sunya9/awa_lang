@@ -394,7 +394,7 @@ fn check_expr(expr: &Expr, sigs: &Sigs) -> Result<(), LocatedError> {
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
         | ExprKind::Var(_) => Ok(()),
-        ExprKind::Neg(x) => check_expr(x, sigs),
+        ExprKind::Neg(x) | ExprKind::BitNot(x) => check_expr(x, sigs),
         ExprKind::BinOp(l, _, r) => {
             check_expr(l, sigs)?;
             check_expr(r, sigs)
